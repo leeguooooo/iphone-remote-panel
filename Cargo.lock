@@ -342,13 +342,25 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 name = "core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
+ "bytes",
+ "core-foundation",
  "core-graphics 0.25.0",
+ "core-media-rs",
+ "core-video-rs",
  "hmac",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
+ "screencapturekit",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
+ "tokio",
 ]
 
 [[package]]
