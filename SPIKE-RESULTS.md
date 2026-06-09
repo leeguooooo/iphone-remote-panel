@@ -306,3 +306,38 @@ Architecture implication: proceed with the GUI-session authorized daemon model. 
 must run as a GUI LaunchAgent (or equivalent logged-in desktop session process) with Screen
 Recording + Accessibility granted to the signed binary. SSH/Hermes/control clients should
 connect to that daemon instead of trying to capture/input from their own unsigned context.
+
+---
+
+## Input vertical — full hardware validation (2026-06-09, HEAD 2bd2bba)
+
+Validated on .190 (real iPhone via Mirroring) by Hermes; code authored on .13.
+
+| Capability | Verdict | Notes |
+|---|---|---|
+| Video stream (WebRTC H.264) | PASS | 312×694, `video.readyState=4` |
+| Tap | PASS | clean sequence; YT Music play/pause toggled |
+| Shortcuts (home/spotlight/switcher) | PASS | `cua-driver call press_key` cmd+1/2/3 |
+| Text input (US keycodes + real Shift) | PASS (English/digits) | see IME caveat below |
+| **Scroll (scroll-wheel)** | **PASS** | swipe→`CGEvent::new_scroll_event`; dir `SCROLL_DIR_V=1.0`, `SCROLL_SCALE=1.3` |
+| Drag (mouse-drag) | N/A for scroll | Mirroring reads mouse-drag as long-press/reorder, never scroll — hence the scroll-wheel path |
+| LAN WebRTC | PASS | trickle ICE, fe80 filtered |
+
+### Key findings
+
+1. **iPhone Mirroring scrolls only on scroll-wheel events**, not mouse-drag. A finger
+   swipe must map to `CGEvent::new_scroll_event` (PIXEL units), not `LeftMouseDragged`.
+   The client gesture model was reworked: tap→tap, swipe→scroll packets (7-byte),
+   long-press→mouse hold, long-press-then-drag→mouse-drag. The old eager per-gesture
+   `down` was dropped (it was being read as long-press/icon-reorder).
+
+2. **Text keycode injection is correct.** "Missing digit" symptom (`Hello123`→`Hello23`)
+   is the iPhone **Chinese Pinyin IME hijacking number keys as candidate-selectors**
+   (`a1b2c3`→`啊不c3`); pure digits (`2341`,`91`) land perfectly. Mirroring forwards
+   keycodes + the real Shift KEY (not `CGEventFlagShift`). Real CJK needs an on-phone IME.
+
+3. **HID tap requires the Mirroring window frontmost.** A tap no-op was traced to the
+   test harness (screenshots/CDP/Chrome) stealing frontmost; `cua-driver call click`
+   (pid/window_id-targeted) is frontmost-independent and worked throughout. In production
+   the Mac is idle with Mirroring frontmost, so this is not a blocker — but routing taps
+   through cua-driver (like key/text/shortcut already are) would harden it.
