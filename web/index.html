@@ -470,6 +470,22 @@ function sendMove(nx, ny, flags) {
   view.setUint8(4, flags & 0xff);
   try { moveCh.send(buf); } catch (_) {}
 }
+/* Swipe → scroll-wheel. 7-byte packet: [u16 nx][u16 ny][i8 dx][i8 dy][u8 flags=0x02].
+   nx/ny anchor the cursor; dx/dy are per-move CSS-pixel deltas. iPhone Mirroring
+   only scrolls on scroll-wheel events, so swipes go here (NOT sendMove, which is a
+   mouse-drag → long-press/reorder and never scrolls). */
+const clampI8 = v => Math.max(-127, Math.min(127, Math.round(v)));
+function sendScroll(nx, ny, dx, dy) {
+  if (!moveCh || moveCh.readyState !== 'open') return;
+  if (moveCh.bufferedAmount > MOVE_BACKPRESSURE_BYTES) return;
+  const buf = new ArrayBuffer(7), view = new DataView(buf);
+  view.setUint16(0, Math.round(nx * 65535), false);
+  view.setUint16(2, Math.round(ny * 65535), false);
+  view.setInt8(4, clampI8(dx));
+  view.setInt8(5, clampI8(dy));
+  view.setUint8(6, 0x02);
+  try { moveCh.send(buf); } catch (_) {}
+}
 
 /* ── Tap dot ──────────────────────────────────────────────────── */
 function showTapDot(clientX, clientY) {
@@ -492,6 +508,14 @@ document.addEventListener('gesturestart',  e => e.preventDefault(), { passive: f
 document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
 document.addEventListener('gestureend',    e => e.preventDefault(), { passive: false });
 
+/* Gesture model (matches iPhone Mirroring's input semantics):
+   - quick tap (no move)        → control `tap`         → mouse down+up
+   - swipe (move before hold)   → `scroll` packets      → scroll-wheel (the ONLY
+                                                           thing Mirroring scrolls on)
+   - long-press (held, still)   → control `longpress`   → mouse down (held)
+   - long-press then drag       → `move` packets        → mouse-drag (slider/reorder)
+   No eager `down` on every gesture: an early mouse press + drag is what Mirroring
+   read as long-press/icon-reorder, so swipes never scrolled. */
 function onPointerDown(e) {
   e.preventDefault();
   videoArea.setPointerCapture(e.pointerId);
@@ -499,22 +523,27 @@ function onPointerDown(e) {
     const pd = pointers.get(e.pointerId); if (!pd) return;
     const coords = pointerToNormalized(pd.lastX, pd.lastY);
     if (coords) { sendControl({ type:'longpress', x:coords.nx, y:coords.ny }); showTapDot(pd.lastX, pd.lastY); toast('长按'); }
-    pd.longFired = true;
+    pd.pressed = true; // now in mouse-drag mode (slider / icon reorder)
   }, LONGPRESS_MS);
-  pointers.set(e.pointerId, { startX:e.clientX, startY:e.clientY, startT:performance.now(), lastX:e.clientX, lastY:e.clientY, longTimer, longFired:false, moved:false });
-  const coords = pointerToNormalized(e.clientX, e.clientY);
-  if (coords) sendControl({ type:'down', x:coords.nx, y:coords.ny });
+  pointers.set(e.pointerId, { startX:e.clientX, startY:e.clientY, startT:performance.now(), lastX:e.clientX, lastY:e.clientY, longTimer, pressed:false, scrolling:false });
 }
 function onPointerMove(e) {
   e.preventDefault();
   const pd = pointers.get(e.pointerId); if (!pd) return;
   const events = hasCoalesced ? e.getCoalescedEvents() : [e];
   for (const ev of events) {
+    const ddx = ev.clientX - pd.lastX, ddy = ev.clientY - pd.lastY; // per-move delta
     pd.lastX = ev.clientX; pd.lastY = ev.clientY;
-    const dx = ev.clientX - pd.startX, dy = ev.clientY - pd.startY;
-    if (Math.hypot(dx, dy) > TAP_SLOP) { pd.moved = true; clearTimeout(pd.longTimer); }
+    const moved = Math.hypot(ev.clientX - pd.startX, ev.clientY - pd.startY) > TAP_SLOP;
     const coords = pointerToNormalized(ev.clientX, ev.clientY);
-    if (coords && pd.moved) sendMove(coords.nx, coords.ny, 1);
+    if (pd.pressed) {
+      // long-press already fired → real mouse-drag (slider/reorder).
+      if (coords) sendMove(coords.nx, coords.ny, 1);
+    } else if (moved) {
+      // swipe before any hold → scroll. Cancel the long-press timer once.
+      if (!pd.scrolling) { clearTimeout(pd.longTimer); pd.scrolling = true; }
+      if (coords) sendScroll(coords.nx, coords.ny, ddx, ddy);
+    }
   }
 }
 function onPointerUp(e) {
@@ -522,12 +551,16 @@ function onPointerUp(e) {
   const pd = pointers.get(e.pointerId); if (!pd) return;
   clearTimeout(pd.longTimer); pointers.delete(e.pointerId);
   const coords = pointerToNormalized(e.clientX, e.clientY);
-  if (!pd.longFired) {
+  if (pd.pressed) {
+    // release the held long-press / drag.
+    if (coords) sendControl({ type:'up', x:coords.nx, y:coords.ny });
+  } else if (!pd.scrolling) {
+    // stationary, quick → a tap.
     const dt = performance.now() - pd.startT;
     const dist = Math.hypot(e.clientX - pd.startX, e.clientY - pd.startY);
     if (coords && dist < TAP_SLOP && dt < TAP_MS) { sendControl({ type:'tap', x:coords.nx, y:coords.ny }); showTapDot(e.clientX, e.clientY); }
   }
-  if (coords) sendControl({ type:'up', x:coords.nx, y:coords.ny });
+  // swipe (scrolling) needs no release event — no mouse button was held.
 }
 function onPointerCancel(e) {
   const pd = pointers.get(e.pointerId); if (pd) clearTimeout(pd.longTimer);

@@ -16,9 +16,13 @@
 //!   - `{type:"text", text}` → [`InputEvent::Text`]
 //!   - `{type:"key", name}` → [`InputEvent::Key`]
 //!
-//! * **move** data channel — 5 binary bytes, big-endian:
-//!   `[u16 nx*65535][u16 ny*65535][u8 flags]` (bit0 = button down).
-//!   Decoded to `(nx/65535, ny/65535)` → [`InputEvent::Move`].
+//! * **move** data channel — binary, big-endian, two shapes distinguished by length:
+//!   - 5 bytes `[u16 nx*65535][u16 ny*65535][u8 flags]` (bit0 = button down) →
+//!     [`InputEvent::Move`] (a mouse-drag, for long-press-then-drag gestures).
+//!   - 7 bytes `[u16 nx*65535][u16 ny*65535][i8 dx][i8 dy][u8 flags]` (bit1 set) →
+//!     [`InputEvent::Scroll`] (a swipe → scroll-wheel; Mirroring won't scroll on
+//!     a mouse-drag, only on real scroll-wheel events). `dx`/`dy` are CSS-pixel
+//!     deltas; `nx`/`ny` anchor the cursor.
 
 use core::input::InputEvent;
 use serde::Deserialize;
@@ -69,21 +73,32 @@ pub fn control_to_event(msg: ControlMsg) -> InputEvent {
 // move-channel binary decode
 // ---------------------------------------------------------------------------
 
-/// Decode the 5-byte big-endian move packet into an [`InputEvent::Move`].
+/// Decode a binary move-channel packet into an [`InputEvent`].
 ///
-/// Layout: `[u16 nx*65535 BE][u16 ny*65535 BE][u8 flags]` (bit0 = button down).
-/// Returns `None` if the packet is not exactly 5 bytes. The flags byte is parsed
-/// but a move is always a drag/move regardless (the client only sends moves while
-/// the button is held); the normalized coordinates are `nx/65535`, `ny/65535`.
+/// Two shapes, distinguished by length:
+/// * **5 bytes** `[u16 nx][u16 ny][u8 flags]` → [`InputEvent::Move`] (mouse-drag,
+///   for long-press-then-drag). `nx/ny` are normalized via `/65535`.
+/// * **7 bytes** `[u16 nx][u16 ny][i8 dx][i8 dy][u8 flags]` with the scroll bit
+///   (`0x02`) set → [`InputEvent::Scroll`]. `nx/ny` anchor the cursor; `dx/dy`
+///   are signed CSS-pixel deltas.
+///
+/// Returns `None` for any other length / unset scroll bit.
 pub fn decode_move(bytes: &[u8]) -> Option<InputEvent> {
-    if bytes.len() != 5 {
-        return None;
+    match bytes.len() {
+        5 => {
+            let nx = u16::from_be_bytes([bytes[0], bytes[1]]) as f64 / 65535.0;
+            let ny = u16::from_be_bytes([bytes[2], bytes[3]]) as f64 / 65535.0;
+            Some(InputEvent::Move { x: nx, y: ny })
+        }
+        7 if bytes[6] & 0x02 != 0 => {
+            let nx = u16::from_be_bytes([bytes[0], bytes[1]]) as f64 / 65535.0;
+            let ny = u16::from_be_bytes([bytes[2], bytes[3]]) as f64 / 65535.0;
+            let dx = (bytes[4] as i8) as f64;
+            let dy = (bytes[5] as i8) as f64;
+            Some(InputEvent::Scroll { x: nx, y: ny, dx, dy })
+        }
+        _ => None,
     }
-    let nx_raw = u16::from_be_bytes([bytes[0], bytes[1]]);
-    let ny_raw = u16::from_be_bytes([bytes[2], bytes[3]]);
-    let nx = nx_raw as f64 / 65535.0;
-    let ny = ny_raw as f64 / 65535.0;
-    Some(InputEvent::Move { x: nx, y: ny })
 }
 
 /// Returns `true` if the move packet's flags byte has the button-down bit set.
@@ -280,7 +295,28 @@ mod tests {
     fn decode_move_wrong_length_is_none() {
         assert!(decode_move(&[]).is_none());
         assert!(decode_move(&[0, 0, 0, 0]).is_none());
-        assert!(decode_move(&[0, 0, 0, 0, 0, 0]).is_none());
+        assert!(decode_move(&[0, 0, 0, 0, 0, 0]).is_none()); // 6 bytes: no shape
+    }
+
+    #[test]
+    fn decode_scroll_7byte_deltas_and_anchor() {
+        // nx=0x8000 (~0.5), ny=0x4000 (~0.25), dx=+5, dy=-12, flags=0x02 (scroll)
+        let pkt = [0x80, 0x00, 0x40, 0x00, 0x05, 0xF4, 0x02];
+        match decode_move(&pkt).unwrap() {
+            InputEvent::Scroll { x, y, dx, dy } => {
+                assert!((x - 0.5).abs() < 0.01, "x ~0.5, got {x}");
+                assert!((y - 0.25).abs() < 0.01, "y ~0.25, got {y}");
+                assert_eq!(dx, 5.0);
+                assert_eq!(dy, -12.0); // 0xF4 as i8 = -12
+            }
+            other => panic!("expected Scroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_scroll_without_flag_bit_is_none() {
+        // 7 bytes but scroll bit (0x02) not set → not a known shape.
+        assert!(decode_move(&[0x80, 0x00, 0x40, 0x00, 0x05, 0xF4, 0x01]).is_none());
     }
 
     #[test]

@@ -58,6 +58,22 @@ pub const KEY_GAP_MS: u64 = 14;
 /// [`KEY_GAP_MS`], so Mirroring does not coalesce or drop adjacent key presses.
 pub const CHAR_GAP_MS: u64 = 22;
 
+/// Multiplier applied to client-reported pixel deltas before they become
+/// scroll-wheel pixel units in [`CgEventSink::scroll`].
+///
+/// iPhone Mirroring scrolls only on scroll-wheel events — a finger swipe was
+/// reaching it as a mouse-drag (long-press / icon-reorder, never a scroll). The
+/// client sends per-move CSS-pixel deltas; this scales them to a natural-feeling
+/// scroll. Tune for feel against the hardware.
+pub const SCROLL_SCALE: f64 = 1.6;
+
+/// Sign of the vertical scroll axis. Flip if the phone scrolls the wrong way:
+/// finger-up should scroll the content up (reveal what's below).
+pub const SCROLL_DIR_V: f64 = 1.0;
+
+/// Sign of the horizontal scroll axis. Flip if the phone pans the wrong way.
+pub const SCROLL_DIR_H: f64 = 1.0;
+
 // ── InputEvent ───────────────────────────────────────────────────────────────
 
 /// A caller-facing input event expressed in *normalized* coordinates.
@@ -78,6 +94,14 @@ pub enum InputEvent {
     /// The dwell is [`TAP_DWELL_MS`] ms; the real sink sleeps that amount
     /// between the two posts.  Test doubles do not sleep.
     Tap { x: f64, y: f64 },
+    /// Scroll-wheel gesture: position the cursor at `(x, y)` then scroll by the
+    /// pixel deltas `(dx, dy)`.
+    ///
+    /// `x`/`y` are normalized `[0, 1]` (the gesture anchor); `dx`/`dy` are the
+    /// per-move CSS-pixel deltas reported by the client. iPhone Mirroring only
+    /// scrolls on real scroll-wheel events, so swipes route here instead of
+    /// through `Move` (which is a mouse-drag and triggers long-press/reorder).
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
     /// Single key by name (e.g. `"return"`, `"escape"`, `"space"`).
     Key(String),
     /// Literal text to type.
@@ -106,6 +130,12 @@ pub trait EventSink {
     /// sleeps [`TAP_DWELL_MS`] before posting the up event to avoid triggering
     /// iOS long-press / jiggle mode.
     fn mouse_up(&mut self, sx: f64, sy: f64);
+
+    /// Scroll the view under the cursor at global screen point `(sx, sy)` by the
+    /// pixel deltas `(dx, dy)`. The real sink positions the hardware cursor at
+    /// `(sx, sy)` first (the scroll-wheel event applies at the cursor location)
+    /// then posts a scroll-wheel event.
+    fn scroll(&mut self, sx: f64, sy: f64, dx: f64, dy: f64);
 
     /// Key event by name (e.g. `"return"`, `"escape"`).
     fn key(&mut self, name: &str);
@@ -174,6 +204,12 @@ pub fn inject(
             sink.mouse_down(sx, sy);
             sink.mouse_up(sx, sy);
         }
+        InputEvent::Scroll { x, y, dx, dy } => {
+            // Only the anchor (x, y) is bounds-checked / mapped through geometry;
+            // the deltas are pixel amounts, passed through untouched.
+            let (sx, sy) = screen_or_err(*x, *y, geo)?;
+            sink.scroll(sx, sy, *dx, *dy);
+        }
         InputEvent::Key(name) => {
             sink.key(name);
         }
@@ -229,6 +265,7 @@ pub enum SinkCall {
     MouseDown { sx: f64, sy: f64 },
     MouseDragged { sx: f64, sy: f64 },
     MouseUp { sx: f64, sy: f64 },
+    Scroll { sx: f64, sy: f64, dx: f64, dy: f64 },
     Key(String),
     Text(String),
     Shortcut(String),
@@ -243,6 +280,9 @@ impl EventSink for RecordingSink {
     }
     fn mouse_up(&mut self, sx: f64, sy: f64) {
         self.calls.push(SinkCall::MouseUp { sx, sy });
+    }
+    fn scroll(&mut self, sx: f64, sy: f64, dx: f64, dy: f64) {
+        self.calls.push(SinkCall::Scroll { sx, sy, dx, dy });
     }
     fn key(&mut self, name: &str) {
         self.calls.push(SinkCall::Key(name.to_owned()));
@@ -473,6 +513,40 @@ impl EventSink for CgEventSink {
         Self::post_mouse(CGEventType::LeftMouseUp, sx, sy);
     }
 
+    fn scroll(&mut self, sx: f64, sy: f64, dx: f64, dy: f64) {
+        use core_graphics::event::{
+            CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
+        };
+        use core_graphics::geometry::CGPoint;
+        // The scroll-wheel event applies at the *current* hardware cursor
+        // location, and Mirroring scrolls the phone only when the cursor is
+        // inside its window — so move the cursor to the gesture anchor first
+        // (MouseMoved, no button held; this does not trigger a tap/long-press).
+        if let Ok(moved) = CGEvent::new_mouse_event(
+            Self::make_source(),
+            CGEventType::MouseMoved,
+            CGPoint::new(sx, sy),
+            CGMouseButton::Left,
+        ) {
+            moved.post(CGEventTapLocation::HID);
+        }
+        let wheel1 = (dy * SCROLL_SCALE * SCROLL_DIR_V) as i32; // vertical
+        let wheel2 = (dx * SCROLL_SCALE * SCROLL_DIR_H) as i32; // horizontal
+        if wheel1 == 0 && wheel2 == 0 {
+            return;
+        }
+        if let Ok(scroll) = CGEvent::new_scroll_event(
+            Self::make_source(),
+            ScrollEventUnit::PIXEL,
+            2, // wheel_count: vertical + horizontal
+            wheel1,
+            wheel2,
+            0,
+        ) {
+            scroll.post(CGEventTapLocation::HID);
+        }
+    }
+
     fn key(&mut self, name: &str) {
         match self.target {
             Some((pid, wid)) => self.cua_call("press_key", &press_key_json(pid, wid, name, false)),
@@ -590,6 +664,40 @@ mod tests {
             SinkCall::MouseUp { sx: 250.0, sy: 500.0 },
             "second call must be MouseUp at the same point"
         );
+    }
+
+    // ── Scroll ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_maps_anchor_through_geometry_and_passes_deltas() {
+        let geo = portrait_geo(); // content_rect x=100,y=200,w=300,h=600
+        let mut sink = RecordingSink::default();
+        inject(
+            &InputEvent::Scroll { x: 0.5, y: 0.5, dx: 3.0, dy: -7.0 },
+            &geo,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(sink.calls.len(), 1, "Scroll must emit exactly 1 call");
+        assert_eq!(
+            sink.calls[0],
+            SinkCall::Scroll { sx: 250.0, sy: 500.0, dx: 3.0, dy: -7.0 },
+            "anchor mapped to content center, deltas passed through untouched"
+        );
+    }
+
+    #[test]
+    fn scroll_out_of_bounds_anchor_emits_nothing() {
+        let geo = portrait_geo();
+        let mut sink = RecordingSink::default();
+        let err = inject(
+            &InputEvent::Scroll { x: 1.5, y: 0.5, dx: 0.0, dy: -5.0 },
+            &geo,
+            &mut sink,
+        );
+        assert_eq!(err, Err(InputError::OutOfBounds));
+        assert!(sink.calls.is_empty(), "nothing emitted on out-of-bounds anchor");
     }
 
     #[test]

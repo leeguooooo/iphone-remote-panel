@@ -13,8 +13,10 @@ serde_json = "1"
 # input.rs — CgEventSink uses CGEvent::post(HID) for mouse injection.
 # The elcapitan feature gates CGEventPostToPid (not needed here, but kept for
 # parity with the spikes crate that confirmed the API surface).
+# The highsierra feature gates CGEvent::new_scroll_event — used by the scroll
+# path (iPhone Mirroring scrolls only on scroll-wheel events, not mouse-drag).
 # Only used on macOS; the CgEventSink impl is #[cfg(target_os = "macos")].
-core-graphics = { version = "0.25", features = ["elcapitan"] }
+core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"] }
 
 # capture.rs / encode.rs video pipeline — cross-platform deps.
 # anyhow: error type for the public pipeline API.
