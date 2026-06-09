@@ -320,6 +320,47 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// US-ANSI virtual keycode + whether Shift is held, for a printable ASCII char.
+/// `None` for chars we can't map (non-ASCII / CJK). iPhone Mirroring forwards the
+/// keycode (not the Unicode payload), so text input must send real keycodes.
+fn char_to_keycode(c: char) -> Option<(u16, bool)> {
+    Some(match c {
+        'a' => (0, false), 'b' => (11, false), 'c' => (8, false), 'd' => (2, false),
+        'e' => (14, false), 'f' => (3, false), 'g' => (5, false), 'h' => (4, false),
+        'i' => (34, false), 'j' => (38, false), 'k' => (40, false), 'l' => (37, false),
+        'm' => (46, false), 'n' => (45, false), 'o' => (31, false), 'p' => (35, false),
+        'q' => (12, false), 'r' => (15, false), 's' => (1, false), 't' => (17, false),
+        'u' => (32, false), 'v' => (9, false), 'w' => (13, false), 'x' => (7, false),
+        'y' => (16, false), 'z' => (6, false),
+        'A' => (0, true), 'B' => (11, true), 'C' => (8, true), 'D' => (2, true),
+        'E' => (14, true), 'F' => (3, true), 'G' => (5, true), 'H' => (4, true),
+        'I' => (34, true), 'J' => (38, true), 'K' => (40, true), 'L' => (37, true),
+        'M' => (46, true), 'N' => (45, true), 'O' => (31, true), 'P' => (35, true),
+        'Q' => (12, true), 'R' => (15, true), 'S' => (1, true), 'T' => (17, true),
+        'U' => (32, true), 'V' => (9, true), 'W' => (13, true), 'X' => (7, true),
+        'Y' => (16, true), 'Z' => (6, true),
+        '0' => (29, false), '1' => (18, false), '2' => (19, false), '3' => (20, false),
+        '4' => (21, false), '5' => (23, false), '6' => (22, false), '7' => (26, false),
+        '8' => (28, false), '9' => (25, false),
+        ')' => (29, true), '!' => (18, true), '@' => (19, true), '#' => (20, true),
+        '$' => (21, true), '%' => (23, true), '^' => (22, true), '&' => (26, true),
+        '*' => (28, true), '(' => (25, true),
+        ' ' => (49, false), '\n' => (36, false), '\t' => (48, false),
+        '-' => (27, false), '_' => (27, true),
+        '=' => (24, false), '+' => (24, true),
+        '[' => (33, false), '{' => (33, true),
+        ']' => (30, false), '}' => (30, true),
+        '\\' => (42, false), '|' => (42, true),
+        ';' => (41, false), ':' => (41, true),
+        '\'' => (39, false), '"' => (39, true),
+        ',' => (43, false), '<' => (43, true),
+        '.' => (47, false), '>' => (47, true),
+        '/' => (44, false), '?' => (44, true),
+        '`' => (50, false), '~' => (50, true),
+        _ => return None,
+    })
+}
+
 /// Build the JSON for `cua-driver call press_key`.
 fn press_key_json(pid: i32, window_id: u32, key: &str, cmd: bool) -> String {
     let mods = if cmd { r#","modifiers":["cmd"]"# } else { "" };
@@ -428,25 +469,34 @@ impl EventSink for CgEventSink {
     }
 
     fn text(&mut self, s: &str) {
-        // Type via CGEvent keyboard events with the Unicode string set, posted to
-        // the HID tap — the SAME path the mouse uses, which iPhone Mirroring
-        // forwards to the phone. cua-driver `type_text` inserts into the Mac
-        // window's AX tree, which the phone never receives (Hermes-confirmed), so
-        // we synthesize real key events instead. The target field on the phone
-        // must already be focused (e.g. Spotlight after ⌘3, or a tapped field).
-        use core_graphics::event::{CGEvent, CGEventTapLocation};
+        // iPhone Mirroring forwards the key's VIRTUAL KEYCODE to the phone, NOT
+        // the CGEvent Unicode payload — so `CGEventKeyboardSetUnicodeString` is
+        // ignored and every char arrives as keycode 0 ('a'). We must post the
+        // real keycode (+ Shift) per char, to the HID tap (the mouse path). The
+        // phone field must already be focused. Non-ASCII (CJK) has no US keycode
+        // and is skipped — that needs an on-phone IME, out of scope here.
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
         for ch in s.chars() {
-            let mut buf = [0u16; 2];
-            let utf16: &[u16] = ch.encode_utf16(&mut buf);
-            if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), 0, true) {
-                down.set_string_from_utf16_unchecked(utf16);
+            let (kc, shift) = match char_to_keycode(ch) {
+                Some(v) => v,
+                None => {
+                    eprintln!("text: no US keycode for {ch:?}; skipping (non-ASCII?)");
+                    continue;
+                }
+            };
+            let flags = if shift {
+                CGEventFlags::CGEventFlagShift
+            } else {
+                CGEventFlags::empty()
+            };
+            if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), kc, true) {
+                down.set_flags(flags);
                 down.post(CGEventTapLocation::HID);
             }
-            if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), 0, false) {
-                up.set_string_from_utf16_unchecked(utf16);
+            if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), kc, false) {
+                up.set_flags(flags);
                 up.post(CGEventTapLocation::HID);
             }
-            // tiny gap so the receiver registers distinct keystrokes
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
@@ -754,6 +804,19 @@ mod tests {
             press_key_json(7, 9, "a", false),
             r#"{"pid":7,"window_id":9,"key":"a"}"#
         );
+    }
+
+    #[test]
+    fn char_to_keycode_covers_ascii() {
+        assert_eq!(char_to_keycode('a'), Some((0, false)));
+        assert_eq!(char_to_keycode('A'), Some((0, true)));
+        assert_eq!(char_to_keycode('1'), Some((18, false)));
+        assert_eq!(char_to_keycode('!'), Some((18, true))); // shift+1
+        assert_eq!(char_to_keycode(' '), Some((49, false)));
+        assert_eq!(char_to_keycode('?'), Some((44, true))); // shift+/
+        assert_eq!(char_to_keycode('-'), Some((27, false)));
+        assert_eq!(char_to_keycode('_'), Some((27, true)));
+        assert_eq!(char_to_keycode('中'), None); // non-ASCII → skipped
     }
 
     #[test]
