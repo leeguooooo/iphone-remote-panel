@@ -58,9 +58,19 @@ pub async fn build_viewer_pc(
     let registry = Registry::new();
     let registry = register_default_interceptors(registry, &mut media_engine)?;
 
+    // Drop IPv6 link-local (`fe80::/10`) candidates: webrtc-rs fails to bind them
+    // ("Can't assign requested address", os error 49), which spams the log and can
+    // stall candidate pairing. LAN (IPv4), STUN and TURN don't need them.
+    let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+    setting_engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+        std::net::IpAddr::V4(_) => true,
+    }));
+
     let api = APIBuilder::new()
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
         .build();
 
     let config = RTCConfiguration {
