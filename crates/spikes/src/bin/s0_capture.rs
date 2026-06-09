@@ -223,17 +223,49 @@ fn find_mirroring_window(
         return Err(listing);
     }
 
-    // Prefer: on-screen AND size in the phone-ish range, then on-screen, then
-    // anything.
-    let pick = candidates
+    // Selection: the phone-shape size filter is a far stronger signal than
+    // SCK's is_on_screen (which reported false for the real 354x781 window on
+    // one host while several 1800x39 menubar extras also matched the name).
+    // So: among size_ok candidates pick the LARGEST area (the phone, not a
+    // menubar sliver), preferring on-screen as a tiebreak; only if none are
+    // size_ok fall back to on-screen / largest / first.
+    let area = |w: &screencapturekit::shareable_content::SCWindow| {
+        let f = w.get_frame();
+        f.size.width * f.size.height
+    };
+    // A setup/welcome dialog ("Welcome to iPhone Mirroring") is size_ok but is
+    // NOT the live mirror — skip it when a real phone window is also present.
+    let is_setup = |w: &screencapturekit::shareable_content::SCWindow| {
+        w.title().to_lowercase().contains("welcome")
+    };
+    let mut size_matches: Vec<_> = candidates
         .iter()
-        .find(|w| {
+        .filter(|w| {
             let f = w.get_frame();
-            w.is_on_screen() && size_ok(f.size.width, f.size.height)
+            size_ok(f.size.width, f.size.height)
         })
-        .or_else(|| candidates.iter().find(|w| w.is_on_screen()))
-        .or_else(|| candidates.first())
-        .cloned()
+        .collect();
+    if size_matches.iter().any(|w| !is_setup(w)) {
+        size_matches.retain(|w| !is_setup(w));
+    }
+
+    let pick = size_matches
+        .iter()
+        .max_by(|a, b| {
+            // on-screen wins ties, then larger area
+            (a.is_on_screen(), area(a))
+                .partial_cmp(&(b.is_on_screen(), area(b)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|w| (*w).clone())
+        .or_else(|| candidates.iter().find(|w| w.is_on_screen()).cloned())
+        .or_else(|| {
+            candidates
+                .iter()
+                .max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned()
+        })
+        .or_else(|| candidates.first().cloned())
         .expect("candidates is non-empty");
 
     Ok(pick)
