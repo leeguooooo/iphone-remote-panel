@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# S0a capture probe output
+/s0-frames/
+crates/spikes/s0-frames/
+
 __pycache__/
 *.py[cod]
 .DS_Store
