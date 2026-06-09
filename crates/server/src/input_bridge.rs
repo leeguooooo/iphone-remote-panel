@@ -39,6 +39,9 @@ pub enum ControlMsg {
     Up { x: f64, y: f64 },
     Tap { x: f64, y: f64 },
     Longpress { x: f64, y: f64 },
+    /// Scroll-wheel gesture. Carried as binary on the move channel for the human
+    /// client, but accepted here as JSON too so the agent HTTP API can scroll.
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
     Shortcut { name: String },
     Text { text: String },
     Key { name: String },
@@ -63,6 +66,7 @@ pub fn control_to_event(msg: ControlMsg) -> InputEvent {
         // A long-press is a press that the client times on its side; we register
         // it as a Down (the matching `up` releases it).
         ControlMsg::Longpress { x, y } => InputEvent::Down { x, y },
+        ControlMsg::Scroll { x, y, dx, dy } => InputEvent::Scroll { x, y, dx, dy },
         ControlMsg::Shortcut { name } => InputEvent::Shortcut(name),
         ControlMsg::Text { text } => InputEvent::Text(text),
         ControlMsg::Key { name } => InputEvent::Key(name),
@@ -254,6 +258,12 @@ mod tests {
     fn decode_control_key() {
         let ev = decode_control(r#"{"type":"key","name":"return"}"#).unwrap();
         assert_eq!(ev, InputEvent::Key("return".to_string()));
+    }
+
+    #[test]
+    fn decode_control_scroll() {
+        let ev = decode_control(r#"{"type":"scroll","x":0.5,"y":0.5,"dx":0.0,"dy":-12.0}"#).unwrap();
+        assert_eq!(ev, InputEvent::Scroll { x: 0.5, y: 0.5, dx: 0.0, dy: -12.0 });
     }
 
     #[test]

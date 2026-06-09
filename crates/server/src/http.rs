@@ -24,7 +24,7 @@ use axum::{
     extract::{ws::WebSocketUpgrade, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Form, Router,
 };
 use serde::Deserialize;
@@ -81,6 +81,10 @@ pub struct AppState {
     pub current_lease: Arc<Mutex<Option<Lease>>>,
     /// Input injector (decoded events → CgEventSink on its own thread).
     pub injector: InputInjector,
+    /// cua-driver target `(binary_path, pid, window_id)` of the Mirroring window,
+    /// if found — used by the agent API to report `phone_target` (and, later, to
+    /// capture screenshots). `None` = pointer-only (no key/text/shortcut target).
+    pub cua_target: Option<(String, i32, u32)>,
 }
 
 /// Build the axum router for the daemon.
@@ -92,6 +96,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/logout", get(logout))
         .route("/turn-creds", get(turn_creds))
         .route("/ws", get(ws_upgrade))
+        // Agent operation entry (connect-in; reuses the validated injector +
+        // control lease). Bearer-token auth; see `agent_input` / `agent_status`.
+        .route("/agent/status", get(agent_status))
+        .route("/agent/input", post(agent_input))
         .with_state(state)
 }
 
@@ -279,6 +287,98 @@ async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .unwrap();
     resp = with_security_headers(resp);
     resp
+}
+
+// ---------------------------------------------------------------------------
+// Agent operation entry (connect-in HTTP API)
+// ---------------------------------------------------------------------------
+//
+// An agent (Hermes, a Claude MCP client, a script) drives the phone by POSTing
+// control messages to the *already-running, TCC-granted* daemon — never by
+// spawning its own input process (macOS's responsible-process rule makes a
+// spawned child's CGEvents untrusted). The daemon injects through the same
+// validated path as the human WebRTC client, taking an `Agent` control lease.
+
+/// Extract a `Authorization: Bearer <token>` value.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    v.strip_prefix("Bearer ").map(|s| s.trim().to_string())
+}
+
+/// Return `true` if the request may use the agent API.
+///
+/// When a password is configured the agent must present it as a bearer token
+/// (`Authorization: Bearer <password>`). With no password the daemon is in open
+/// LAN-dev mode and the agent API is open too — same policy as [`is_authed`].
+fn is_agent_authed(state: &AppState, headers: &HeaderMap) -> bool {
+    match &state.password {
+        None => true,
+        Some(pw) => bearer_token(headers).is_some_and(|t| {
+            // length-checked byte compare (avoids early-exit on first mismatch)
+            let (a, b) = (t.as_bytes(), pw.as_bytes());
+            a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        }),
+    }
+}
+
+/// `GET /agent/status` — auth/health probe. `{"ok":true,"phone_target":bool}`.
+///
+/// `phone_target` reports whether the daemon has a cua-driver window target
+/// (needed for key/text/shortcut); pointer/tap/scroll work regardless.
+async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_agent_authed(&state, &headers) {
+        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    }
+    let body = format!(
+        r#"{{"ok":true,"phone_target":{}}}"#,
+        state.cua_target.is_some()
+    );
+    let resp = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    with_security_headers(resp)
+}
+
+/// `POST /agent/input` — inject one control message (same JSON shape as the
+/// WebRTC control channel): `{"type":"tap","x":0.5,"y":0.5}`,
+/// `{"type":"text","text":"hi"}`, `{"type":"scroll","x":..,"y":..,"dx":..,"dy":..}`,
+/// `{"type":"shortcut","name":"home"}`, `{"type":"key","name":"return"}`, etc.
+///
+/// Coordinates are normalized `[0,1]` over the phone content rect (geometry-agnostic,
+/// like the web client). Acquiring an `Agent` control lease makes the injector gate
+/// allow the event; this preempts a human viewer (single shared cursor, last actor
+/// wins). Returns 200 on accept, 400 on an unparseable message.
+async fn agent_input(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !is_agent_authed(&state, &headers) {
+        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    }
+    let event = match crate::input_bridge::decode_control(&body) {
+        Some(ev) => ev,
+        None => {
+            return with_security_headers(
+                (StatusCode::BAD_REQUEST, "invalid control message").into_response(),
+            );
+        }
+    };
+    // Take an Agent lease so the injector gate permits this event.
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("agent")
+        .to_string();
+    {
+        let mut control = state.control.lock().unwrap();
+        let lease = control.acquire(core::control::Holder::Agent(agent_id), now_secs());
+        *state.current_lease.lock().unwrap() = Some(lease);
+    }
+    state.injector.send(event);
+    with_security_headers((StatusCode::OK, "ok").into_response())
 }
 
 async fn ws_upgrade(

@@ -183,6 +183,9 @@ fn serve() -> Result<()> {
     // gated on the human lease being current).
     let control = Arc::new(Mutex::new(core::control::Control::new()));
     let current_lease = Arc::new(Mutex::new(None::<core::control::Lease>));
+    // Keep a copy for the agent API (status / future screenshot) before the
+    // original is moved into the injector thread.
+    let cua_target_for_state = cua_target.clone();
     let injector = {
         let control = control.clone();
         let current_lease = current_lease.clone();
@@ -213,6 +216,7 @@ fn serve() -> Result<()> {
         control,
         current_lease,
         injector,
+        cua_target: cua_target_for_state,
     });
 
     run_server(cfg, state)

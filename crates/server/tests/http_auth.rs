@@ -78,6 +78,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         control: Arc::new(Mutex::new(Control::new())),
         current_lease: Arc::new(Mutex::new(None)),
         injector,
+        cua_target: None,
     })
 }
 
@@ -270,5 +271,122 @@ fn logout_clears_cookie() {
             .to_str()
             .unwrap();
         assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
+    });
+}
+
+// ── Agent operation entry (/agent/*) ─────────────────────────────────────────
+
+#[test]
+fn agent_status_requires_bearer_when_password_set() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        // No bearer → 401.
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/agent/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct bearer → 200 + JSON.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = String::from_utf8_lossy(&body);
+        assert!(json.contains("\"ok\":true"), "{json}");
+        assert!(json.contains("\"phone_target\":false"), "{json}");
+    });
+}
+
+#[test]
+fn agent_input_rejects_wrong_bearer() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::from(r#"{"type":"tap","x":0.5,"y":0.5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+}
+
+#[test]
+fn agent_input_accepts_valid_message_with_bearer() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        for body in [
+            r#"{"type":"tap","x":0.5,"y":0.5}"#,
+            r#"{"type":"scroll","x":0.5,"y":0.5,"dx":0.0,"dy":-12.0}"#,
+            r#"{"type":"text","text":"hello"}"#,
+            r#"{"type":"shortcut","name":"home"}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/agent/input")
+                        .header(header::AUTHORIZATION, "Bearer hunter2")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "body={body}");
+        }
+    });
+}
+
+#[test]
+fn agent_input_rejects_garbage_body() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    });
+}
+
+#[test]
+fn agent_open_mode_allows_without_bearer() {
+    block(async {
+        // No password configured → open LAN-dev mode; agent API is open too.
+        let app = http::router(build_state(None));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .body(Body::from(r#"{"type":"tap","x":0.1,"y":0.1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     });
 }
