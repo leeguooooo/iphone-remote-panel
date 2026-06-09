@@ -57,6 +57,19 @@ fn area(w: &WindowInfo) -> f64 {
     w.w * w.h
 }
 
+/// Minimum height/width ratio for a real phone content window.
+///
+/// iPhone Mirroring is portrait-locked, so the live phone window is always
+/// clearly taller than wide (a real 312×694 window is 2.22; even an iPhone SE
+/// is ~1.78). A spurious near-square SCK window — e.g. the hidden 500×500
+/// off-screen one a hardware test caught winning on raw area — is rejected here.
+const PHONE_MIN_ASPECT: f64 = 1.5;
+
+/// Return `true` if the window is portrait phone-shaped (tall, not square/wide).
+fn is_phone_shaped(w: &WindowInfo) -> bool {
+    w.w > 0.0 && w.h >= w.w * PHONE_MIN_ASPECT
+}
+
 /// Select the best iPhone Mirroring window from a slice.
 ///
 /// Algorithm:
@@ -64,8 +77,11 @@ fn area(w: &WindowInfo) -> f64 {
 /// 2. Among candidates, find those with `size_ok`.
 /// 3. If any `size_ok` candidates exist:
 ///    a. If there are also `size_ok` non-setup candidates, discard setup windows.
-///    b. Sort survivors by: (area DESC, on_screen DESC), pick first.
-/// 4. If no `size_ok` candidate: fall back to on_screen first, then largest, then first.
+///    b. Sort survivors by: (phone-shaped DESC, on_screen DESC, area DESC, lower id),
+///       pick first. Portrait shape leads so a spurious near-square SCK window
+///       can't win on raw area (a hardware test caught a hidden 500×500 window
+///       outscoring the real 312×694 phone).
+/// 4. If no `size_ok` candidate: fall back to the same ranking over all candidates.
 /// 5. Return `None` if no candidates at all.
 pub fn select_mirroring(windows: &[WindowInfo]) -> Option<&WindowInfo> {
     let candidates: Vec<&WindowInfo> = windows.iter().filter(|w| is_candidate(w)).collect();
@@ -93,18 +109,26 @@ pub fn select_mirroring(windows: &[WindowInfo]) -> Option<&WindowInfo> {
         candidates
     };
 
-    // Pick best: largest area first, break ties by on_screen (true > false), then by id (stable).
+    // Rank: phone-shaped (portrait) first so a near-square junk window can't win
+    // on raw area; then on_screen; then largest area; then lower id for stability.
+    use std::cmp::Ordering;
     pool.into_iter().max_by(|a, b| {
-        let area_cmp = area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal);
-        if area_cmp != std::cmp::Ordering::Equal {
+        match (is_phone_shaped(a), is_phone_shaped(b)) {
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            _ => {}
+        }
+        match (a.on_screen, b.on_screen) {
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            _ => {}
+        }
+        let area_cmp = area(a).partial_cmp(&area(b)).unwrap_or(Ordering::Equal);
+        if area_cmp != Ordering::Equal {
             return area_cmp;
         }
-        // tie-break: on_screen preferred
-        match (a.on_screen, b.on_screen) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => std::cmp::Ordering::Equal,
-        }
+        // stable: prefer the lower window id (so it's `Greater` in max_by)
+        b.id.cmp(&a.id)
     })
 }
 
@@ -265,6 +289,28 @@ mod tests {
         let windows = [w1, w2];
         let sel = select_mirroring(&windows).unwrap();
         assert_eq!(sel.id, 2);
+    }
+
+    // --- spurious near-square SCK window must not win on area ---
+
+    #[test]
+    fn rejects_square_window_outscoring_real_phone_on_area() {
+        // Hardware-caught regression: a hidden 500×500 SCK window (area 250000)
+        // outscored the real 312×694 phone (area 216528) under area-first ranking.
+        // Portrait shape must win regardless of the larger area.
+        let mut square = phone_window(77, 500.0, 500.0);
+        square.title = String::new(); // off-screen/empty-title junk window
+        square.on_screen = false;
+        let windows = vec![square, phone_window(10, 312.0, 694.0)];
+        let sel = select_mirroring(&windows).unwrap();
+        assert_eq!(sel.id, 10, "must pick the portrait phone, not the bigger square");
+    }
+
+    #[test]
+    fn among_two_portrait_phones_larger_area_still_wins() {
+        // Shape tie → area still decides (no regression to picks_largest).
+        let windows = vec![phone_window(1, 312.0, 694.0), phone_window(2, 390.0, 844.0)];
+        assert_eq!(select_mirroring(&windows).unwrap().id, 2);
     }
 
     // --- menubar (out-of-size) falls back ---
