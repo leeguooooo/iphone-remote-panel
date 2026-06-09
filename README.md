@@ -2,20 +2,41 @@
 
 A small authenticated web remote for macOS iPhone Mirroring.
 
-## Architecture (v2 — WebRTC rebuild, in design)
+## Architecture (v2 — WebRTC rebuild)
 
 ![Architecture](assets/architecture.png)
 
-A single Rust binary captures the macOS iPhone Mirroring window with
-ScreenCaptureKit, hardware-encodes it to H.264 with VideoToolbox, and streams it
-over WebRTC. The same capture/input core serves two front-ends: a human client
-(iPhone Safari — live video + continuous touch) and an agent client (Hermes and
-other agents via MCP). Touch is injected as continuous `CGEvent`s for native-feel
-drag/swipe; a mutex grants control to one side at a time (a human tap pre-empts an
-agent). Cloudflare carries signaling (over the tunnel) and TURN for NAT traversal.
+A Rust daemon captures the macOS iPhone Mirroring window with ScreenCaptureKit,
+hardware-encodes it to H.264 with VideoToolbox, and streams it over WebRTC. The same
+capture/input core serves two front-ends: a human client (iPhone Safari — live video +
+continuous touch) and an agent client (Hermes and other agents via MCP). Touch is
+injected back as continuous `CGEvent`s via the system session/HID event tap (the dashed
+`session-tap` path). Cloudflare carries signaling (over the tunnel) and TURN for NAT
+traversal.
 
-> The sections below document the current (v1) screenshot-polling implementation,
-> which still ships until v2 lands.
+### Deployment — a GUI-session LaunchAgent
+
+![Deployment](assets/deployment.png)
+
+ScreenCaptureKit (Screen Recording) and input injection (Accessibility) require TCC
+grants tied to a signed identity **in the login session** — an SSH-spawned binary is
+denied. So the daemon runs as a codesigned **LaunchAgent** in the desktop session,
+granted once; SSH shells, Hermes, and the iPhone Safari controller all **connect to it**.
+
+### Control lease — one cursor, one controller
+
+![Control and input](assets/control-input.png)
+
+Session/HID-tap input drives the host Mac's **one real cursor** with the Mirroring window
+frontmost. A mandatory **control lease** grants that single cursor to one controller at a
+time; a human touch **pre-empts** an in-flight agent gesture (the agent can still observe).
+Without the lease, human and agent would corrupt each other's gestures fighting over the
+same cursor.
+
+> Phase 0 (capture + input) is validated on real hardware; see
+> `docs/superpowers/specs/2026-06-09-iphone-remote-webrtc-design.md` and `SPIKE-RESULTS.md`.
+> The sections below document the current (v1) screenshot-polling implementation, which
+> still ships until v2 lands.
 
 It serves a local page at `http://127.0.0.1:8787/phone` with:
 
