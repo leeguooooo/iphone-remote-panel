@@ -199,20 +199,55 @@ git commit -m "spike: S0 capture real Mirroring window + H.264 browser decode"
 - [ ] **Step 3:** Exercise credential refresh via `setConfiguration()` and an ICE restart;
   confirm the session survives. Record + commit.
 
-## Phase 0 GATE
+## Phase 0 GATE — ✅ PASSED (2026-06-09)
 
-- [ ] **Write the gate decision** at the top of `SPIKE-RESULTS.md`: input path
-  (self-contained / focus-first / fallback), capture viability + working states, locked
-  crates, and any design deltas to fold back into the spec. Then expand Phase 2 and
-  Phase 3 to bite-sized steps using the gate outcomes. **Stop-and-re-brainstorm
-  conditions:** S0 or S1 hard-fail (no capture / no input — fatal to everything); **S2
-  fail** = iOS Safari can't decode the stream (fatal to the human path — investigate
-  H.264 profile/level before continuing); **S3 fail** = no relayed path (degrade to
-  LAN-only and defer public access, not a full stop).
+Both blockers passed on real hardware after a debugging round (see `SPIKE-RESULTS.md`
+and spec §9). Locked outcomes folded into the spec:
 
-```bash
-git add SPIKE-RESULTS.md && git commit -m "docs: Phase 0 spike gate decision"
-```
+- **S0 capture:** PASS — `NSApplicationLoad()` fixes the `CGS_REQUIRE_INIT` abort; real
+  non-black live frames captured. Window-picker fixed; drop idle `CouldNotGetDataBuffer`.
+- **S1 input:** PASS (as S1b) — `CGEvent::post(HID/Session)` at global coords, window
+  **frontmost**, drives the phone (`post_to_pid` does not). Commandeers the real cursor.
+- **Deployment constraint (validated):** SSH-spawned binary is TCC-denied → the daemon
+  must run as a **GUI-session signed LaunchAgent** (spec §5). Control lease is **mandatory**.
+- **Crates locked:** `screencapturekit` + `videotoolbox` (next) + `webrtc-rs`.
+
+**Remaining spikes before the full build:** **S0b** (encode→WebRTC→browser decode),
+then **S2** (iOS Safari receive) and **S3** (Cloudflare TURN). Stop-and-re-brainstorm
+only if **S2** fails (iOS can't decode → investigate H.264 profile/level) — **S3** fail
+just degrades to LAN-only.
+
+The Phase 0 gate commits already exist (`869c79f`…`c3d8f16`, `9e6edac`). Next executable
+unit is the **S0b spike**, below.
+
+---
+
+# Phase 0b — Encode + WebRTC spike (last gate before the build)
+
+The macOS capture/input assumptions are settled; this proves the WebRTC half before we
+commit to the full server. Throwaway probe under `crates/spikes/`, run in the granted GUI
+session on the host.
+
+## Spike S0b — capture → VideoToolbox H.264 → webrtc-rs → browser
+
+**Files:** Create `crates/spikes/src/bin/s0b_encode_webrtc.rs`
+
+- [ ] **Step 1:** Reuse the working `s0_capture` pipeline (NSApplicationLoad, window
+  picker, frame channel) as the source.
+- [ ] **Step 2:** Feed frames to **VideoToolbox** realtime H.264 — Constrained Baseline,
+  `packetization-mode=1`, no B-frames, forced IDR at start, **in-band SPS/PPS before each
+  IDR**. Print encoded NAL sizes.
+- [ ] **Step 3:** Publish the H.264 stream on a **`webrtc-rs`** video track; serve a tiny
+  local signaling page with a `<video>`.
+- [ ] **Step 4:** Open in **desktop** Chrome/Safari over LAN; confirm it decodes and
+  renders the live phone. Measure rough latency.
+- [ ] **Step 5:** Record outcome in `SPIKE-RESULTS.md` (PASS = browser shows live video);
+  commit `spike: S0b capture→H264→webrtc browser decode`.
+- [ ] **Step 6 (S2, same probe):** open the same page in **iOS Safari** with the explicit
+  `play()` gesture; confirm decode + the two data-channel classes round-trip. Record.
+
+**Gate:** S0b/S2 PASS → start Phase 1. If iOS Safari can't decode, fix H.264
+profile/level before building the server.
 
 ---
 
@@ -353,20 +388,27 @@ git add SPIKE-RESULTS.md && git commit -m "docs: Phase 0 spike gate decision"
   video. Record latency.
 - [ ] **Step 7:** Commit `feat: live H.264 WebRTC video from Mirroring window`.
 
-## Task 8: `core::input` — CGEvent injection (from S1 gate)
+## Task 8: `core::input` — CGEvent injection (S1b-validated path)
 
 **Files:**
 - Create: `crates/core/src/input.rs`
 
-- [ ] **Step 1:** Implement `inject(event: InputEvent, geo: &SessionGeometry)` mapping
-  normalized coords via `core::coords` → screen point → CGEvent (or the focus-first /
-  cua-driver path the S1 gate selected). Phases: down→`mouseDown`, move→`mouseDragged`,
-  up→`mouseUp`; `Key`/`Text`/`Shortcut` per gate.
-- [ ] **Step 2:** Unit-test the *mapping/decision* logic (which path, which CGEvent type)
-  with the OS post mocked; the real post is manual.
-- [ ] **Step 3:** `cargo test -p core input::` → PASS.
-- [ ] **Step 4:** Manual: confirm a programmatic down→drag→up moves the phone.
-- [ ] **Step 5:** Commit `feat(core): CGEvent input injection`.
+- [ ] **Step 1:** Implement `inject(event, geo)` mapping normalized coords via
+  `core::coords` → **global screen point** → `CGEvent::post(CGEventTapLocation::HID)`
+  (the S1b-proven path; **not** `post_to_pid`). Before a gesture, **bring the Mirroring
+  window frontmost**. Phases: down→`mouseDown`, move→`mouseDragged`, up→`mouseUp`.
+  Reuse the `s1b_session_input` probe as the reference.
+- [ ] **Step 1b:** Implement **tap-vs-long-press timing**: a quick tap must complete fast
+  enough not to trigger jiggle/edit mode (the probe's ~100 ms press did). Map iPhone
+  touch duration → CGEvent dwell deliberately; add a short, configurable tap dwell.
+- [ ] **Step 2:** Provide a **`cua-driver` fallback** path behind the same `inject`
+  interface (insurance / discrete actions / when frontmost can't be guaranteed).
+- [ ] **Step 3:** Unit-test the *mapping/decision* logic (path selection, CGEvent type,
+  dwell) with the OS post mocked; the real post is manual.
+- [ ] **Step 4:** `cargo test -p core input::` → PASS.
+- [ ] **Step 5:** Manual (on the granted host): a programmatic tap opens an app; a drag
+  scrolls; a quick tap does NOT enter jiggle mode.
+- [ ] **Step 6:** Commit `feat(core): session-tap CGEvent input injection + cua-driver fallback`.
 
 ## Task 9: Wire input end-to-end (two data channels)
 
@@ -429,13 +471,18 @@ git add SPIKE-RESULTS.md && git commit -m "docs: Phase 0 spike gate decision"
   `http.rs`** (stubbed/LAN in Task 7) that issues ephemeral Cloudflare creds with TTL >
   session; client refreshes via `setConfiguration()` before expiry; ICE restart on path
   loss. Manual: rotate mid-session, force a network change.
-- [ ] **Task 18 — `serve`/`stop` + tunnel:** `serve` runs preflight, starts host, brings
-  up `cloudflared` (external prereq; health-check it), prints local/tunnel URL +
-  password; `stop` kills recorded pids. Replace the v1 bash scripts.
-- [ ] **Task 19 — distribution:** `install.sh` (`curl … | sh`), per-platform binary build
-  + attach to **GitHub Release** in `.github/workflows/release-binaries.yml` (no npm
-  registry, per project convention). README rewrite for v2 (HTML per global doc rule if
-  user-facing; repo README stays `.md`).
+- [ ] **Task 18 — `serve`/`stop`/`status` + LaunchAgent:** `serve` (foreground) runs the
+  TCC preflight, `NSApplicationLoad()`, starts capture/input/WebRTC/MCP/HTTP, brings up
+  `cloudflared` (external prereq; health-check it), prints local/tunnel URL + password.
+  `stop`/`status` manage the **GUI-session LaunchAgent** (`launchctl bootstrap gui/$UID`).
+  Replace the v1 bash scripts. **Must run in the login session — not over SSH** (validated
+  TCC constraint, spec §5).
+- [ ] **Task 19 — distribution:** `install.sh` (`curl … | sh`) that installs the
+  **codesigned** daemon, writes the `~/Library/LaunchAgents/…plist`, bootstraps it, and
+  walks the user through granting **Screen Recording + Accessibility once**. Per-platform
+  build + attach to **GitHub Release** in `.github/workflows/release-binaries.yml` (no npm
+  registry). README rewrite for v2 (HTML per global doc rule if user-facing; repo README
+  stays `.md`).
 - [ ] **Task 20 — retire v1:** delete `phone_remote_server.py` + `scripts/*` once v2
   reaches parity; update README "current implementation" section.
 
