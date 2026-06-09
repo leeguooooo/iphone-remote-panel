@@ -1,0 +1,13 @@
+[package]
+name = "spikes"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "s1_input"
+path = "src/bin/s1_input.rs"
+
+[dependencies]
+# elcapitan feature gates CGEvent::post_to_pid (CGEventPostToPid).
+# highsierra is not needed — we use only mouse events, not scroll.
+core-graphics = { version = "0.25.0", features = ["elcapitan"] }
