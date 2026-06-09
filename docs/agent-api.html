@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone Remote — Agent API</title>
+<style>
+  :root {
+    --fg: #1a1a1a; --muted: #6b6b6b; --bg: #fbfbfa; --card: #ffffff;
+    --border: #e6e4df; --accent: #c0392b; --code-bg: #f4f2ee; --ok: #2e7d32;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 1.25rem 5rem; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.page { padding: 3rem 0 1.5rem; border-bottom: 2px solid var(--fg); margin-bottom: 2rem; }
+  header.page h1 { margin: 0 0 .3rem; font-size: 2rem; letter-spacing: -.02em; }
+  header.page p { margin: 0; color: var(--muted); }
+  h2 { margin: 2.6rem 0 .8rem; font-size: 1.3rem; letter-spacing: -.01em;
+       padding-bottom: .3rem; border-bottom: 1px solid var(--border); }
+  h3 { margin: 1.8rem 0 .5rem; font-size: 1.02rem; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: var(--code-bg); padding: .12em .4em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 1rem 1.1rem; overflow-x: auto; font-size: .86rem; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: .92rem; }
+  th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; }
+  .method { font-family: ui-monospace, monospace; font-weight: 700; font-size: .82rem;
+            padding: .12em .5em; border-radius: 4px; color: #fff; }
+  .get { background: #2e7d32; } .post { background: #1565c0; }
+  .ep { font-family: ui-monospace, monospace; font-weight: 600; }
+  aside { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+          border-radius: 6px; padding: .8rem 1rem; margin: 1.2rem 0; font-size: .92rem; }
+  aside.note { border-left-color: var(--accent); }
+  .muted { color: var(--muted); }
+  .pill { display: inline-block; background: var(--code-bg); border: 1px solid var(--border);
+          border-radius: 999px; padding: .05em .6em; font-size: .8rem; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <h1>iPhone Remote — Agent API</h1>
+  <p>Connect-in HTTP control for agents (Hermes, Claude MCP clients, scripts).</p>
+</header>
+
+<p>
+  An agent drives the iPhone by talking to the <strong>already-running daemon</strong> over
+  HTTP — it does <em>not</em> spawn its own input process. This is a hard requirement on macOS:
+  under the responsible-process rule a spawned child's synthetic events (<code>CGEvent</code>) are
+  untrusted and silently dropped, whereas the daemon runs as a launchd LaunchAgent with Screen
+  Recording + Accessibility granted. So the agent <strong>connects in</strong> and the daemon
+  injects through the same validated path as the human WebRTC client.
+</p>
+
+<h2>Authentication</h2>
+<p>
+  Every <code>/agent/*</code> endpoint takes the daemon password as a bearer token:
+</p>
+<pre><code>Authorization: Bearer &lt;PHONE_REMOTE_PASSWORD&gt;</code></pre>
+<p class="muted">
+  When the daemon runs with no password (open LAN-dev mode) the agent API is open too — the same
+  policy as the browser cookie gate. The bearer is compared in length-checked constant time.
+</p>
+
+<h2>Endpoints</h2>
+
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td><span class="method get">GET</span></td><td class="ep">/agent/status</td><td>Auth / health probe.</td></tr>
+  <tr><td><span class="method post">POST</span></td><td class="ep">/agent/input</td><td>Inject one control message.</td></tr>
+  <tr><td><span class="method get">GET</span></td><td class="ep">/agent/screenshot</td><td>Current phone screen as PNG.</td></tr>
+</table>
+
+<h3><span class="method get">GET</span> <span class="ep">/agent/status</span></h3>
+<p>Returns <code>200</code> with JSON when the bearer is valid.</p>
+<pre><code>{ "ok": true, "phone_target": true }</code></pre>
+<p class="muted">
+  <code>phone_target</code> is <code>true</code> when the daemon found a cua-driver window target
+  (needed for <code>text</code>/<code>key</code>/<code>shortcut</code> and for screenshots).
+  Pointer events (<code>tap</code>/<code>scroll</code>) work either way.
+</p>
+
+<h3><span class="method post">POST</span> <span class="ep">/agent/input</span></h3>
+<p>
+  Body is a single control message — the <strong>same JSON shape</strong> as the WebRTC control
+  channel. Coordinates are normalized <span class="pill">[0,1]</span> over the phone's content
+  rect (geometry-agnostic; <code>0,0</code> = top-left, <code>1,1</code> = bottom-right).
+</p>
+
+<table>
+  <tr><th>Message</th><th>Effect</th></tr>
+  <tr><td><code>{"type":"tap","x":0.5,"y":0.5}</code></td><td>Tap at centre.</td></tr>
+  <tr><td><code>{"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":-40}</code></td><td>Scroll up (negative <code>dy</code>) at the anchor. <code>dx/dy</code> are pixel deltas.</td></tr>
+  <tr><td><code>{"type":"text","text":"hello"}</code></td><td>Type literal text (US keycodes; the field must be focused first). See the CJK-IME caveat below.</td></tr>
+  <tr><td><code>{"type":"key","name":"return"}</code></td><td>One named key (<code>return</code>, <code>escape</code>, <code>space</code>…).</td></tr>
+  <tr><td><code>{"type":"shortcut","name":"home"}</code></td><td>System shortcut: <code>home</code> | <code>spotlight</code> | <code>switcher</code>.</td></tr>
+  <tr><td><code>{"type":"longpress","x":0.4,"y":0.6}</code></td><td>Press &amp; hold (release with a matching <code>up</code>).</td></tr>
+  <tr><td><code>{"type":"down"}</code> / <code>{"type":"up"}</code></td><td>Low-level press / release for custom drags.</td></tr>
+</table>
+<p>
+  Returns <code>200</code> on accept, <code>400</code> on an unparseable message, <code>401</code>
+  when the bearer is wrong. Optional header <code>X-Agent-Id: &lt;name&gt;</code> labels the control
+  lease (default <code>agent</code>).
+</p>
+
+<h3><span class="method get">GET</span> <span class="ep">/agent/screenshot</span></h3>
+<p>
+  Returns <code>image/png</code> of the current phone screen, captured via cua-driver (targets the
+  window by id, so it works regardless of which app is frontmost). <code>503</code> if the daemon
+  has no cua-driver target.
+</p>
+
+<h2>Example — a see-decide-act loop</h2>
+<pre><code>HOST=http://192.168.0.190:8787
+PW=&lt;password&gt;
+AUTH="Authorization: Bearer $PW"
+
+# 1. confirm reachable
+curl -s -H "$AUTH" "$HOST/agent/status"            # {"ok":true,"phone_target":true}
+
+# 2. see
+curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
+
+# 3. act — go Home, open Spotlight, type, scroll
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"spotlight"}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"text","text":"Notes"}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.22}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":-60}'</code></pre>
+
+<h2>Behaviour notes</h2>
+<aside class="note">
+  <strong>Single shared cursor.</strong> Posting input takes an <code>Agent</code> control lease,
+  which preempts a connected human viewer — last actor wins. The agent and a human don't drive
+  the phone simultaneously; whoever acted most recently holds control.
+</aside>
+<aside class="note">
+  <strong>CJK-IME caveat.</strong> <code>text</code> sends real US keycodes (capitals via a real
+  Shift key). If the iPhone keyboard is on Chinese Pinyin, number keys are hijacked as
+  candidate-selectors (e.g. <code>a1</code> → 啊). For literal Latin + digits, switch the phone to
+  the English ABC keyboard first. Real CJK input needs an on-phone IME (out of scope).
+</aside>
+<aside class="note">
+  <strong>Vision in v1.</strong> <code>/agent/screenshot</code> is the daemon-native way to see.
+  Agents already running on the host may also use their local capture tools; remote agents can
+  consume the WebRTC video stream.
+</aside>
+
+</div>
+</body>
+</html>
