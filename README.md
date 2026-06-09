@@ -1,7 +1,7 @@
 # iPhone Remote Panel
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey)
+![Platform: macOS 15+](https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![Streaming: WebRTC / H.264](https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success)
 
@@ -73,7 +73,9 @@ agent would corrupt each other's gestures fighting over the same cursor.
 
 ## Requirements
 
-- macOS 14+ with **iPhone Mirroring** set up and signed in.
+- macOS 15 Sequoia or later (iPhone Mirroring's requirement) with **iPhone
+  Mirroring** set up and signed in. Validated on macOS 15 Sequoia / 26 Tahoe;
+  see the [Roadmap](#roadmap) for macOS 27 support.
 - Rust toolchain (to build) — `cargo`.
 - **`cua-driver`** (external) for key / text / shortcut injection. Pointer input
   (tap / scroll) works without it; it is only needed for the keyboard and Home /
@@ -145,6 +147,26 @@ sensitive credentials.
   HTTP and reads `X-Forwarded-Proto`); the session cookie is `HttpOnly` + `SameSite=Lax`.
 - Don't leave payment apps, private chats, or 2FA screens open while exposing access.
 - Stop / unload the LaunchAgent when not in use.
+
+## Roadmap
+
+Shipped and hardware-validated on macOS 15 Sequoia / 26 Tahoe: WebRTC video, tap,
+scroll, keycode text, shortcuts, frontmost-robust input, the agent HTTP API, and the
+LaunchAgent install. Next:
+
+- [ ] **macOS 27 "Golden Gate" support.** macOS 27 makes the iPhone Mirroring window
+  *resizable with variable aspect ratios* (and can render an iPad layout) — it's no
+  longer portrait-locked. Make window selection aspect-independent (rank by on-screen +
+  area, not shape), re-validate capture + input on the 27 beta, and add the new
+  **Control Center** shortcut. Goal: one build that runs on macOS 15 / 26 / 27.
+- [ ] **MCP server** wrapping the agent API, so MCP clients (Claude, etc.) get
+  `tap` / `type` / `scroll` / `screenshot` as native tools.
+- [ ] **Cross-network validation** of the Cloudflare dynamic TURN path with a real key
+  (the minting + refresh code already ships; needs an end-to-end run off-LAN).
+- [ ] **Release binaries** in CI + a one-line `curl … install.sh | sh` install.
+- [ ] A short **demo** (GIF / video) of an AI agent driving the phone through the API.
+
+Issues and PRs welcome.
 
 ## Layout
 
