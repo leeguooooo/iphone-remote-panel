@@ -38,7 +38,6 @@ pub struct Config {
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8787;
 const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600; // 28 800
-const DEFAULT_CUA_DRIVER: &str = "/Users/leo/.local/bin/cua-driver";
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -75,10 +74,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        // cua-driver path: explicit CUA_DRIVER, else $HOME/.local/bin/cua-driver
+        // (a LaunchAgent runs with a minimal PATH, so an absolute path is needed),
+        // else a bare `cua-driver` resolved via PATH.
         let cua_driver = get("CUA_DRIVER")
             .filter(|s| !s.is_empty())
+            .or_else(|| {
+                get("HOME")
+                    .filter(|s| !s.is_empty())
+                    .map(|home| format!("{home}/.local/bin/cua-driver"))
+            })
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CUA_DRIVER));
+            .unwrap_or_else(|| PathBuf::from("cua-driver"));
 
         Config {
             host,
@@ -117,7 +124,26 @@ mod tests {
         assert_eq!(cfg.secret, None);
         assert_eq!(cfg.session_ttl_secs, 8 * 3600);
         assert_eq!(cfg.state_dir, None);
-        assert_eq!(cfg.cua_driver, PathBuf::from("/Users/leo/.local/bin/cua-driver"));
+        // No CUA_DRIVER and no HOME → bare `cua-driver` (PATH lookup).
+        assert_eq!(cfg.cua_driver, PathBuf::from("cua-driver"));
+    }
+
+    #[test]
+    fn cua_driver_defaults_under_home() {
+        let cfg = map_cfg(&[("HOME", "/Users/someone")]);
+        assert_eq!(
+            cfg.cua_driver,
+            PathBuf::from("/Users/someone/.local/bin/cua-driver")
+        );
+    }
+
+    #[test]
+    fn cua_driver_env_beats_home_default() {
+        let cfg = map_cfg(&[
+            ("HOME", "/Users/someone"),
+            ("CUA_DRIVER", "/opt/cua-driver"),
+        ]);
+        assert_eq!(cfg.cua_driver, PathBuf::from("/opt/cua-driver"));
     }
 
     // --- overrides ---
