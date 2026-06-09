@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${PHONE_REMOTE_STATE_DIR:-/tmp/hermes-phone-remote}"
+for f in "$STATE_DIR/tunnel.pid" "$STATE_DIR/server.pid"; do
+  if [[ -s "$f" ]]; then
+    pid="$(cat "$f" || true)"
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      echo "stopped $pid"
+    fi
+  fi
+done

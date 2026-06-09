@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${PHONE_REMOTE_PORT:-8787}"
+HOST="${PHONE_REMOTE_HOST:-127.0.0.1}"
+STATE_DIR="${PHONE_REMOTE_STATE_DIR:-/tmp/hermes-phone-remote}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVER="$ROOT_DIR/phone_remote_server.py"
+
+mkdir -p "$STATE_DIR"
+SERVER_LOG="$STATE_DIR/server.log"
+TUNNEL_LOG="$STATE_DIR/cloudflared.log"
+ENV_FILE="$STATE_DIR/env.txt"
+SERVER_PID_FILE="$STATE_DIR/server.pid"
+TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
+URL_FILE="$STATE_DIR/url.txt"
+
+stop_pid_file() {
+  local file="$1"
+  if [[ -s "$file" ]]; then
+    local pid
+    pid="$(cat "$file" || true)"
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.4
+    fi
+  fi
+}
+
+stop_pid_file "$TUNNEL_PID_FILE"
+stop_pid_file "$SERVER_PID_FILE"
+
+PASS="${PHONE_REMOTE_PASSWORD:-$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(12))
+PY
+)}"
+SECRET="${PHONE_REMOTE_SECRET:-$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)}"
+
+cat > "$ENV_FILE" <<EOF
+PHONE_REMOTE_PASSWORD=$PASS
+PHONE_REMOTE_SECRET=$SECRET
+PHONE_REMOTE_PORT=$PORT
+EOF
+chmod 600 "$ENV_FILE"
+
+PHONE_REMOTE_PASSWORD="$PASS" PHONE_REMOTE_SECRET="$SECRET" PHONE_REMOTE_HOST="$HOST" PHONE_REMOTE_PORT="$PORT" \
+  nohup python3 "$SERVER" >"$SERVER_LOG" 2>&1 &
+echo $! > "$SERVER_PID_FILE"
+
+for _ in {1..30}; do
+  if curl -fsS "http://$HOST:$PORT/login" >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+
+: > "$TUNNEL_LOG"
+nohup cloudflared tunnel --no-autoupdate --loglevel info --url "http://$HOST:$PORT" >"$TUNNEL_LOG" 2>&1 &
+echo $! > "$TUNNEL_PID_FILE"
+
+URL=""
+for _ in {1..90}; do
+  URL="$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' "$TUNNEL_LOG" | tail -1 || true)"
+  if [[ -n "$URL" ]]; then
+    echo "$URL" > "$URL_FILE"
+    break
+  fi
+  sleep 0.5
+done
+
+echo "local=http://$HOST:$PORT/phone"
+if [[ -n "$URL" ]]; then
+  echo "tunnel=$URL/phone"
+else
+  echo "tunnel=(not ready yet; check $TUNNEL_LOG)"
+fi
+echo "password=$PASS"
+echo "server_pid=$(cat "$SERVER_PID_FILE") tunnel_pid=$(cat "$TUNNEL_PID_FILE")"
+echo "logs=$SERVER_LOG $TUNNEL_LOG"
