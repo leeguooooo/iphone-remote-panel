@@ -84,11 +84,38 @@ mod imp {
         }
         tracing::debug!("could not bring iPhone Mirroring frontmost via `open -a`");
     }
+
+    /// The known localized names of the iPhone Mirroring app (en + zh-CN).
+    const MIRRORING_NAMES: [&str; 2] = ["iPhone Mirroring", "iPhone 镜像"];
+
+    /// Returns true if the iPhone Mirroring app is currently the frontmost app.
+    ///
+    /// Cheap in-process query (`NSWorkspace.frontmostApplication`) — no subprocess.
+    /// The injector calls this before each event so it only pays the expensive
+    /// `open -a` re-activation when focus was actually stolen (HID-tap events land
+    /// only on the frontmost app; a hardware test confirmed taps no-op when another
+    /// app steals focus, while scroll/tap both work while Mirroring is frontmost).
+    pub fn mirroring_is_frontmost() -> bool {
+        use objc2_app_kit::NSWorkspace;
+        // Argument-free property reads; safe to query off the main thread.
+        let front = NSWorkspace::sharedWorkspace().frontmostApplication();
+        match front {
+            Some(app) => match app.localizedName() {
+                Some(name) => {
+                    let name = name.to_string();
+                    MIRRORING_NAMES.contains(&name.as_str())
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    bring_mirroring_frontmost, ns_application_load, request_screen_capture, tcc_status, TccStatus,
+    bring_mirroring_frontmost, mirroring_is_frontmost, ns_application_load,
+    request_screen_capture, tcc_status, TccStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,3 +150,8 @@ pub fn ns_application_load() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn bring_mirroring_frontmost() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mirroring_is_frontmost() -> bool {
+    false
+}

@@ -35,7 +35,9 @@ axum = { version = "0.7", features = ["ws"] }
 webrtc = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = "0.3"
+# NSWorkspace + NSRunningApplication features power mirroring_is_frontmost()
+# (cheap frontmost check so HID taps re-assert focus only when it was stolen).
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
 core-graphics = { version = "0.25", features = ["elcapitan"] }
 
 [dev-dependencies]

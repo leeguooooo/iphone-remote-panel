@@ -169,16 +169,23 @@ fn injector_loop<F>(
         Some((cua, pid, wid)) => CgEventSink::with_cua(cua, pid, wid),
         None => CgEventSink::new(),
     };
-    let mut brought_front = false;
+    // HID-tap / scroll-wheel events land only on the *frontmost* app. Re-assert
+    // frontmost when (and only when) focus was stolen — the check is a cheap
+    // in-process query, while the `open -a` re-activation is throttled so a brief
+    // not-yet-frontmost window after activation doesn't spawn a burst of them.
+    let mut last_front: Option<std::time::Instant> = None;
+    const FRONT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(400);
     while let Ok(ev) = rx.recv() {
         if !is_allowed() {
             continue;
         }
-        if !brought_front {
-            // Validated requirement: the Mirroring window must be frontmost for
-            // the HID-tap events to land on it. Best-effort; logged on failure.
-            crate::macos::bring_mirroring_frontmost();
-            brought_front = true;
+        if !crate::macos::mirroring_is_frontmost() {
+            let now = std::time::Instant::now();
+            let throttled = last_front.is_some_and(|t| now.duration_since(t) < FRONT_THROTTLE);
+            if !throttled {
+                crate::macos::bring_mirroring_frontmost();
+                last_front = Some(now);
+            }
         }
         if let Err(e) = inject(&ev, &geo, &mut sink) {
             tracing::debug!("inject dropped {ev:?}: {e}");
