@@ -50,7 +50,9 @@
          covers the phone screen. Immersive mode (toolbar hidden) reclaims it. */
       --tb-reserve: calc(var(--tb-h) + env(safe-area-inset-bottom) + 14px);
     }
-    body.immersive { --tb-reserve: env(safe-area-inset-bottom); }
+    /* --tb-reserve is corrected to the toolbar's real measured height by
+       syncToolbarReserve() (and set to 0 in immersive mode); the calc above is
+       just a first-paint fallback. */
     *, *::before, *::after { box-sizing: border-box; }
 
     /* [iOS-notes §Touch] suppress scroll/zoom/callout on html+body */
@@ -85,35 +87,40 @@
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
     }
 
-    /* [iOS-notes §Video] all four attrs load-bearing.
-       The video sits ABOVE the floating toolbar (bottom: --tb-reserve) rather than
-       filling the area behind it — otherwise the toolbar occludes the bottom of the
-       phone and taps there hit the toolbar. getBoundingClientRect() then yields the
-       visible rect, so the content-rect / coordinate math stays correct. */
+    /* [iOS-notes §Video] The video sits ABOVE the floating toolbar so the toolbar
+       never covers the phone's bottom (and taps there don't hit the toolbar).
+       Use an explicit HEIGHT, not `bottom`: <video> is a replaced element, and
+       width:100% + its intrinsic aspect ratio would otherwise drive the height
+       past `bottom` and back behind the toolbar. getBoundingClientRect() then
+       yields the visible rect, so the content-rect / coordinate math stays correct. */
     #screen {
       position: absolute;
-      top: 0; left: 0; right: 0; bottom: var(--tb-reserve);
+      top: 0; left: 0;
       width: 100%;
+      height: calc(100% - var(--tb-reserve));
       object-fit: contain;          /* letterbox; required for content-rect math */
       background: #000;
       pointer-events: none;         /* pointer events handled on #videoArea */
       touch-action: none;
-      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
+      transition: height .28s cubic-bezier(.2,.7,.2,1);
     }
     /* subtle device-screen vignette + inset ring so the mirror reads as "a screen" */
     #videoArea::after {
       content: ""; position: absolute;
-      top: 0; left: 0; right: 0; bottom: var(--tb-reserve); pointer-events: none;
+      top: 0; left: 0; width: 100%;
+      height: calc(100% - var(--tb-reserve)); pointer-events: none;
       box-shadow: inset 0 0 0 1px rgba(255,255,255,.03),
                   inset 0 30px 60px -30px rgba(0,0,0,.5);
-      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
+      transition: height .28s cubic-bezier(.2,.7,.2,1);
     }
 
     #gridCanvas {
       position: absolute;
-      top: 0; left: 0; right: 0; bottom: var(--tb-reserve);
+      top: 0; left: 0;
+      width: 100%;
+      height: calc(100% - var(--tb-reserve));
       pointer-events: none; display: none;
-      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
+      transition: height .28s cubic-bezier(.2,.7,.2,1);
     }
     #gridCanvas.on { display: block; }
 
@@ -731,8 +738,26 @@ textInput.addEventListener('keydown', e => { if (e.key === 'Enter') setTimeout(c
 
 const btnImmersive = document.getElementById('btnImmersive');
 const grabber = document.getElementById('grabber');
-btnImmersive.addEventListener('click', () => { document.body.classList.add('immersive'); if (gridOn) requestAnimationFrame(drawGrid); });
-grabber.addEventListener('click', () => { document.body.classList.remove('immersive'); if (gridOn) requestAnimationFrame(drawGrid); });
+const toolbar = document.getElementById('toolbar');
+
+/* Reserve exactly the toolbar's real footprint (incl. its safe-area padding) so
+   the video sits right above it — a hardcoded guess was a few px short and left
+   the toolbar overlapping the phone's bottom. Immersive mode reclaims the space. */
+function syncToolbarReserve() {
+  const reserve = document.body.classList.contains('immersive') ? 0 : (toolbar.offsetHeight || 78);
+  document.documentElement.style.setProperty('--tb-reserve', reserve + 'px');
+  if (gridOn) drawGrid();
+}
+function setImmersive(on) {
+  document.body.classList.toggle('immersive', on);
+  syncToolbarReserve();
+  if (gridOn) requestAnimationFrame(drawGrid);
+}
+btnImmersive.addEventListener('click', () => setImmersive(true));
+grabber.addEventListener('click', () => setImmersive(false));
+window.addEventListener('resize', syncToolbarReserve);
+window.addEventListener('orientationchange', () => setTimeout(syncToolbarReserve, 200));
+syncToolbarReserve();
 
 /* ── Status pill dot colour (observe statusLine text) ─────────── */
 const connDot = document.querySelector('#statusPill .conn-dot');
