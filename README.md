@@ -5,6 +5,10 @@
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![Streaming: WebRTC / H.264](https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success)
 
+<p align="center">
+  <img src="assets/hero.png" alt="Controlling an iPhone from a browser — live screen plus a touch toolbar (Home, Spotlight, App Switcher, keyboard)" width="320">
+</p>
+
 **Remote-control your iPhone from any web browser** — over macOS **iPhone Mirroring**,
 with low-latency WebRTC video and near-native touch. A Rust daemon captures the Mirroring
 window with **ScreenCaptureKit**, hardware-encodes it to **H.264** with **VideoToolbox**,
