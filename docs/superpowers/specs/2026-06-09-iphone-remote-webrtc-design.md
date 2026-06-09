@@ -67,7 +67,7 @@ The core does not know whether a caller is a human or an agent — it only expos
 |---|---|---|---|
 | `core::window` | Find the iPhone Mirroring window; track resize/move/close | shareable-content list | `{pid, window_id, bounds, scale}`. **Selection (validated):** match name/bundle (`iPhone`/`镜像`/`Mirroring`/`ScreenContinuity`), then prefer the **phone-shape `size_ok` (200–900 × 400–1600) largest** window — SCK `is_on_screen` proved unreliable — and **skip setup/welcome windows** (`welcome`/`欢迎`) and the 1800×N menubar extras |
 | `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Host context:** must call `NSApplicationLoad()` before any SCK call (else `CGS_REQUIRE_INIT` abort — validated). **Invariants/targets:** 30 fps default (cap 60, `SCStreamConfiguration.minimumFrameInterval`), bounded queue depth ~2–3 frames, drop late frames, **silently drop idle samples** (`get_pixel_buffer → CouldNotGetDataBuffer` is normal SCK behavior, not an error), **pass `CMSampleBuffer` PTS through** for pacing, restart `SCStream` on window-id/display change |
-| `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract:** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **SPS/PPS in-band before every IDR** |
+| `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract (S0b-1 validated):** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **Annex-B with SPS/PPS in-band before every IDR**. **Static-screen keepalive (required):** SCK emits no frames when the screen is static, so **repeat the last encoded access unit on a ~500 ms timer** or the stream stalls and a late-joining viewer gets nothing |
 | `core::input` | Map abstract events → injected events | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | **`CGEvent::post(CGEventTapLocation::HID)` at global screen coords, Mirroring window frontmost** (validated S1b — `post_to_pid` does NOT work); `cua-driver` fallback. **Commandeers the real Mac cursor.** Tap-vs-long-press **timing fidelity** matters (the probe's ~100 ms press read as a long-press → jiggle mode) — map iPhone touch durations deliberately |
 | `front::webrtc` | One `PeerConnection` per viewer: H.264 track + data channel | SDP/ICE via signaling | webrtc-rs |
 | `front::mcp` | MCP tools over the same core; screenshots pulled from the live pipeline | tool calls | rmcp (or hand-rolled) |
@@ -253,9 +253,13 @@ Status as of 2026-06-09 (see `SPIKE-RESULTS.md` for the hardware log).
 - **TCC/deployment finding (validated).** An SSH-spawned binary is denied Screen
   Recording (error -3801); the daemon must run in the GUI login session as a granted,
   signed LaunchAgent (§5). This is now a locked architectural constraint, not a spike.
-- **S0b — encode + WebRTC (NEXT).** Chain the working capture → `videotoolbox` realtime
-  H.264 (Constrained Baseline, `packetization-mode=1`, no B-frames, forced IDR + in-band
-  SPS/PPS) → `webrtc-rs` H.264 track that a desktop browser decodes.
+- **S0b-1 — capture → VideoToolbox H.264 → file — ✅ PASS.** `s0b.h264` decodes
+  (ffprobe: Constrained Baseline, 312×694, no B-frames) and visually shows the live Home
+  Screen. **Finding:** SCK delivers no frames on a static screen → encoder timed out at 33
+  frames; the WebRTC side needs **repeat-last-frame keepalive** (folded into `encode`, §3.1).
+- **S0b-2 — capture → VideoToolbox → `webrtc-rs` `TrackLocalStaticSample` → desktop
+  browser decode (IN PROGRESS).** LAN-only (no TURN yet); must implement the static-frame
+  keepalive + force-IDR-on-connect. Cheat-sheet: `docs/superpowers/notes/2026-06-09-webrtc-turn-cheatsheet.md`.
 - **S2 — Safari receive path.** The S0b stream rendered in **iOS Safari**
   `<video playsinline>` with the explicit `play()` gesture; verify decode, latency, and
   data-channel round-trip (separate reliable + unordered channels).
