@@ -1,10 +1,28 @@
 # iPhone Remote Panel
 
-Control your iPhone from a browser — low-latency, near-native touch — over
-macOS **iPhone Mirroring**. A Rust daemon captures the Mirroring window, hardware-
-encodes it to H.264, and streams it to iPhone Safari over WebRTC, injecting touch
-back as continuous system events. Agents (Hermes, Claude, scripts) can drive the
-same phone through an HTTP API.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+![Streaming: WebRTC / H.264](https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success)
+
+**Remote-control your iPhone from any web browser** — over macOS **iPhone Mirroring**,
+with low-latency WebRTC video and near-native touch. A Rust daemon captures the Mirroring
+window with **ScreenCaptureKit**, hardware-encodes it to **H.264** with **VideoToolbox**,
+and streams it to iPhone Safari (or any browser) over **WebRTC** — injecting taps, swipes,
+scrolls, and text back as continuous system events. AI agents, scripts, and bots can drive
+the same phone through a simple **HTTP API**.
+
+Think **Chrome Remote Desktop, but for your iPhone** — running entirely on your own Mac, no
+third-party cloud.
+
+## Features
+
+- 📱 **Control an iPhone from a browser** — live screen with tap / swipe / scroll / type, on iPhone Safari or any desktop browser.
+- ⚡ **Low latency** — hardware H.264 (VideoToolbox) over WebRTC, not screenshot polling.
+- 🤚 **Near-native touch** — real scroll-wheel scrolling, keycode text input, Home / Spotlight / App-Switcher shortcuts.
+- 🤖 **Agent-ready** — an HTTP API (`/agent/input`, `/agent/screenshot`) lets AI agents and scripts *see* and *drive* the phone.
+- 🌐 **LAN or remote** — same Wi-Fi over your local network, or from anywhere via a Cloudflare tunnel + TURN.
+- 🔒 **Self-hosted & authenticated** — password login; runs on your own machine, your screen never leaves your control.
 
 > v2 — a full WebRTC + hardware-codec + continuous-input rebuild of the original
 > v1 screenshot-polling server. The input + video vertical (video, tap, scroll,
