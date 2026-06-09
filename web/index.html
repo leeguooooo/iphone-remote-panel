@@ -1,0 +1,948 @@
+<!doctype html>
+<!--
+  iPhone Remote — WebRTC web client  (web/index.html)
+  =====================================================
+  Served at /phone (auth-gated).  Daemon is the OFFERER.
+  Signaling:  WebSocket /ws
+  ICE creds:  GET /turn-creds  → {iceServers:[...]}
+  Video:      recvonly track, ondatachannel for "control" (reliable) + "move" (lossy)
+  Touch:      Pointer Events → normalized [0,1] content-rect coords
+  Ref:
+    docs/superpowers/notes/2026-06-09-ios-safari-webrtc-client.md
+    docs/superpowers/notes/2026-06-09-v1-feature-parity.md
+    phone_remote_server.py  (v1 UI/aesthetic baseline)
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <!-- [iOS-notes §Fullscreen/PWA] viewport-fit=cover for safe-area; initial-scale=1 required -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <!-- [iOS-notes §Fullscreen/PWA] standalone PWA meta -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>iPhone Remote</title>
+  <style>
+    /* ── Design system (matches v1 dark palette) ─────────────────── */
+    :root {
+      color-scheme: dark;
+      --bg:      #08090c;
+      --panel:   #11131a;
+      --line:    #272b38;
+      --text:    #eef2ff;
+      --muted:   #9ca3af;
+      --accent:  #4f8cff;
+      --danger:  #ff5a66;
+      --danger-bg:  #2a1116;
+      --danger-border: #5b1b24;
+      --danger-text:   #ffb8bf;
+      --grid-stroke: rgba(255,60,60,.55);
+      --grid-label:  rgba(255,80,80,.9);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+
+    /* [iOS-notes §Touch] suppress scroll/zoom/callout on html+body */
+    html, body {
+      margin: 0; padding: 0;
+      height: 100%;
+      overflow: hidden;
+      overscroll-behavior: none;   /* [iOS-notes §Touch] */
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+                   "Segoe UI", sans-serif;
+    }
+
+    /* ── Layout: header + full-height video area ─────────────────── */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;             /* [iOS-notes §Fullscreen/PWA] 100dvh not 100vh */
+      /* safe-area padding for notch/home-bar */
+      padding-top:    env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left:   env(safe-area-inset-left);
+      padding-right:  env(safe-area-inset-right);
+    }
+
+    /* ── Header bar (mirrors v1 header aesthetic) ────────────────── */
+    header {
+      position: relative;
+      z-index: 10;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 8px 10px;
+      background: rgba(8,9,12,.92);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+
+    button, input {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+      -webkit-appearance: none;
+    }
+    button {
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      white-space: nowrap;
+    }
+    button.primary  { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.active   { background: #1a2a4a; border-color: var(--accent); color: var(--accent); }
+    button.danger   { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger-text); }
+
+    #textInput {
+      min-width: 130px;
+      flex: 1 1 130px;
+      max-width: 260px;
+    }
+
+    #statusLine {
+      color: var(--muted);
+      font-size: 12px;
+      margin-left: auto;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 180px;
+    }
+
+    /* ── Video area: fills remaining height ──────────────────────── */
+    #videoArea {
+      flex: 1 1 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #000;
+      position: relative;
+      overflow: hidden;
+      /* [iOS-notes §Touch] touch-action none on the video container */
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* [iOS-notes §Video] all four attrs load-bearing; 100dvh fill */
+    #screen {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;          /* letterbox; required for content-rect math */
+      background: #000;
+      touch-action: none;           /* [iOS-notes §Touch] */
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      pointer-events: none;         /* pointer events handled on #videoArea overlay */
+    }
+
+    /* Grid overlay canvas: absolute, covers video area */
+    #gridCanvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      display: none;
+    }
+    #gridCanvas.on { display: block; }
+
+    /* Tap dot indicator (matches v1: 350ms fade) */
+    #tapDot {
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border: 2px solid #fff;
+      background: rgba(79,140,255,.45);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .25s;
+      z-index: 5;
+    }
+
+    /* "Tap to start" play overlay */
+    #playOverlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(8,9,12,.82);
+      z-index: 20;
+      cursor: pointer;
+    }
+    #playOverlay svg {
+      width: 72px; height: 72px;
+      fill: rgba(255,255,255,.7);
+    }
+    #playOverlay p {
+      color: var(--muted);
+      font-size: 14px;
+      margin: 12px 0 0;
+    }
+    #playOverlay.hidden { display: none; }
+
+    /* Toast (matches v1: 1600ms) */
+    #toast {
+      position: fixed;
+      left: 50%;
+      bottom: calc(18px + env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      background: #111827;
+      border: 1px solid var(--line);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      opacity: 0;
+      transition: opacity .2s;
+      z-index: 99;
+      max-width: 90vw;
+      pointer-events: none;
+    }
+    #toast.on { opacity: 1; }
+
+    /* Connection state dot in status line */
+    .dot-connected  { color: #4ade80; }
+    .dot-connecting { color: #facc15; }
+    .dot-failed     { color: var(--danger); }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header bar (v1 parity + WebRTC affordances) ──────────── -->
+  <header>
+    <!-- [v1 parity] Home / Search(Spotlight) / Switcher shortcuts -->
+    <button id="btnHome" title="Home">Home</button>
+    <button id="btnSearch" title="Spotlight 搜索">搜索</button>
+    <button id="btnSwitcher" title="App 切换">切换器</button>
+
+    <!-- [v1 parity] Freeze toggle (replaces auto-refresh) -->
+    <button id="btnFreeze" title="暂停/继续渲染">冻结</button>
+
+    <!-- [v1 parity] 12×24 numbered grid overlay toggle -->
+    <button id="btnGrid" title="数字网格覆盖">网格</button>
+
+    <!-- [v1 parity] Text input + send -->
+    <input id="textInput" type="text" placeholder="输入到手机…" maxlength="500" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+    <button id="btnSend" class="primary">输入</button>
+
+    <!-- [v1 parity] Logout -->
+    <button id="btnLogout" class="danger">退出</button>
+
+    <!-- Status / latency line -->
+    <span id="statusLine">connecting…</span>
+  </header>
+
+  <!-- ── Video + interaction surface ───────────────────────────── -->
+  <div id="videoArea">
+    <!--
+      [iOS-notes §Video] all four attrs mandatory:
+        autoplay   — browser attempts autoplay
+        playsinline — no iOS fullscreen takeover
+        webkit-playsinline — legacy iOS compat
+        muted      — required for autoplay policy
+      disablePictureInPicture/disableRemotePlayback prevent AirPlay detach
+    -->
+    <video id="screen"
+           autoplay
+           playsinline
+           webkit-playsinline
+           muted
+           disablePictureInPicture
+           disableRemotePlayback>
+    </video>
+
+    <!-- 12×24 numbered grid canvas (v1 parity — agent coordinate aid) -->
+    <canvas id="gridCanvas"></canvas>
+
+    <!-- Tap-point indicator (v1 parity: 350ms fade) -->
+    <div id="tapDot"></div>
+
+    <!-- [iOS-notes §Video] "Tap to start" play() gesture fallback -->
+    <div id="playOverlay">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M8 5v14l11-7L8 5z"/>
+      </svg>
+      <p>轻触以开始</p>
+    </div>
+  </div>
+
+</div><!-- #app -->
+
+<div id="toast"></div>
+
+<script>
+/* ================================================================
+   iPhone Remote — WebRTC client
+   Contract refs follow this legend:
+     [SIG]   = signaling contract (/ws WebSocket)
+     [ICE]   = /turn-creds + ICE handling
+     [CH]    = data channels (control / move)
+     [TOUCH] = Pointer Events + content-rect mapping
+     [iOS]   = iOS Safari notes
+     [v1]    = v1 parity affordance
+   ================================================================ */
+
+'use strict';
+
+/* ── Constants ────────────────────────────────────────────────── */
+const TAP_MS       = 250;   // [TOUCH] max ms for a tap gesture
+const TAP_SLOP     = 10;    // [TOUCH] max px movement for tap classification
+const LONGPRESS_MS = 500;   // [TOUCH] ms hold for long-press
+const MOVE_BACKPRESSURE_BYTES = 256 * 1024; // [CH] drop threshold for move channel
+const STATS_INTERVAL_MS = 2000;   // getStats polling interval
+const ICE_RESTART_DEBOUNCE_MS = 2000; // [ICE] debounce restart signals
+const RECONNECT_BASE_MS = 1500;   // base delay for WS reconnect
+
+/* ── DOM refs ─────────────────────────────────────────────────── */
+const video       = document.getElementById('screen');
+const videoArea   = document.getElementById('videoArea');
+const gridCanvas  = document.getElementById('gridCanvas');
+const tapDot      = document.getElementById('tapDot');
+const playOverlay = document.getElementById('playOverlay');
+const statusLine  = document.getElementById('statusLine');
+const toastEl     = document.getElementById('toast');
+const textInput   = document.getElementById('textInput');
+
+/* ── State ────────────────────────────────────────────────────── */
+let pc         = null;     // RTCPeerConnection
+let ws         = null;     // signaling WebSocket
+let controlCh  = null;     // reliable data channel (control verbs)
+let moveCh     = null;     // lossy data channel (pointer coords)
+let frozen     = false;    // [v1 parity] freeze toggle
+let gridOn     = false;    // [v1 parity] grid overlay toggle
+let wakeLock   = null;     // [iOS] WakeLock handle
+let iceRestartTimer = null;// debounce handle
+let reconnectTimer  = null;
+let reconnectDelay  = RECONNECT_BASE_MS;
+let statsInterval   = null;
+let lastRtt    = '--';
+let connState  = 'new';
+
+/* ── Toast (v1 parity: 1600ms) ────────────────────────────────── */
+let toastTimer = null;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('on'), 1600);
+}
+
+/* ── Status line ──────────────────────────────────────────────── */
+function setStatus(msg) {
+  statusLine.textContent = msg;
+}
+function updateStatusLine() {
+  const rtt = lastRtt !== '--' ? ` ${lastRtt}ms` : '';
+  setStatus(`${connState}${rtt}`);
+}
+
+/* ── Wake Lock [iOS §Wake Lock] ───────────────────────────────── */
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    if (wakeLock && !wakeLock.released) return;
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (_) { /* non-fatal; live video keeps screen on anyway */ }
+}
+
+/* ── Play() with fallback overlay [iOS §Video] ────────────────── */
+async function tryPlay() {
+  if (video.srcObject == null) return;
+  try {
+    await video.play();
+    playOverlay.classList.add('hidden');
+    acquireWakeLock();
+  } catch (_) {
+    // autoplay blocked — show gesture overlay
+    playOverlay.classList.remove('hidden');
+  }
+}
+
+playOverlay.addEventListener('pointerup', async (e) => {
+  e.stopPropagation();
+  try {
+    await video.play();
+    playOverlay.classList.add('hidden');
+    acquireWakeLock();
+  } catch (_) { /* will try again on next visibility */ }
+});
+
+/* ── Visibility change: re-play + re-acquire WakeLock [iOS §Video] */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (video.srcObject && video.paused) tryPlay();
+    acquireWakeLock();
+    // [ICE] also attempt ICE restart if connection dropped while backgrounded
+    if (pc && (pc.iceConnectionState === 'disconnected' ||
+                pc.iceConnectionState === 'failed')) {
+      scheduleIceRestart();
+    }
+  }
+});
+
+/* ── Grid overlay (v1 parity: 12×24, numbered 1–288) ──────────── */
+function drawGrid() {
+  if (!gridOn) return;
+  const rect = videoArea.getBoundingClientRect();
+  const dpr  = window.devicePixelRatio || 1;
+  gridCanvas.width  = Math.round(rect.width  * dpr);
+  gridCanvas.height = Math.round(rect.height * dpr);
+  gridCanvas.style.width  = rect.width  + 'px';
+  gridCanvas.style.height = rect.height + 'px';
+
+  const ctx  = gridCanvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const COLS = 12, ROWS = 24;
+
+  // [v1 parity] draw grid lines red translucent
+  ctx.strokeStyle = 'rgba(255,60,60,.55)';
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) {
+    const x = rect.width * c / COLS;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, rect.height); ctx.stroke();
+  }
+  for (let r = 0; r <= ROWS; r++) {
+    const y = rect.height * r / ROWS;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(rect.width, y); ctx.stroke();
+  }
+
+  // [v1 parity] cell numbers 1–288
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.fillStyle   = 'rgba(255,80,80,.9)';
+  ctx.strokeStyle = 'rgba(255,255,255,.75)';
+  ctx.lineWidth = 2;
+  let n = 1;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const x = rect.width  * c / COLS + 3;
+      const y = rect.height * r / ROWS + 12;
+      ctx.strokeText(String(n), x, y);
+      ctx.fillText(String(n), x, y);
+      n++;
+    }
+  }
+}
+window.addEventListener('resize', () => { if (gridOn) drawGrid(); });
+
+/* ── Content-rect coord mapping [iOS §Touch content-rect] ─────── */
+// object-fit:contain letterboxes the video inside #screen (which fills #videoArea).
+// We compute the actual rendered rect of the video frame and map pointer events
+// to normalized [0,1] coords. Returns null for clicks in the letterbox bars.
+function pointerToNormalized(clientX, clientY) {
+  const el   = video;
+  const rect = el.getBoundingClientRect();
+  const vw   = el.videoWidth;
+  const vh   = el.videoHeight;
+
+  if (!vw || !vh) return null; // no frame yet
+
+  const elAR    = rect.width / rect.height;
+  const vidAR   = vw / vh;
+
+  let contentW, contentH, offX, offY;
+  if (elAR >= vidAR) {
+    // pillarbox: video fills height, bars on left+right
+    contentH = rect.height;
+    contentW = rect.height * vidAR;
+    offX     = rect.left + (rect.width - contentW) / 2;
+    offY     = rect.top;
+  } else {
+    // letterbox: video fills width, bars on top+bottom
+    contentW = rect.width;
+    contentH = rect.width / vidAR;
+    offX     = rect.left;
+    offY     = rect.top + (rect.height - contentH) / 2;
+  }
+
+  const nx = (clientX - offX) / contentW;
+  const ny = (clientY - offY) / contentH;
+
+  // [iOS §Touch] return null if tap fell in letterbox bar
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+  return { nx, ny };
+}
+
+/* ── Control channel: send verb (reliable) [CH] ──────────────── */
+function sendControl(obj) {
+  if (!controlCh || controlCh.readyState !== 'open') return;
+  try { controlCh.send(JSON.stringify(obj)); } catch (_) {}
+}
+
+/* ── Move channel: send compact binary [CH §backpressure] ─────── */
+// Format: 5 bytes — uint16 x (BE), uint16 y (BE), uint8 flags
+// x = Math.round(nx * 65535), y = Math.round(ny * 65535)
+// flags: bit0 = primary button down, bit1 = coalesced (unused for now)
+function sendMove(nx, ny, flags) {
+  if (!moveCh || moveCh.readyState !== 'open') return;
+  // [CH] drop on backpressure — never queue
+  if (moveCh.bufferedAmount > MOVE_BACKPRESSURE_BYTES) return;
+  const buf  = new ArrayBuffer(5);
+  const view = new DataView(buf);
+  view.setUint16(0, Math.round(nx * 65535), false); // big-endian
+  view.setUint16(2, Math.round(ny * 65535), false);
+  view.setUint8(4, flags & 0xff);
+  try { moveCh.send(buf); } catch (_) {}
+}
+
+/* ── Tap dot indicator (v1 parity: 350ms fade) ────────────────── */
+function showTapDot(clientX, clientY) {
+  const rect = videoArea.getBoundingClientRect();
+  const x    = clientX - rect.left;
+  const y    = clientY - rect.top;
+  tapDot.style.left    = x + 'px';
+  tapDot.style.top     = y  + 'px';
+  tapDot.style.opacity = '1';
+  clearTimeout(tapDot._timer);
+  tapDot._timer = setTimeout(() => { tapDot.style.opacity = '0'; }, 350);
+}
+
+/* ── Pointer Events touch handling [iOS §Touch] ──────────────── */
+// Tracks: { pointerId → { startX, startY, startT, lastX, lastY, longTimer } }
+const pointers = new Map();
+
+// [iOS §Touch] feature-detect getCoalescedEvents (iOS 18+ only)
+const hasCoalesced = typeof PointerEvent !== 'undefined' &&
+                     'getCoalescedEvents' in PointerEvent.prototype;
+
+videoArea.addEventListener('pointerdown', onPointerDown, { passive: false });
+videoArea.addEventListener('pointermove', onPointerMove, { passive: false });
+videoArea.addEventListener('pointerup',   onPointerUp,   { passive: false });
+videoArea.addEventListener('pointercancel', onPointerCancel, { passive: false });
+
+// [iOS §Touch] suppress gesture events (pinch-zoom etc.)
+document.addEventListener('gesturestart',  e => e.preventDefault(), { passive: false });
+document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
+document.addEventListener('gestureend',    e => e.preventDefault(), { passive: false });
+
+function onPointerDown(e) {
+  e.preventDefault();
+  videoArea.setPointerCapture(e.pointerId);
+
+  const longTimer = setTimeout(() => {
+    // long-press: fire after LONGPRESS_MS
+    const pd = pointers.get(e.pointerId);
+    if (!pd) return;
+    const coords = pointerToNormalized(pd.lastX, pd.lastY);
+    if (coords) {
+      sendControl({ type: 'longpress', x: coords.nx, y: coords.ny });
+      showTapDot(pd.lastX, pd.lastY);
+      toast('长按');
+    }
+    pd.longFired = true;
+  }, LONGPRESS_MS);
+
+  pointers.set(e.pointerId, {
+    startX:    e.clientX,
+    startY:    e.clientY,
+    startT:    performance.now(),
+    lastX:     e.clientX,
+    lastY:     e.clientY,
+    longTimer,
+    longFired: false,
+    moved:     false,
+  });
+
+  // send down event on control channel
+  const coords = pointerToNormalized(e.clientX, e.clientY);
+  if (coords) {
+    sendControl({ type: 'down', x: coords.nx, y: coords.ny });
+  }
+}
+
+function onPointerMove(e) {
+  e.preventDefault();
+  const pd = pointers.get(e.pointerId);
+  if (!pd) return;
+
+  // [iOS §Touch] coalesced events for smoother streaming (iOS 18+ only)
+  const events = hasCoalesced ? e.getCoalescedEvents() : [e];
+
+  for (const ev of events) {
+    pd.lastX = ev.clientX;
+    pd.lastY = ev.clientY;
+
+    const dx = ev.clientX - pd.startX;
+    const dy = ev.clientY - pd.startY;
+    if (Math.hypot(dx, dy) > TAP_SLOP) {
+      pd.moved = true;
+      clearTimeout(pd.longTimer); // cancel long-press if dragging
+    }
+
+    const coords = pointerToNormalized(ev.clientX, ev.clientY);
+    if (coords && pd.moved) {
+      sendMove(coords.nx, coords.ny, 1); // flags: primary button down
+    }
+  }
+}
+
+function onPointerUp(e) {
+  e.preventDefault();
+  const pd = pointers.get(e.pointerId);
+  if (!pd) return;
+  clearTimeout(pd.longTimer);
+  pointers.delete(e.pointerId);
+
+  const coords = pointerToNormalized(e.clientX, e.clientY);
+
+  if (!pd.longFired) {
+    const dt = performance.now() - pd.startT;
+    const dx = e.clientX - pd.startX;
+    const dy = e.clientY - pd.startY;
+    const dist = Math.hypot(dx, dy);
+
+    if (coords) {
+      if (dist < TAP_SLOP && dt < TAP_MS) {
+        // TAP
+        sendControl({ type: 'tap', x: coords.nx, y: coords.ny });
+        showTapDot(e.clientX, e.clientY);
+      } else {
+        // drag ended — send up
+        sendControl({ type: 'up', x: coords.nx, y: coords.ny });
+      }
+    }
+  }
+
+  // always send up event regardless
+  if (coords) {
+    sendControl({ type: 'up', x: coords.nx, y: coords.ny });
+  }
+}
+
+function onPointerCancel(e) {
+  const pd = pointers.get(e.pointerId);
+  if (pd) clearTimeout(pd.longTimer);
+  pointers.delete(e.pointerId);
+}
+
+/* ── Header button handlers (v1 parity) ─────────────────────────  */
+document.getElementById('btnHome').addEventListener('click', () => {
+  sendControl({ type: 'shortcut', name: 'home' });
+  toast('Home');
+});
+document.getElementById('btnSearch').addEventListener('click', () => {
+  sendControl({ type: 'shortcut', name: 'spotlight' });
+  toast('Spotlight');
+});
+document.getElementById('btnSwitcher').addEventListener('click', () => {
+  sendControl({ type: 'shortcut', name: 'switcher' });
+  toast('切换器');
+});
+
+// [v1 parity] Freeze toggle — pause/resume video rendering
+const btnFreeze = document.getElementById('btnFreeze');
+btnFreeze.addEventListener('click', () => {
+  frozen = !frozen;
+  if (frozen) {
+    video.pause();
+    btnFreeze.classList.add('active');
+    btnFreeze.textContent = '继续';
+    toast('已冻结');
+  } else {
+    video.play().catch(() => {});
+    btnFreeze.classList.remove('active');
+    btnFreeze.textContent = '冻结';
+    toast('继续');
+  }
+});
+
+// [v1 parity] Grid overlay toggle
+document.getElementById('btnGrid').addEventListener('click', () => {
+  gridOn = !gridOn;
+  gridCanvas.classList.toggle('on', gridOn);
+  document.getElementById('btnGrid').classList.toggle('active', gridOn);
+  drawGrid();
+});
+
+// [v1 parity] Text input send (Enter key + button)
+function sendText() {
+  const text = textInput.value.trim().slice(0, 500);
+  if (!text) return;
+  sendControl({ type: 'text', text });
+  textInput.value = '';
+  toast('已输入');
+}
+document.getElementById('btnSend').addEventListener('click', sendText);
+textInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+
+// [v1 parity] Logout
+document.getElementById('btnLogout').addEventListener('click', () => {
+  location.href = '/logout';
+});
+
+/* ── Stats: RTT from getStats() inbound-rtp ──────────────────── */
+// [v1 parity §Status/latency line]
+async function pollStats() {
+  if (!pc || pc.connectionState === 'closed') return;
+  try {
+    const stats = await pc.getStats();
+    stats.forEach(report => {
+      if (report.type === 'inbound-rtp' && report.mediaType === 'video') {
+        // roundTripTime not on inbound; use candidate-pair RTT instead
+      }
+      if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+        if (report.currentRoundTripTime != null) {
+          lastRtt = Math.round(report.currentRoundTripTime * 1000);
+        }
+      }
+    });
+  } catch (_) {}
+  updateStatusLine();
+}
+
+/* ── ICE restart [SIG §restart] ─────────────────────────────────  */
+function scheduleIceRestart() {
+  if (iceRestartTimer) return; // already scheduled
+  iceRestartTimer = setTimeout(() => {
+    iceRestartTimer = null;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // [SIG] send restart request to daemon — daemon will createOffer({iceRestart:true})
+    wsSend({ type: 'restart' });
+    toast('ICE 重连中…');
+  }, ICE_RESTART_DEBOUNCE_MS);
+}
+
+/* ── WebSocket helpers [SIG] ─────────────────────────────────── */
+function wsSend(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(obj)); } catch (_) {}
+}
+
+/* ── Build RTCPeerConnection ─────────────────────────────────── */
+// [ICE] fetch turn creds from /turn-creds, fall back to empty if unavailable
+async function fetchIceServers() {
+  try {
+    const resp = await fetch('/turn-creds', { credentials: 'include' });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return Array.isArray(data.iceServers) ? data.iceServers : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function buildPeerConnection(iceServers) {
+  // [ICE §relay fallback] first attempt with provided servers (relay+srflx+host)
+  const config = {
+    iceServers,
+    bundlePolicy:   'max-bundle',
+    rtcpMuxPolicy:  'require',
+  };
+  return new RTCPeerConnection(config);
+}
+
+async function buildPeerConnectionRelayOnly(iceServers) {
+  // [iOS-notes §relay fallback] relay-only fallback — sidesteps mDNS/LAN issues
+  const config = {
+    iceServers,
+    iceTransportPolicy: 'relay',
+    bundlePolicy:   'max-bundle',
+    rtcpMuxPolicy:  'require',
+  };
+  return new RTCPeerConnection(config);
+}
+
+/* ── Wire up a PeerConnection [SIG contract] ─────────────────── */
+function wirePc(newPc) {
+  // Close old one if any
+  if (pc) { try { pc.close(); } catch (_) {} }
+  pc = newPc;
+  controlCh = null;
+  moveCh    = null;
+
+  // [SIG] Video track → attach to <video>
+  pc.ontrack = (e) => {
+    // [iOS §Video] never createObjectURL; always srcObject
+    video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+    if (!frozen) tryPlay();
+  };
+
+  // [CH] Both data channels arrive via ondatachannel (daemon creates them)
+  pc.ondatachannel = (e) => {
+    const ch = e.channel;
+    ch.binaryType = 'arraybuffer'; // [CH] required for binary move messages
+    if (ch.label === 'control') {
+      controlCh = ch;
+      ch.onopen    = () => { connState = 'connected'; updateStatusLine(); };
+      ch.onclose   = () => { controlCh = null; };
+      ch.onmessage = onControlMessage;
+    } else if (ch.label === 'move') {
+      moveCh = ch;
+      ch.onopen  = () => {};
+      ch.onclose = () => { moveCh = null; };
+    }
+  };
+
+  // [ICE] trickle ICE — forward candidates to daemon [SIG]
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      wsSend({ type: 'ice', candidate: e.candidate.toJSON() });
+    }
+  };
+
+  // [ICE §restart] react to ICE connection state changes
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    connState = s;
+    updateStatusLine();
+
+    if (s === 'disconnected') {
+      // schedule restart after debounce
+      scheduleIceRestart();
+    } else if (s === 'failed') {
+      // [SIG §restart] signal daemon immediately for ICE restart
+      scheduleIceRestart();
+    } else if (s === 'connected' || s === 'completed') {
+      // cancel any pending restart
+      clearTimeout(iceRestartTimer);
+      iceRestartTimer = null;
+      if (statsInterval) clearInterval(statsInterval);
+      statsInterval = setInterval(pollStats, STATS_INTERVAL_MS);
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    connState = pc.connectionState;
+    updateStatusLine();
+    if (pc.connectionState === 'failed') scheduleIceRestart();
+  };
+}
+
+/* ── Handle messages on control channel (daemon → client) ─────── */
+// (currently daemon sends no messages to client, but guard defensively)
+function onControlMessage(e) {
+  if (typeof e.data === 'string') {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'toast') toast(msg.text || '');
+    } catch (_) {}
+  }
+}
+
+/* ── Main WebSocket + signaling loop [SIG] ───────────────────── */
+// Implements: connect → receive offer → answer → trickle ICE
+// On close/error: reconnect with backoff
+
+let relayAttempt = false; // [ICE §relay fallback] flag for second attempt
+
+async function connectWs() {
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  clearTimeout(iceRestartTimer);
+  iceRestartTimer = null;
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url   = `${proto}//${location.host}/ws`;
+  connState = 'connecting';
+  updateStatusLine();
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    connState = 'ws-open';
+    updateStatusLine();
+    reconnectDelay = RECONNECT_BASE_MS; // reset backoff on successful connect
+    relayAttempt = false;
+  };
+
+  ws.onerror = () => {}; // onclose will fire too; handle there
+
+  ws.onclose = (ev) => {
+    connState = 'ws-closed';
+    updateStatusLine();
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    // schedule reconnect with exponential backoff (cap at 30s)
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectWs, reconnectDelay);
+  };
+
+  ws.onmessage = async (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+
+    if (msg.type === 'offer') {
+      // [SIG] daemon sends offer; we answer
+      await handleOffer(msg.sdp);
+    } else if (msg.type === 'ice') {
+      // [SIG] trickle ICE candidate from daemon
+      if (pc && msg.candidate) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); }
+        catch (_) {}
+      }
+    }
+  };
+}
+
+/* ── Handle SDP offer from daemon [SIG] ──────────────────────── */
+async function handleOffer(sdp) {
+  // [ICE] fetch TURN credentials
+  const iceServers = await fetchIceServers();
+
+  // [ICE §relay fallback] on second attempt use relay-only transport policy
+  const newPc = relayAttempt
+    ? await buildPeerConnectionRelayOnly(iceServers)
+    : await buildPeerConnection(iceServers);
+
+  wirePc(newPc);
+
+  try {
+    await pc.setRemoteDescription({ type: 'offer', sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // [SIG] send answer to daemon
+    wsSend({ type: 'answer', sdp: pc.localDescription.sdp });
+  } catch (err) {
+    connState = 'sdp-error';
+    updateStatusLine();
+    toast('SDP 协商失败');
+    // If this was the normal attempt, try relay-only next
+    if (!relayAttempt) {
+      relayAttempt = true;
+      // Re-request an offer by closing + reconnecting
+      // The daemon will re-send an offer on new WS connection
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connectWs, 500);
+    }
+  }
+}
+
+/* ── Boot ─────────────────────────────────────────────────────── */
+// [iOS §Touch] suppress default scroll/context-menu globally
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+// [iOS §Video] show overlay if video stalls
+video.addEventListener('pause', () => {
+  if (!frozen) playOverlay.classList.remove('hidden');
+});
+video.addEventListener('playing', () => {
+  playOverlay.classList.add('hidden');
+});
+
+// defensive: re-play on video stall (iOS background→foreground)
+video.addEventListener('stalled', tryPlay);
+video.addEventListener('waiting', tryPlay);
+
+connectWs();
+</script>
+</body>
+</html>
