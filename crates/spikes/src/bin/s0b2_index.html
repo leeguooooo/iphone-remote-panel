@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S0b-2 — iPhone Mirror over WebRTC</title>
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --fg: #e7e7ea;
+    --muted: #8b8b93;
+    --accent: #4da3ff;
+    --border: #26262c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    padding: 24px;
+  }
+  header { text-align: center; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  p.sub { margin: 0; color: var(--muted); font-size: 13px; }
+  #stage {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    line-height: 0;
+  }
+  video { display: block; max-width: 90vw; max-height: 70vh; }
+  .controls { display: flex; gap: 12px; align-items: center; }
+  button {
+    background: var(--accent);
+    color: #00112b;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 22px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log {
+    width: min(90vw, 760px);
+    height: 180px;
+    overflow-y: auto;
+    background: #111116;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: pre-wrap;
+  }
+  .pill {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--accent);
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>S0b-2 — iPhone Mirroring over WebRTC</h1>
+    <p class="sub">Daemon captures the iPhone Mirroring window, hardware-encodes H.264, and streams it here. Click Connect.</p>
+  </header>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div class="controls">
+    <button id="connect">Connect</button>
+    <span class="pill" id="state">idle</span>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const stateEl = $("state");
+const logEl = $("log");
+
+function log(...args) {
+  const line = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  logEl.textContent += line + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(...args);
+}
+
+$("connect").addEventListener("click", connect);
+
+async function connect() {
+  $("connect").disabled = true;
+  stateEl.textContent = "connecting";
+  log("creating RTCPeerConnection (STUN: stun.l.google.com)...");
+
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+
+  // We only receive video.
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  pc.ontrack = (ev) => {
+    log("ontrack:", ev.track.kind, "- attaching to <video>");
+    if (video.srcObject !== ev.streams[0]) {
+      video.srcObject = ev.streams[0];
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    log("ICE state:", pc.iceConnectionState);
+    stateEl.textContent = pc.iceConnectionState;
+  };
+  pc.onconnectionstatechange = () => {
+    log("PC state:", pc.connectionState);
+  };
+
+  // Browser is the offerer. Non-trickle: wait for ICE gathering to finish so the
+  // offer SDP carries all candidates, then POST it; the daemon answers likewise.
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  log("created offer, gathering ICE...");
+
+  await waitForIceGathering(pc);
+  log("ICE gathering complete; POSTing offer to /offer");
+
+  let answer;
+  try {
+    const resp = await fetch("/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pc.localDescription),
+    });
+    if (!resp.ok) {
+      log("ERROR: /offer responded", resp.status, await resp.text());
+      stateEl.textContent = "failed";
+      $("connect").disabled = false;
+      return;
+    }
+    answer = await resp.json();
+  } catch (e) {
+    log("ERROR posting offer:", e.message);
+    stateEl.textContent = "failed";
+    $("connect").disabled = false;
+    return;
+  }
+
+  log("got answer, setting remote description");
+  await pc.setRemoteDescription(answer);
+  log("remote description set — waiting for media");
+}
+
+function waitForIceGathering(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+    // Safety timeout: don't wait forever on a flaky STUN reply.
+    setTimeout(resolve, 3000);
+  });
+}
+</script>
+</body>
+</html>

@@ -24,6 +24,13 @@ path = "src/bin/s1b_session_input.rs"
 name = "s0b_encode"
 path = "src/bin/s0b_encode.rs"
 
+[[bin]]
+# S0b-2 probe: capture+encode (same front-half as s0b_encode) but stream the
+# Annex-B H.264 over WebRTC (webrtc-rs) to a desktop browser on the LAN via a
+# tiny HTTP+WebSocket signaling server.
+name = "s0b2_webrtc"
+path = "src/bin/s0b2_webrtc.rs"
+
 [dependencies]
 # elcapitan feature gates CGEvent::post_to_pid (CGEventPostToPid).
 # highsierra is not needed — we use only mouse events, not scroll.
@@ -53,3 +60,19 @@ objc2-core-video = "0.3.2"
 # TCFType to pull the raw CVPixelBufferRef out of the SCK-captured pixel buffer
 # and bridge it to objc2-core-video's CVImageBuffer for VTCompressionSessionEncodeFrame.
 core-foundation = "0.10"
+
+# S0b-2 WebRTC streaming probe.
+# webrtc-rs: TrackLocalStaticSample runs the H264 RTP payloader internally; we
+# feed it Annex-B access units via write_sample.
+webrtc = "0.17"
+# async runtime for the webrtc peer connection + signaling server.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+# tiny HTTP server: serves index.html + the /offer JSON signaling endpoint.
+# Signaling is plain HTTP POST (browser is the offerer, non-trickle ICE — the
+# answer SDP carries all LAN host candidates), so no WebSocket lib is needed.
+tiny_http = "0.12"
+# zero-copy byte buffers handed to webrtc Sample.data.
+bytes = "1"
+# SDP/ICE JSON payloads over the WebSocket.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
