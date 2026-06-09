@@ -417,3 +417,40 @@ fn agent_screenshot_503_without_phone_target() {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     });
 }
+
+#[test]
+fn agent_auth_accepts_non_ascii_password_bearer() {
+    block(async {
+        // Regression: a Chinese password made HeaderValue::to_str() fail → 401
+        // on every agent request. The byte-based bearer check must accept it.
+        let pw = "测试密码123";
+        let app = http::router(build_state(Some(pw)));
+        let hv = axum::http::HeaderValue::from_bytes(format!("Bearer {pw}").as_bytes()).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, hv)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wrong non-ASCII token → still 401.
+        let bad = axum::http::HeaderValue::from_bytes("Bearer 错误密码".as_bytes()).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, bad)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+}

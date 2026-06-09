@@ -300,10 +300,15 @@ async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 // spawned child's CGEvents untrusted). The daemon injects through the same
 // validated path as the human WebRTC client, taking an `Agent` control lease.
 
-/// Extract a `Authorization: Bearer <token>` value.
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    v.strip_prefix("Bearer ").map(|s| s.trim().to_string())
+/// Extract the bytes after `Authorization: Bearer `.
+///
+/// Works on the raw header bytes, NOT `to_str()`: a non-ASCII password — e.g. a
+/// Chinese one — makes `HeaderValue::to_str()` fail, which 401'd every agent
+/// request (caught on hardware). Reading bytes + trimming ASCII whitespace
+/// handles the UTF-8 token a client (curl) sends verbatim.
+fn bearer_credential(headers: &HeaderMap) -> Option<&[u8]> {
+    let v = headers.get(header::AUTHORIZATION)?;
+    Some(v.as_bytes().strip_prefix(b"Bearer ")?.trim_ascii())
 }
 
 /// Return `true` if the request may use the agent API.
@@ -314,10 +319,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 fn is_agent_authed(state: &AppState, headers: &HeaderMap) -> bool {
     match &state.password {
         None => true,
-        Some(pw) => bearer_token(headers).is_some_and(|t| {
-            // length-checked byte compare (avoids early-exit on first mismatch)
-            let (a, b) = (t.as_bytes(), pw.as_bytes());
-            a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        Some(pw) => bearer_credential(headers).is_some_and(|token| {
+            // length-checked constant-time byte compare (no early exit, UTF-8 safe)
+            let pw = pw.as_bytes();
+            token.len() == pw.len()
+                && token.iter().zip(pw).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
         }),
     }
 }
