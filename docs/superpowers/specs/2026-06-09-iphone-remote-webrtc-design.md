@@ -65,9 +65,9 @@ The core does not know whether a caller is a human or an agent — it only expos
 | Module | Responsibility | Inputs | Outputs / deps |
 |---|---|---|---|
 | `core::window` | Find the iPhone Mirroring window; track resize/move/close | app-name + bounds heuristic (`iPhone`/`镜像`/`Mirroring`, 200–900 × 400–1600) | `{pid, window_id, bounds, scale}`; SCK or `cua-driver list_windows` |
-| `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream; restart on window change |
-| `encode` | VideoToolbox H.264, realtime/low-latency, on-demand keyframe when a viewer joins | frame stream | Annex-B/AVCC NAL units → RTP packetizer |
-| `core::input` | Map abstract events → `CGEventPostToPid` on window pid | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | synthesized CGEvents |
+| `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Invariants:** explicit FPS, bounded queue depth, drop late frames, restart `SCStream` on window-id/display change |
+| `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract:** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **SPS/PPS in-band before every IDR** |
+| `core::input` | Map abstract events → injected events on window pid | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | injected events — **primary path `CGEventPostToPid`, fallback `cua-driver`/AX** until Spike S1 proves the primary (see §9) |
 | `front::webrtc` | One `PeerConnection` per viewer: H.264 track + data channel | SDP/ICE via signaling | webrtc-rs |
 | `front::mcp` | MCP tools over the same core; screenshots pulled from the live pipeline | tool calls | rmcp (or hand-rolled) |
 | `front::http` | Serve web UI, login, WS signaling, ephemeral TURN creds | HTTP/WS | axum |
@@ -78,9 +78,16 @@ The core does not know whether a caller is a human or an agent — it only expos
   offer/answer + ICE candidates; ICE servers include Cloudflare TURN. Media is **not**
   proxied through the tunnel.
 - **Video:** SCK frame → VideoToolbox H.264 → RTP → WebRTC video track → Safari
-  `<video autoplay playsinline muted>`.
-- **Input:** Safari pointer/key events → data channel → `core::input` → CGEvent →
-  Mirroring window.
+  `<video autoplay playsinline muted>`. iOS Safari may still stall a one-way stream to a
+  black element, so the client keeps an explicit **"connect/play" user gesture** that
+  calls `video.play()` after the remote track attaches and treats a rejected `play()`
+  promise as a real UI state, not a console error.
+- **Input:** Safari pointer/key events → data channel → `core::input` → injected
+  event → Mirroring window. **Two message classes on the data channel:**
+  `down`/`up`/`key`/`text` go **reliable + ordered**; high-rate `move` goes
+  **unordered + lossy** (maxRetransmits 0), carries a sequence number, and the host
+  **drops stale moves**. A single reliable-ordered channel would head-of-line-block
+  `move` and defeat the latency goal.
 
 ### 3.3 Coordinate mapping (human touch)
 
@@ -90,15 +97,23 @@ screen point → CGEvent`. Normalization keeps the client resolution-agnostic an
 survives window resize. Touch phases map: `touchstart → mouseDown`,
 `touchmove → mouseDragged` (every intermediate point), `touchend → mouseUp`.
 
-### 3.4 Arbitration (mutex + takeover)
+### 3.4 Arbitration (control lease + cancellation token)
 
-`core` holds one `control_lock { holder: Human | Agent(id), last_active }`.
-- Agent `tap/swipe/type` implicitly `acquire`s; a long agent task may `acquire_control`
-  explicitly for exclusivity.
-- A human pointer event in Safari **pre-empts**: it takes the lock, the agent receives
-  a `preempted` signal, and the agent's subsequent injections are rejected — but the
-  agent can still `observe` (read frames/screenshots).
-- Idle timeout auto-releases the lock (default 30 s; configurable).
+Not a long-held mutex — a mutex held across an `.await`, a blocking FFI call, or a
+multi-event gesture loop would queue human input *behind* the agent instead of
+pre-empting it. Instead:
+
+- `core` holds `control { holder: Human | Agent(id), generation: u64, last_active }`
+  guarded by a **short** lock that is **never held across `.await`, blocking FFI, or an
+  injection loop** — only long enough to read/swap the holder and bump `generation`.
+- Each injected event checks the current `generation` **before** it fires; a gesture
+  loop (`move` stream, multi-key `text`) re-checks every iteration and aborts the moment
+  its generation is stale.
+- A human pointer event **pre-empts**: it swaps `holder` to `Human` and bumps
+  `generation`; the agent's in-flight gesture sees the stale token and stops, and the
+  agent receives a `preempted` event. The agent can still `observe`.
+- Agent `tap/swipe/type` implicitly acquires; a long agent task may `acquire_control`
+  for exclusivity. Idle timeout auto-releases (default 30 s; configurable).
 
 ### 3.5 Agent MCP surface
 
@@ -110,31 +125,46 @@ Tools (high-level, phone-semantic — agents never compute raw screen coordinate
 path, the host synthesizes intermediate `mouseDragged` points through `core::input`
 so the same code path serves both front-ends.
 
-**`cua-driver` dependency:** the default is to reimplement keyboard/text/shortcuts
-in-process via CGEvent so the shipped binary has **no runtime dependency** on
-`cua-driver` (window enumeration in `core::window` can fall back to its own SCK/AX
-query). `cua-driver` is used during development for parity checks; whether any path
-keeps shelling out to it at runtime is a plan-time decision, but the spec's intent is
-a self-contained binary.
+**`cua-driver` dependency:** a self-contained binary (in-process CGEvent for all
+input, own SCK/AX window enumeration) is the **goal**, but it is **gated on Spike S1**
+(§9): raw `CGEventPostToPid` driving the Mirroring window is unproven. Until S1 passes,
+`cua-driver` stays as a **runtime fallback** for input, and the installer treats it as a
+prerequisite. If S1 shows `CGEventPostToPid` only works with the window frontmost,
+`core::input` must explicitly activate/focus the window before injecting (or keep the
+`cua-driver` path). This fork is resolved by S1 before the plan commits a deployment
+story.
 
 ## 4. Security
 
 - Reuse v1's **password + HMAC-signed session token** (`exp:nonce:sig`, default 8 h TTL,
   `hmac.compare_digest`). The token gates both WS signaling and MCP.
-- **TURN credentials** are short-lived, issued via the Cloudflare API on demand — never
-  baked into the binary or page.
+- **TURN credentials** are short-lived, issued server-side via the Cloudflare API on
+  demand — never baked into the binary or page. TTL must exceed expected session length;
+  the client **refreshes via `setConfiguration()` before expiry** and supports **ICE
+  restart** so a mid-session credential rotation or path change doesn't silently drop the
+  call.
 - Cloudflare tunnel carries **signaling only** (HTTP/WS); UDP media stays P2P/TURN.
 - Keep v1's headers: `Cache-Control: no-store`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`. Add `Secure` to the session cookie (tunnel is HTTPS).
-- The binary requires **Screen Recording + Accessibility** TCC grants (same as cua-driver).
+- The binary requires **Screen Recording + Accessibility** TCC grants (same as
+  cua-driver). These are **not passive dependencies** for a background daemon: `serve`
+  runs a **preflight that fails closed** — `CGPreflightScreenCaptureAccess` /
+  `CGRequestScreenCaptureAccess` for capture and `AXIsProcessTrustedWithOptions` for
+  input — printing the exact System Settings panes and refusing to start until both are
+  granted. The binary must ship with a **fixed codesign identity** so the grant sticks
+  across upgrades (TCC keys on the executable's identity).
 
 ## 5. Deployment
 
 - Ship a **single binary** `iphone-remote` via **GitHub Releases** + `install.sh`
-  (`curl … | sh`), per the project distribution convention — no npm registry.
-- Subcommands `serve` / `stop` replace the v1 bash scripts. `serve` launches the host,
-  brings up the Cloudflare tunnel for signaling, and prints local URL / tunnel URL /
-  password.
+  (`curl … | sh`), per the project distribution convention — no npm registry. "Single
+  binary" refers to the host logic; **`cloudflared` remains an external prerequisite**
+  (the `serve` health check verifies it exists before reporting a tunnel URL), and
+  `cua-driver` is a prerequisite only until Spike S1 retires the input fallback. The
+  installer documents both.
+- Subcommands `serve` / `stop` replace the v1 bash scripts. `serve` runs the TCC
+  preflight (§4), launches the host, brings up the `cloudflared` tunnel for signaling,
+  and prints local URL / tunnel URL / password.
 - State (pid, logs, ephemeral secret) stays under `/tmp/hermes-phone-remote`, uncommitted.
 
 ## 6. Latency budget (target)
@@ -150,10 +180,32 @@ latency, which is outside our control.
 - Multi-device / multi-phone selection UI — single Mirroring window for now.
 - HEVC/AV1 — H.264 for Safari compatibility first.
 
-## 8. Open questions
+## 8. Crate selection (default; confirm in Spike S0)
 
-- Exact Rust crates for SCK + VideoToolbox (`cidre` vs `screencapturekit` + `core-video`)
-  and WebRTC (`webrtc-rs` vs `str0m`) — resolved during the plan/spike.
-- Whether `front::mcp` uses an existing MCP crate (`rmcp`) or a thin hand-rolled
-  stdio JSON-RPC loop.
+- **Capture/encode:** `screencapturekit` (purpose-built, has single-window examples) +
+  `videotoolbox` (exposes realtime H.264 builder paths) over `cidre` (broader but less
+  documented).
+- **WebRTC:** `webrtc-rs` (PeerConnection-style API, includes an H.264 payloader) over
+  `str0m` (Sans-I/O — only worth it if we deliberately want to own the reactor loop and
+  TURN sockets).
+- **MCP:** `rmcp` if it fits cleanly, else a thin hand-rolled stdio JSON-RPC loop.
+
+## 9. Validation spikes (do FIRST, before the plan commits)
+
+Ordered by risk. Each is a throwaway probe that retires a specific unknown.
+
+- **S1 — input injection (BLOCKER).** Does `CGEventPostToPid(mouseDown/Dragged/Up)` on
+  the Mirroring window's pid actually drive the mirrored iPhone? Test window
+  **frontmost, backgrounded, covered, and across displays**. Outcome decides whether the
+  binary is self-contained, must focus the window first, or keeps the `cua-driver`
+  fallback (§3.1, §3.5).
+- **S0 — crate smoke test.** `screencapturekit` single-window frames →
+  `videotoolbox` realtime H.264 (Constrained Baseline, `packetization-mode=1`, no
+  B-frames, forced IDR + in-band SPS/PPS) → `webrtc-rs` H.264 track that a desktop
+  browser decodes. Confirms the §8 stack before building on it.
+- **S2 — Safari receive path.** The S0 stream rendered in **iOS Safari**
+  `<video playsinline>` with the explicit `play()` gesture; verify decode, latency, and
+  data-channel round-trip (reliable + unordered classes).
+- **S3 — Cloudflare TURN.** A 1:1 P2P session relayed through Cloudflare Realtime TURN
+  with server-issued ephemeral creds, credential refresh, and an ICE restart.
 ```
