@@ -59,6 +59,69 @@ fn main() -> Result<()> {
     }
 }
 
+/// Resolve the iPhone Mirroring window's `(pid, window_id)` by parsing
+/// `cua-driver call list_windows`. Picks the largest on-screen phone-shaped
+/// Mirroring window (skips menubar extras + the setup/welcome window), matching
+/// the validated `core::window::select_mirroring` heuristic. `None` if cua-driver
+/// is unavailable or nothing matches — key/text/shortcut are then skipped.
+fn find_cua_target(cua_driver: &std::path::Path) -> Option<(i32, u32)> {
+    let out = std::process::Command::new(cua_driver)
+        .args(["call", "list_windows", "{}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let wins = v.get("windows")?.as_array()?;
+    let mut best: Option<(i32, u32, bool, f64)> = None; // (pid, wid, on_screen, area)
+    for w in wins {
+        let app = w.get("app_name").and_then(|x| x.as_str()).unwrap_or("");
+        let bundle = w
+            .get("bundle_identifier")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let title = w.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let hay = format!("{app}\u{1}{bundle}\u{1}{title}").to_lowercase();
+        let is_mirror = hay.contains("iphone mirroring")
+            || hay.contains("screencontinuity")
+            || hay.contains('\u{955c}'); // 镜 (镜像)
+        if !is_mirror {
+            continue;
+        }
+        let b = match w.get("bounds") {
+            Some(b) => b,
+            None => continue,
+        };
+        let width = b.get("width").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let height = b.get("height").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        if !((200.0..=900.0).contains(&width) && (400.0..=1600.0).contains(&height)) {
+            continue; // skip menubar extras / off-shape
+        }
+        if title.to_lowercase().contains("welcome") || title.contains('\u{6b22}') {
+            continue; // skip the setup/welcome window (欢迎)
+        }
+        let pid = w.get("pid").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+        let wid = w.get("window_id").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        if pid == 0 || wid == 0 {
+            continue;
+        }
+        let on = w
+            .get("is_on_screen")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let area = width * height;
+        let better = match best {
+            None => true,
+            Some((_, _, b_on, b_area)) => (on, area) > (b_on, b_area),
+        };
+        if better {
+            best = Some((pid, wid, on, area));
+        }
+    }
+    best.map(|(pid, wid, _, _)| (pid, wid))
+}
+
 // ---------------------------------------------------------------------------
 // serve
 // ---------------------------------------------------------------------------
@@ -92,6 +155,20 @@ fn serve() -> Result<()> {
         geometry.orientation
     );
 
+    // 6b. Resolve the Mirroring window's (pid, window_id) via cua-driver, for
+    // key/text/shortcut injection (cua-driver `call press_key`/`type_text`).
+    let cua_path = cfg.cua_driver.to_string_lossy().to_string();
+    let cua_target = find_cua_target(&cfg.cua_driver).map(|(pid, wid)| (cua_path.clone(), pid, wid));
+    match &cua_target {
+        Some((_, pid, wid)) => {
+            tracing::info!("cua-driver input target: pid={pid} window_id={wid}")
+        }
+        None => tracing::warn!(
+            "could not resolve Mirroring window pid/window_id via {cua_path}; \
+             key/text/shortcut will be skipped (pointer/tap still work)"
+        ),
+    }
+
     // 7. ICE servers (STUN + optional env TURN).
     let ice_servers = http::build_ice_servers(
         std::env::var("PHONE_REMOTE_TURN_URLS").ok(),
@@ -107,7 +184,7 @@ fn serve() -> Result<()> {
     let injector = {
         let control = control.clone();
         let current_lease = current_lease.clone();
-        server::input_bridge::spawn_injector(geometry, move || {
+        server::input_bridge::spawn_injector(geometry, cua_target, move || {
             let lease = current_lease.lock().unwrap();
             match &*lease {
                 Some(l) => control.lock().unwrap().is_current(l),

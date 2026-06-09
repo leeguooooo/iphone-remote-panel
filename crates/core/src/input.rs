@@ -257,10 +257,13 @@ impl EventSink for RecordingSink {
 ///   front first).
 ///
 /// - **Key / Text**: delegates to `cua-driver` via a child-process call
-///   (`cua-driver key <name>` / `cua-driver type <text>`).  This avoids
-///   reimplementing keyboard scan-code mapping in Rust.
+///   (`cua-driver call press_key '{...}'` / `cua-driver call type_text '{...}'`,
+///   targeting the Mirroring window's `pid` + `window_id`).  This avoids
+///   reimplementing keyboard scan-code mapping in Rust. cua-driver 0.5.x has NO
+///   top-level `key`/`type`/`shortcut` subcommand — only `call <tool> '<json>'`.
 ///
-/// - **Shortcut**: similarly delegates to `cua-driver shortcut <name>`.
+/// - **Shortcut**: mapped to the proven `iphone-act` hotkeys and sent via
+///   `cua-driver call press_key` — `home` = ⌘1, `switcher` = ⌘2, `spotlight` = ⌘3.
 ///
 /// - **Tap dwell**: when called from a `Tap` sequence, `mouse_up` sleeps
 ///   [`TAP_DWELL_MS`] ms *before* posting the up event so iOS does not
@@ -278,6 +281,57 @@ pub struct CgEventSink {
     /// Set by `mouse_down` so that a `Tap` (which is always down→up with no
     /// intervening drag) gets the short dwell.  Cleared after `mouse_up` fires.
     pending_tap_dwell: bool,
+    /// Path to the `cua-driver` binary used for key/text/shortcut injection.
+    cua_driver: String,
+    /// `(pid, window_id)` of the Mirroring window, for cua-driver `call` tools.
+    /// `None` → key/text/shortcut are logged and skipped (the pointer path,
+    /// which uses CGEvent directly, still works without a target).
+    target: Option<(i32, u32)>,
+}
+
+/// Map a named shortcut to the cua-driver `press_key` key (always with ⌘).
+/// Matches the proven `iphone-act` mapping. Pure — unit-tested.
+fn shortcut_keymap(name: &str) -> Option<&'static str> {
+    match name {
+        "home" => Some("1"),
+        "switcher" => Some("2"),
+        "spotlight" => Some("3"),
+        _ => None,
+    }
+}
+
+/// Minimal JSON string escaping for cua-driver `call` payloads.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the JSON for `cua-driver call press_key`.
+fn press_key_json(pid: i32, window_id: u32, key: &str, cmd: bool) -> String {
+    let mods = if cmd { r#","modifiers":["cmd"]"# } else { "" };
+    format!(
+        r#"{{"pid":{pid},"window_id":{window_id},"key":"{}"{mods}}}"#,
+        json_escape(key)
+    )
+}
+
+/// Build the JSON for `cua-driver call type_text`.
+fn type_text_json(pid: i32, window_id: u32, text: &str) -> String {
+    format!(
+        r#"{{"pid":{pid},"window_id":{window_id},"text":"{}"}}"#,
+        json_escape(text)
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -291,7 +345,18 @@ impl CgEventSink {
             .expect("CGEventSource::new failed — is there a macOS window server session?");
         CgEventSink {
             pending_tap_dwell: false,
+            cua_driver: "cua-driver".to_string(),
+            target: None,
         }
+    }
+
+    /// Create a sink wired to the Mirroring window's `pid` + `window_id` and a
+    /// `cua-driver` binary path, so key/text/shortcut injection works.
+    pub fn with_cua(cua_driver: impl Into<String>, pid: i32, window_id: u32) -> Self {
+        let mut s = Self::new();
+        s.cua_driver = cua_driver.into();
+        s.target = Some((pid, window_id));
+        s
     }
 
     fn make_source() -> core_graphics::event_source::CGEventSource {
@@ -314,12 +379,15 @@ impl CgEventSink {
         evt.post(CGEventTapLocation::HID);
     }
 
-    fn cua_driver(args: &[&str]) {
-        // Best-effort: if cua-driver is not on PATH we log and continue.
-        match std::process::Command::new("cua-driver").args(args).status() {
+    /// Run `cua-driver call <tool> '<json>'`. Best-effort; logs on failure.
+    fn cua_call(&self, tool: &str, json: &str) {
+        match std::process::Command::new(&self.cua_driver)
+            .args(["call", tool, json])
+            .status()
+        {
             Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("cua-driver {:?} exited with {}", args, s),
-            Err(e) => eprintln!("cua-driver not found / failed: {e}"),
+            Ok(s) => eprintln!("cua-driver call {tool} exited {s}"),
+            Err(e) => eprintln!("cua-driver ({}) not found / failed: {e}", self.cua_driver),
         }
     }
 }
@@ -357,15 +425,27 @@ impl EventSink for CgEventSink {
     }
 
     fn key(&mut self, name: &str) {
-        Self::cua_driver(&["key", name]);
+        match self.target {
+            Some((pid, wid)) => self.cua_call("press_key", &press_key_json(pid, wid, name, false)),
+            None => eprintln!("key {name:?}: no Mirroring window target; skipping"),
+        }
     }
 
     fn text(&mut self, s: &str) {
-        Self::cua_driver(&["type", s]);
+        match self.target {
+            Some((pid, wid)) => self.cua_call("type_text", &type_text_json(pid, wid, s)),
+            None => eprintln!("text: no Mirroring window target; skipping"),
+        }
     }
 
     fn shortcut(&mut self, name: &str) {
-        Self::cua_driver(&["shortcut", name]);
+        match (shortcut_keymap(name), self.target) {
+            (Some(key), Some((pid, wid))) => {
+                self.cua_call("press_key", &press_key_json(pid, wid, key, true))
+            }
+            (None, _) => eprintln!("unknown shortcut {name:?} (want home|spotlight|switcher)"),
+            (Some(_), None) => eprintln!("shortcut {name:?}: no Mirroring window target; skipping"),
+        }
     }
 }
 
@@ -637,5 +717,47 @@ mod tests {
             msg.contains("outside") || msg.contains("content rect"),
             "display should describe the error: {msg}"
         );
+    }
+
+    // ── cua-driver invocation builders (the bug Hermes found) ────────────────
+
+    #[test]
+    fn shortcut_keymap_matches_iphone_act() {
+        assert_eq!(shortcut_keymap("home"), Some("1"));
+        assert_eq!(shortcut_keymap("switcher"), Some("2"));
+        assert_eq!(shortcut_keymap("spotlight"), Some("3"));
+        assert_eq!(shortcut_keymap("nope"), None);
+    }
+
+    #[test]
+    fn press_key_json_shape() {
+        // spotlight = ⌘3 on the Mirroring window
+        assert_eq!(
+            press_key_json(40374, 353, "3", true),
+            r#"{"pid":40374,"window_id":353,"key":"3","modifiers":["cmd"]}"#
+        );
+        // a plain key (no cmd)
+        assert_eq!(
+            press_key_json(7, 9, "a", false),
+            r#"{"pid":7,"window_id":9,"key":"a"}"#
+        );
+    }
+
+    #[test]
+    fn type_text_json_escapes() {
+        assert_eq!(
+            type_text_json(1, 2, "hi"),
+            r#"{"pid":1,"window_id":2,"text":"hi"}"#
+        );
+        assert_eq!(
+            type_text_json(1, 2, "a\"b\\c"),
+            r#"{"pid":1,"window_id":2,"text":"a\"b\\c"}"#
+        );
+    }
+
+    #[test]
+    fn json_escape_control_chars() {
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("\"\\"), "\\\"\\\\");
     }
 }

@@ -64,7 +64,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         scale: 2.0,
         orientation: Orientation::Portrait,
     };
-    let injector = server::input_bridge::spawn_injector(geo, || false);
+    let injector = server::input_bridge::spawn_injector(geo, None, || false);
 
     Arc::new(AppState {
         pipeline,
