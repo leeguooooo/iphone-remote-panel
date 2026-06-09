@@ -17,6 +17,13 @@ path = "src/bin/s0_capture.rs"
 name = "s1b_session_input"
 path = "src/bin/s1b_session_input.rs"
 
+[[bin]]
+# S0b-1 probe: capture the iPhone Mirroring window (same front-half as
+# s0_capture) and hardware-encode it to realtime H.264 via VideoToolbox,
+# writing a playable Annex-B elementary stream (s0b.h264).
+name = "s0b_encode"
+path = "src/bin/s0b_encode.rs"
+
 [dependencies]
 # elcapitan feature gates CGEvent::post_to_pid (CGEventPostToPid).
 # highsierra is not needed — we use only mouse events, not scroll.
@@ -33,3 +40,16 @@ objc2-app-kit = "0.3"
 core-media-rs = "0.3.5"
 core-video-rs = "0.3.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# S0b-1 VideoToolbox H.264 encode probe. objc2-video-toolbox exposes the real
+# VTCompressionSession C API (VTCompressionSessionCreate / EncodeFrame /
+# VTSessionSetProperty + all kVT* property/profile keys). objc2-core-media gives
+# the encoded CMSampleBuffer -> CMBlockBuffer byte access + H264 parameter-set
+# (SPS/PPS) extraction; objc2-core-foundation builds the CF property dicts.
+objc2-video-toolbox = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+# core-foundation (0.10) is what core-video-rs/core-media-rs build on; we use its
+# TCFType to pull the raw CVPixelBufferRef out of the SCK-captured pixel buffer
+# and bridge it to objc2-core-video's CVImageBuffer for VTCompressionSessionEncodeFrame.
+core-foundation = "0.10"
