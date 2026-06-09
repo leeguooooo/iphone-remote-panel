@@ -67,7 +67,7 @@ The core does not know whether a caller is a human or an agent — it only expos
 |---|---|---|---|
 | `core::window` | Find the iPhone Mirroring window; track resize/move/close | shareable-content list | `{pid, window_id, bounds, scale}`. **Selection (validated):** match name/bundle (`iPhone`/`镜像`/`Mirroring`/`ScreenContinuity`), then prefer the **phone-shape `size_ok` (200–900 × 400–1600) largest** window — SCK `is_on_screen` proved unreliable — and **skip setup/welcome windows** (`welcome`/`欢迎`) and the 1800×N menubar extras |
 | `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Host context:** must call `NSApplicationLoad()` before any SCK call (else `CGS_REQUIRE_INIT` abort — validated). **Invariants/targets:** 30 fps default (cap 60, `SCStreamConfiguration.minimumFrameInterval`), bounded queue depth ~2–3 frames, drop late frames, **silently drop idle samples** (`get_pixel_buffer → CouldNotGetDataBuffer` is normal SCK behavior, not an error), **pass `CMSampleBuffer` PTS through** for pacing, restart `SCStream` on window-id/display change |
-| `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract (S0b-1 validated):** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **Annex-B with SPS/PPS in-band before every IDR**. **Static-screen keepalive (required):** SCK emits no frames when the screen is static, so **repeat the last encoded access unit on a ~500 ms timer** or the stream stalls and a late-joining viewer gets nothing |
+| `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract (S0b-1 validated):** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR on viewer join AND **on RTCP PLI** (wire the `rtp_sender` RTCP read → force-IDR; S0b-2 found artifacts when PLI→IDR was unreliable), **Annex-B with SPS/PPS in-band before every IDR**. **Static-screen keepalive (required):** SCK emits no frames when static, so on a ~500 ms idle timer **emit a fresh KEYFRAME (forced IDR), not a repeated P-frame** — repeating a non-IDR access unit drifts the decoder into color-block artifacts (S0b-2). Use **trickle ICE** for sub-second first frame |
 | `core::input` | Map abstract events → injected events | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | **`CGEvent::post(CGEventTapLocation::HID)` at global screen coords, Mirroring window frontmost** (validated S1b — `post_to_pid` does NOT work); `cua-driver` fallback. **Commandeers the real Mac cursor.** Tap-vs-long-press **timing fidelity** matters (the probe's ~100 ms press read as a long-press → jiggle mode) — map iPhone touch durations deliberately |
 | `front::webrtc` | One `PeerConnection` per viewer (S0b-2 validated): H.264 `TrackLocalStaticSample` + two data channels | SDP/ICE via signaling | webrtc-rs 0.17. **Daemon is the offerer** and creates both channels; **fmtp `profile-level-id=42e01f`** (Safari-native, NOT 42001f); **relay-only fallback ICE** (Cloudflare TURN) when LAN/mDNS fails; ICE-restart daemon-initiated |
 | `front::mcp` | MCP tools over the same core; screenshots pulled from the live pipeline | tool calls | **Must be a CONNECT-IN surface served by the running daemon (HTTP/SSE/socket), NOT a per-call stdio-spawn MCP** — a spawned child loses the TCC grant (§5 responsible-process chain). A stdio shim, if any, only forwards to the daemon |
@@ -266,9 +266,14 @@ Status as of 2026-06-09 (see `SPIKE-RESULTS.md` for the hardware log).
   (ffprobe: Constrained Baseline, 312×694, no B-frames) and visually shows the live Home
   Screen. **Finding:** SCK delivers no frames on a static screen → encoder timed out at 33
   frames; the WebRTC side needs **repeat-last-frame keepalive** (folded into `encode`, §3.1).
-- **S0b-2 — capture → VideoToolbox → `webrtc-rs` `TrackLocalStaticSample` → desktop
-  browser decode (IN PROGRESS).** LAN-only (no TURN yet); must implement the static-frame
-  keepalive + force-IDR-on-connect. Cheat-sheet: `docs/superpowers/notes/2026-06-09-webrtc-turn-cheatsheet.md`.
+- **S0b-2 — capture → VideoToolbox → `webrtc-rs` → desktop browser decode — ✅ PASS.**
+  Browser showed the live Home Screen (readyState 4, 312×694, track live); static keepalive
+  advanced `currentTime`. **Two quality findings for the production component (not blockers):**
+  (a) **first-frame ~3 s** on connect — non-trickle ICE gathering + waiting for an IDR; prod
+  must use **trickle ICE** + reliable **force-IDR-on-connect** for sub-second first frame.
+  (b) **color-block / codec artifacts** — loss corruption that doesn't recover (PLI→IDR
+  unreliable) and/or keepalive repeating a P-frame. **Prod keepalive must emit a fresh
+  KEYFRAME on a static screen (not repeat an arbitrary access unit), and wire PLI→force-IDR.**
 - **S2 — Safari receive path.** The S0b stream rendered in **iOS Safari**
   `<video playsinline>` with the explicit `play()` gesture; verify decode, latency, and
   data-channel round-trip (separate reliable + unordered channels).
