@@ -26,9 +26,10 @@ control surface for agents (Hermes and others).
 | Encode | **VideoToolbox** H.264, low-latency profile | Hardware encoder; no B-frames; on-demand keyframes |
 | Host stack | **Single Rust binary** | Matches GitHub-Release distribution habit; Rust+SCK proven; one artifact |
 | NAT traversal | **P2P + Cloudflare TURN** | 1:1 control wants direct/relayed P2P, not an SFU extra hop |
-| Input injection | **Direct CGEvent synthesis in Rust** | Continuous pointer stream → native-feel drag/swipe/inertia |
+| Input injection | **CGEvent synthesis in Rust (primary), `cua-driver`/AX fallback** — gated on Spike S1 | Continuous pointer stream → native feel; primary path unproven until S1 (§9) |
 | Agent entry | **MCP server** | Fits the Hermes + cua-driver MCP ecosystem; high-level phone tools |
-| Arbitration | **Mutex + takeover** (human pre-empts agent) | One controller at a time; a human touch wins; agent can still observe |
+| Arbitration | **Control lease + generation/cancellation token** (human pre-empts agent) | Lock never held across `.await`/FFI/gesture loop, so a human touch interrupts mid-gesture (§3.4) |
+| Packaging | **Single host binary + external prerequisites** (`cloudflared`, and `cua-driver` until S1) | One built artifact for host logic; tunnel/input fallback are separate prereqs (§5) |
 
 ## 3. Architecture
 
@@ -65,7 +66,7 @@ The core does not know whether a caller is a human or an agent — it only expos
 | Module | Responsibility | Inputs | Outputs / deps |
 |---|---|---|---|
 | `core::window` | Find the iPhone Mirroring window; track resize/move/close | app-name + bounds heuristic (`iPhone`/`镜像`/`Mirroring`, 200–900 × 400–1600) | `{pid, window_id, bounds, scale}`; SCK or `cua-driver list_windows` |
-| `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Invariants:** explicit FPS, bounded queue depth, drop late frames, restart `SCStream` on window-id/display change |
+| `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Invariants/targets:** 30 fps default (cap 60, `SCStreamConfiguration.minimumFrameInterval`), bounded queue depth ~2–3 frames, drop late frames rather than buffer, **pass the `CMSampleBuffer` PTS through to the encoder/RTP** for pacing (don't re-stamp), restart `SCStream` on window-id/display change |
 | `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract:** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **SPS/PPS in-band before every IDR** |
 | `core::input` | Map abstract events → injected events on window pid | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | injected events — **primary path `CGEventPostToPid`, fallback `cua-driver`/AX** until Spike S1 proves the primary (see §9) |
 | `front::webrtc` | One `PeerConnection` per viewer: H.264 track + data channel | SDP/ICE via signaling | webrtc-rs |
@@ -83,19 +84,27 @@ The core does not know whether a caller is a human or an agent — it only expos
   calls `video.play()` after the remote track attaches and treats a rejected `play()`
   promise as a real UI state, not a console error.
 - **Input:** Safari pointer/key events → data channel → `core::input` → injected
-  event → Mirroring window. **Two message classes on the data channel:**
-  `down`/`up`/`key`/`text` go **reliable + ordered**; high-rate `move` goes
-  **unordered + lossy** (maxRetransmits 0), carries a sequence number, and the host
-  **drops stale moves**. A single reliable-ordered channel would head-of-line-block
-  `move` and defeat the latency goal.
+  event → Mirroring window. Reliability/order are per-`RTCDataChannel`, so this needs
+  **two separate channel objects**, not two message types on one channel: a
+  **reliable + ordered** channel for `down`/`up`/`key`/`text`, and an
+  **unordered + lossy** channel (`maxRetransmits: 0`, `ordered: false`) for high-rate
+  `move`, which carries a sequence number so the host **drops stale moves**. A single
+  reliable-ordered channel would head-of-line-block `move` and defeat the latency goal.
 
 ### 3.3 Coordinate mapping (human touch)
 
-Client sends **normalized [0,1]** coordinates relative to the rendered video, never
-device pixels. Host maps: `normalized → × window content size → + window origin →
-screen point → CGEvent`. Normalization keeps the client resolution-agnostic and
-survives window resize. Touch phases map: `touchstart → mouseDown`,
-`touchmove → mouseDragged` (every intermediate point), `touchend → mouseUp`.
+Client sends **normalized [0,1]** coordinates relative to the **displayed video
+content rect** — not the `<video>` element box. The client must subtract `object-fit`
+letterbox/pillarbox bars and ignore any element padding, so a tap on a black bar maps
+to nothing rather than to an edge. Host maps: `normalized → × captured content size →
++ window content origin → screen point → CGEvent`.
+
+To make this unambiguous, the host **publishes session metadata at connect** and on any
+change: captured **frame size, content rect, backing scale, and orientation**. The
+client recomputes its content-rect math on orientation change / resize. Normalization
+keeps the client resolution-agnostic and survives window resize. Touch phases map:
+`touchstart → mouseDown`, `touchmove → mouseDragged` (every intermediate point),
+`touchend → mouseUp`.
 
 ### 3.4 Arbitration (control lease + cancellation token)
 
@@ -103,15 +112,25 @@ Not a long-held mutex — a mutex held across an `.await`, a blocking FFI call, 
 multi-event gesture loop would queue human input *behind* the agent instead of
 pre-empting it. Instead:
 
-- `core` holds `control { holder: Human | Agent(id), generation: u64, last_active }`
-  guarded by a **short** lock that is **never held across `.await`, blocking FFI, or an
-  injection loop** — only long enough to read/swap the holder and bump `generation`.
+- `core` holds `control { holder: Human(session_id) | Agent(id), generation: u64,
+  last_active, pressed_state }` guarded by a **short** lock that is **never held across
+  `.await`, blocking FFI, or an injection loop** — only long enough to read/swap the
+  holder, bump `generation`, and snapshot `pressed_state`.
+- `holder` carries a **session id even for humans** (one `PeerConnection` per viewer, so
+  two browsers are both "Human"). **One active human controller at a time**: a second
+  human is an observer until it explicitly preempts; human-to-human preemption uses the
+  same generation bump as human-over-agent.
 - Each injected event checks the current `generation` **before** it fires; a gesture
   loop (`move` stream, multi-key `text`) re-checks every iteration and aborts the moment
   its generation is stale.
-- A human pointer event **pre-empts**: it swaps `holder` to `Human` and bumps
-  `generation`; the agent's in-flight gesture sees the stale token and stops, and the
-  agent receives a `preempted` event. The agent can still `observe`.
+- **Cleanup on preemption (no stuck pointer):** the host tracks the **pressed pointer/key
+  state per generation**. If a holder is preempted mid-gesture (a `mouseDown` with no
+  `mouseUp`, a held key), the handover path **synthesizes the matching `mouseUp` / key-up
+  to release** before the new holder injects — the target window never lands in a
+  permanently-pressed state.
+- A human pointer event **pre-empts**: it swaps `holder`, bumps `generation`, runs the
+  cleanup release, and the displaced agent receives a `preempted` event. A displaced
+  party can still `observe`.
 - Agent `tap/swipe/type` implicitly acquires; a long agent task may `acquire_control`
   for exclusivity. Idle timeout auto-releases (default 30 s; configurable).
 
@@ -136,8 +155,10 @@ story.
 
 ## 4. Security
 
-- Reuse v1's **password + HMAC-signed session token** (`exp:nonce:sig`, default 8 h TTL,
-  `hmac.compare_digest`). The token gates both WS signaling and MCP.
+- Reuse v1's **password + HMAC-signed session token** (`exp:nonce:sig`, default 8 h TTL),
+  compared in **constant time** (Rust: `subtle::ConstantTimeEq` or `ring`, not a plain
+  `==` — v1's `hmac.compare_digest` is the Python equivalent). The token gates both WS
+  signaling and MCP.
 - **TURN credentials** are short-lived, issued server-side via the Cloudflare API on
   demand — never baked into the binary or page. TTL must exceed expected session length;
   the client **refreshes via `setConfiguration()` before expiry** and supports **ICE
@@ -165,7 +186,11 @@ story.
 - Subcommands `serve` / `stop` replace the v1 bash scripts. `serve` runs the TCC
   preflight (§4), launches the host, brings up the `cloudflared` tunnel for signaling,
   and prints local URL / tunnel URL / password.
-- State (pid, logs, ephemeral secret) stays under `/tmp/hermes-phone-remote`, uncommitted.
+- State (pid, logs, ephemeral secret) stays uncommitted in a **per-user `0700` runtime
+  directory** (e.g. `$TMPDIR/hermes-phone-remote-$UID`, not shared `/tmp`). Files are
+  created **atomically** (`O_CREAT|O_EXCL`, no-follow), and the secret/pid files have
+  their **ownership and `0600` mode validated before being read** — `/tmp` is world-shared
+  on macOS, so a plain path invites symlink races and secret leakage.
 
 ## 6. Latency budget (target)
 
@@ -199,13 +224,19 @@ Ordered by risk. Each is a throwaway probe that retires a specific unknown.
   **frontmost, backgrounded, covered, and across displays**. Outcome decides whether the
   binary is self-contained, must focus the window first, or keeps the `cua-driver`
   fallback (§3.1, §3.5).
-- **S0 — crate smoke test.** `screencapturekit` single-window frames →
-  `videotoolbox` realtime H.264 (Constrained Baseline, `packetization-mode=1`, no
-  B-frames, forced IDR + in-band SPS/PPS) → `webrtc-rs` H.264 track that a desktop
-  browser decodes. Confirms the §8 stack before building on it.
+- **S0 — capture + encode the REAL Mirroring window (BLOCKER).** Not a generic window:
+  filter `SCStream` to the actual **iPhone Mirroring** window and verify **non-black,
+  changing** frames (Mirroring may emit blank/DRM-protected output or composite
+  oddly). Test **frontmost, backgrounded, covered, and across displays** with S1-level
+  rigor. Then chain it through `videotoolbox` realtime H.264 (Constrained Baseline,
+  `packetization-mode=1`, no B-frames, forced IDR + in-band SPS/PPS) → `webrtc-rs`
+  H.264 track that a desktop browser decodes. Confirms both the physical capture
+  assumption and the §8 stack before building on either.
 - **S2 — Safari receive path.** The S0 stream rendered in **iOS Safari**
   `<video playsinline>` with the explicit `play()` gesture; verify decode, latency, and
-  data-channel round-trip (reliable + unordered classes).
+  data-channel round-trip (separate reliable + unordered channels).
 - **S3 — Cloudflare TURN.** A 1:1 P2P session relayed through Cloudflare Realtime TURN
   with server-issued ephemeral creds, credential refresh, and an ICE restart.
-```
+
+S1 and S0 are both blockers and independent — run them in parallel; neither the input
+path nor the video path is proven against the real Mirroring window yet.
