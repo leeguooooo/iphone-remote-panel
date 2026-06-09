@@ -2,6 +2,21 @@
 
 A small authenticated web remote for macOS iPhone Mirroring.
 
+## Architecture (v2 — WebRTC rebuild, in design)
+
+![Architecture](assets/architecture.png)
+
+A single Rust binary captures the macOS iPhone Mirroring window with
+ScreenCaptureKit, hardware-encodes it to H.264 with VideoToolbox, and streams it
+over WebRTC. The same capture/input core serves two front-ends: a human client
+(iPhone Safari — live video + continuous touch) and an agent client (Hermes and
+other agents via MCP). Touch is injected as continuous `CGEvent`s for native-feel
+drag/swipe; a mutex grants control to one side at a time (a human tap pre-empts an
+agent). Cloudflare carries signaling (over the tunnel) and TURN for NAT traversal.
+
+> The sections below document the current (v1) screenshot-polling implementation,
+> which still ships until v2 lands.
+
 It serves a local page at `http://127.0.0.1:8787/phone` with:
 
 - live iPhone Mirroring screenshots
