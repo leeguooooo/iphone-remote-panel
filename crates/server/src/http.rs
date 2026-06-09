@@ -122,10 +122,27 @@ pub fn is_authed(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
+/// True when the request reached us over HTTPS. The daemon itself always serves
+/// plain HTTP; HTTPS is terminated by the Cloudflare tunnel, which forwards
+/// `X-Forwarded-Proto: https`. We must decide `Secure` **per request** and NOT
+/// from the bind host: a LAN bind (`0.0.0.0`) is still plain HTTP, and a `Secure`
+/// cookie is rejected by browsers over plain HTTP — which silently breaks the
+/// `/ws` auth (the cookie isn't sent on the `ws://` upgrade) and thus WebRTC.
+fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
+    if state.cookie_secure {
+        return true; // explicit force (e.g. an external HTTPS terminator)
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
 /// Build the `Set-Cookie` header value for a freshly-minted session.
-fn make_session_cookie(state: &AppState) -> String {
+fn make_session_cookie(state: &AppState, secure: bool) -> String {
     let token = core::auth::make_token(&state.secret, state.session_ttl_secs, now_secs());
-    let secure = if state.cookie_secure { "; Secure" } else { "" };
+    let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
         state.session_ttl_secs
@@ -133,8 +150,8 @@ fn make_session_cookie(state: &AppState) -> String {
 }
 
 /// Build the cookie that clears the session.
-fn clear_session_cookie(state: &AppState) -> String {
-    let secure = if state.cookie_secure { "; Secure" } else { "" };
+fn clear_session_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
 }
 
@@ -193,14 +210,18 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_submit(State(state): State<Arc<AppState>>, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let expected = match &state.password {
         // Open mode: any login succeeds (no password configured).
-        None => return redirect_with_cookie(&state, "/phone"),
+        None => return redirect_with_cookie(&state, "/phone", &headers),
         Some(p) => p,
     };
     if core::auth::verify_password(&form.password, expected) {
-        redirect_with_cookie(&state, "/phone")
+        redirect_with_cookie(&state, "/phone", &headers)
     } else {
         let body = LOGIN_HTML.replace("__ERR__", "密码错误");
         let mut resp = Html(body).into_response();
@@ -209,18 +230,21 @@ async fn login_submit(State(state): State<Arc<AppState>>, Form(form): Form<Login
     }
 }
 
-/// 303-redirect to `to`, setting a fresh session cookie.
-fn redirect_with_cookie(state: &AppState, to: &str) -> Response {
+/// 303-redirect to `to`, setting a fresh session cookie (Secure iff the request
+/// arrived over HTTPS — see `request_is_https`).
+fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Response {
+    let secure = request_is_https(state, headers);
     let mut resp = Redirect::to(to).into_response();
-    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state)) {
+    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state, secure)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)
 }
 
-async fn logout(State(state): State<Arc<AppState>>) -> Response {
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let secure = request_is_https(&state, &headers);
     let mut resp = Redirect::to("/login").into_response();
-    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(&state)) {
+    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(secure)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)

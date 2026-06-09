@@ -193,7 +193,12 @@ fn serve() -> Result<()> {
         })
     };
 
-    let cookie_secure = cfg.host != "127.0.0.1" && cfg.host != "localhost";
+    // The daemon always serves plain HTTP; whether the cookie is marked `Secure`
+    // is decided per-request from `X-Forwarded-Proto` (the Cloudflare tunnel sets
+    // it to https). Binding to a LAN IP (0.0.0.0) is still plain HTTP, so forcing
+    // Secure here would make browsers reject the cookie over LAN and break /ws
+    // auth → WebRTC. Keep this `false`; per-request HTTPS is detected in http.rs.
+    let cookie_secure = false;
     let state = Arc::new(AppState {
         pipeline,
         ice_servers,
