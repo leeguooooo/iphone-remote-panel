@@ -46,6 +46,18 @@ use crate::coords::{to_screen, SessionGeometry};
 /// probe showed 100 ms already crosses that threshold.
 pub const TAP_DWELL_MS: u64 = 30;
 
+/// Delay between consecutive synthetic keyboard events posted by [`CgEventSink::text`].
+///
+/// iPhone Mirroring drops keycodes posted back-to-back too fast (an 8 ms gap lost
+/// digits in hardware testing — `Hello123` arrived as `hello13`). Each transition
+/// — Shift-down, key-down, key-up, Shift-up — is separated by this gap so Mirroring
+/// forwards every one.
+pub const KEY_GAP_MS: u64 = 14;
+
+/// Extra spacing inserted *between characters* in [`CgEventSink::text`], on top of
+/// [`KEY_GAP_MS`], so Mirroring does not coalesce or drop adjacent key presses.
+pub const CHAR_GAP_MS: u64 = 22;
+
 // ── InputEvent ───────────────────────────────────────────────────────────────
 
 /// A caller-facing input event expressed in *normalized* coordinates.
@@ -470,12 +482,18 @@ impl EventSink for CgEventSink {
 
     fn text(&mut self, s: &str) {
         // iPhone Mirroring forwards the key's VIRTUAL KEYCODE to the phone, NOT
-        // the CGEvent Unicode payload — so `CGEventKeyboardSetUnicodeString` is
-        // ignored and every char arrives as keycode 0 ('a'). We must post the
-        // real keycode (+ Shift) per char, to the HID tap (the mouse path). The
-        // phone field must already be focused. Non-ASCII (CJK) has no US keycode
+        // the CGEvent Unicode payload AND NOT the modifier *flags* — both are
+        // dropped on the Mirroring boundary. So:
+        //   1. post the real keycode per char (Unicode is ignored → keycode 0 = 'a');
+        //   2. press a real Shift KEY (keycode 56) around shifted chars — relying on
+        //      `CGEventFlagShift` alone made capitals arrive lowercase (`H` → `h`);
+        //   3. space every transition by KEY_GAP_MS / CHAR_GAP_MS — events posted
+        //      back-to-back too fast get dropped (`Hello123` → `hello13`, the `2` lost).
+        // The phone field must already be focused. Non-ASCII (CJK) has no US keycode
         // and is skipped — that needs an on-phone IME, out of scope here.
         use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+        const KVK_SHIFT: u16 = 56;
+        let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
         for ch in s.chars() {
             let (kc, shift) = match char_to_keycode(ch) {
                 Some(v) => v,
@@ -489,15 +507,35 @@ impl EventSink for CgEventSink {
             } else {
                 CGEventFlags::empty()
             };
+            // Hold a real Shift key down for shifted chars — the flag alone is
+            // dropped by Mirroring, so capitals/symbols need the physical key.
+            if shift {
+                if let Ok(sd) = CGEvent::new_keyboard_event(Self::make_source(), KVK_SHIFT, true) {
+                    sd.set_flags(CGEventFlags::CGEventFlagShift);
+                    sd.post(CGEventTapLocation::HID);
+                }
+                gap();
+            }
             if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), kc, true) {
                 down.set_flags(flags);
                 down.post(CGEventTapLocation::HID);
             }
+            gap();
             if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), kc, false) {
                 up.set_flags(flags);
                 up.post(CGEventTapLocation::HID);
             }
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            gap();
+            if shift {
+                if let Ok(su) = CGEvent::new_keyboard_event(Self::make_source(), KVK_SHIFT, false) {
+                    su.set_flags(CGEventFlags::empty());
+                    su.post(CGEventTapLocation::HID);
+                }
+                gap();
+            }
+            // Inter-char spacing on top of the per-event gap so Mirroring does not
+            // coalesce or drop adjacent presses.
+            std::thread::sleep(std::time::Duration::from_millis(CHAR_GAP_MS));
         }
     }
 
