@@ -65,7 +65,10 @@ pub const CHAR_GAP_MS: u64 = 22;
 /// reaching it as a mouse-drag (long-press / icon-reorder, never a scroll). The
 /// client sends per-move CSS-pixel deltas; this scales them to a natural-feeling
 /// scroll. Tune for feel against the hardware.
-pub const SCROLL_SCALE: f64 = 1.6;
+///
+/// Hardware feel check (Hermes): 1.6 scrolled ~a full screen per swipe (slightly
+/// much); 1.3 lands closer to finger-tracking.
+pub const SCROLL_SCALE: f64 = 1.3;
 
 /// Sign of the vertical scroll axis. Flip if the phone scrolls the wrong way:
 /// finger-up should scroll the content up (reveal what's below).
