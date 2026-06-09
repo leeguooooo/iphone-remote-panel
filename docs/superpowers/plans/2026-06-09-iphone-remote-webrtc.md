@@ -249,6 +249,30 @@ session on the host.
 **Gate:** S0b/S2 PASS → start Phase 1. If iOS Safari can't decode, fix H.264
 profile/level before building the server.
 
+**Status (2026-06-09):** S0b-1 (encode→file) ✅ PASS. S0b-2 (`s0b2_webrtc` bin) written +
+compiles `--locked`; **awaiting hardware browser-decode validation** (run on the granted
+.190 host, open `http://192.168.0.190:8088`). S2 (iOS) and S3 (TURN) pending. Note: the
+S0b-2 probe offers `42001f` for desktop — production/iOS must use **`42e01f`**.
+
+---
+
+# Reference notes (read before building Phase 1+)
+
+Parallel research already de-risked the tricky parts — consult before writing the
+corresponding component:
+- `docs/superpowers/notes/2026-06-09-webrtc-turn-cheatsheet.md` — webrtc-rs + Cloudflare TURN API.
+- `docs/superpowers/notes/2026-06-09-ios-safari-webrtc-client.md` — iOS Safari client (player,
+  pointer→content-rect coords, two data channels, 42e01f, relay fallback, Wake Lock).
+- `docs/superpowers/notes/2026-06-09-macos-deployment-tcc-launchagent.md` — LaunchAgent /
+  TCC / codesign / install.sh (and the §0 responsible-process rule → MCP is connect-in).
+- `docs/superpowers/notes/2026-06-09-v1-feature-parity.md` — **parity checklist**; the web
+  client + http + mcp tasks MUST cover its gaps (Search/Switcher buttons, text input, 12×24
+  grid overlay, freeze toggle, status/latency display, discrete swipe verbs for MCP, security
+  notes, auth-gates-signaling).
+
+Already built (foundation, 99 tests green): `core::{auth,coords,window,control,input}`,
+`server::{protocol,runtime_dir,config}`. Phase 1 wires these into the daemon.
+
 ---
 
 # Phase 1 — Foundation + first human vertical slice

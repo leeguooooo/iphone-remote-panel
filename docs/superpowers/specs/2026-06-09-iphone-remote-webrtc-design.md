@@ -69,8 +69,8 @@ The core does not know whether a caller is a human or an agent — it only expos
 | `core::capture` | SCK `SCStream` filtered to that window; deliver frames | window handle | `CMSampleBuffer` stream. **Host context:** must call `NSApplicationLoad()` before any SCK call (else `CGS_REQUIRE_INIT` abort — validated). **Invariants/targets:** 30 fps default (cap 60, `SCStreamConfiguration.minimumFrameInterval`), bounded queue depth ~2–3 frames, drop late frames, **silently drop idle samples** (`get_pixel_buffer → CouldNotGetDataBuffer` is normal SCK behavior, not an error), **pass `CMSampleBuffer` PTS through** for pacing, restart `SCStream` on window-id/display change |
 | `encode` | VideoToolbox H.264, realtime/low-latency | frame stream | NAL units → RTP. **Contract (S0b-1 validated):** Constrained Baseline, `packetization-mode=1`, **no B-frames**, force IDR (`kVTEncodeFrameOptionKey_ForceKeyFrame`) on viewer join, **Annex-B with SPS/PPS in-band before every IDR**. **Static-screen keepalive (required):** SCK emits no frames when the screen is static, so **repeat the last encoded access unit on a ~500 ms timer** or the stream stalls and a late-joining viewer gets nothing |
 | `core::input` | Map abstract events → injected events | `PointerDown/Move/Up`, `Key`, `Text` (normalized coords) | **`CGEvent::post(CGEventTapLocation::HID)` at global screen coords, Mirroring window frontmost** (validated S1b — `post_to_pid` does NOT work); `cua-driver` fallback. **Commandeers the real Mac cursor.** Tap-vs-long-press **timing fidelity** matters (the probe's ~100 ms press read as a long-press → jiggle mode) — map iPhone touch durations deliberately |
-| `front::webrtc` | One `PeerConnection` per viewer: H.264 track + data channel | SDP/ICE via signaling | webrtc-rs |
-| `front::mcp` | MCP tools over the same core; screenshots pulled from the live pipeline | tool calls | rmcp (or hand-rolled) |
+| `front::webrtc` | One `PeerConnection` per viewer (S0b-2 validated): H.264 `TrackLocalStaticSample` + two data channels | SDP/ICE via signaling | webrtc-rs 0.17. **Daemon is the offerer** and creates both channels; **fmtp `profile-level-id=42e01f`** (Safari-native, NOT 42001f); **relay-only fallback ICE** (Cloudflare TURN) when LAN/mDNS fails; ICE-restart daemon-initiated |
+| `front::mcp` | MCP tools over the same core; screenshots pulled from the live pipeline | tool calls | **Must be a CONNECT-IN surface served by the running daemon (HTTP/SSE/socket), NOT a per-call stdio-spawn MCP** — a spawned child loses the TCC grant (§5 responsible-process chain). A stdio shim, if any, only forwards to the daemon |
 | `front::http` | Serve web UI, login, WS signaling, ephemeral TURN creds | HTTP/WS | axum |
 
 ### 3.2 Data flow
@@ -183,13 +183,22 @@ the Mirroring window to front before a gesture and the control lease (§3.4) is 
 
 ## 5. Deployment — GUI-session LaunchAgent (validated constraint)
 
-**The daemon must run in the login (Aqua) session, not as an SSH-spawned process.**
-Validation proved an SSH-launched binary is **TCC-denied** for Screen Recording
-(`SCShareableContent` → error -3801) and would be denied Accessibility too. The grants
-are tied to a stable signed identity in the GUI session — exactly how `cua-driver`
-(`CuaDriver.app`) and screenpipe operate. Clients (SSH shells, Hermes/agents, the iPhone
-Safari controller) **connect to the running daemon**; they never spawn the capture/input
-binary themselves.
+**The daemon must run in the login (Aqua) session as a launchd-direct child, not as an
+SSH-spawned process.** Two validated facts force this (details: `docs/superpowers/notes/2026-06-09-macos-deployment-tcc-launchagent.md`):
+
+1. An SSH-launched binary is **TCC-denied** for Screen Recording (`SCShareableContent` →
+   error -3801) and would be denied Accessibility too.
+2. **Responsible-process chain (macOS 15):** `AXIsProcessTrusted`/`CGEventPost` evaluate
+   the *caller chain*, not just the daemon's own entry. A binary `spawn`ed by another
+   process (e.g. an agent) is **untrusted even with a valid grant**; only a
+   **launchd-direct LaunchAgent** is evaluated against its own entry.
+
+→ The daemon is a **codesigned `.app` LaunchAgent** (stable identity so grants persist
+across upgrades). **No client may spawn its own copy** — SSH shells, Hermes/agents, and
+the iPhone Safari controller all **connect to the running daemon** (this is why `front::mcp`
+is connect-in, not stdio-spawn). Mirrors `cua-driver`/screenpipe. Headless boxes need
+**auto-login** (a LaunchAgent only runs once a GUI user logs in); macOS 15 re-prompts
+Screen Recording ~monthly (interactive, unsuppressible without MDM).
 
 - Ship the daemon `iphone-remote` via **GitHub Releases** + `install.sh` (`curl … | sh`),
   per the project distribution convention — no npm registry. It must be **codesigned with
