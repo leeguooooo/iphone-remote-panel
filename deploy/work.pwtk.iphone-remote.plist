@@ -55,6 +55,16 @@
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <!-- The iPhone reaches the daemon over the LAN, so bind 0.0.0.0 (the
+             daemon's own default is 127.0.0.1, which the phone can't reach).
+             A password is mandatory when bound to the LAN. install.sh fills
+             these in (generating a password if none is supplied). -->
+        <key>PHONE_REMOTE_HOST</key>
+        <string>0.0.0.0</string>
+        <key>PHONE_REMOTE_PORT</key>
+        <string>8787</string>
+        <key>PHONE_REMOTE_PASSWORD</key>
+        <string>__PASSWORD__</string>
     </dict>
 </dict>
 </plist>

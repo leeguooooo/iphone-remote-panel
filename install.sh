@@ -188,6 +188,30 @@ ok "Installed: $DEST"
 mkdir -p "$LOG_DIR"
 ok "Log directory: $LOG_DIR"
 
+# ── Step 6b — Resolve listen host + password ──────────────────────────────────
+# The iPhone reaches the daemon over the LAN, so it must bind 0.0.0.0 (the
+# daemon's own default is 127.0.0.1, which the phone can't reach). Binding to
+# the LAN without a password would let anyone on the network drive the phone, so
+# a password is mandatory here — generated if the user didn't supply one.
+HOST="${PHONE_REMOTE_HOST:-0.0.0.0}"
+PORT="${PHONE_REMOTE_PORT:-8787}"
+PASSWORD="${PHONE_REMOTE_PASSWORD:-}"
+GENERATED_PW=0
+if [ -z "$PASSWORD" ]; then
+    PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
+    [ -n "$PASSWORD" ] || PASSWORD="$(date +%s | shasum | head -c 16)"
+    GENERATED_PW=1
+fi
+if [ "$GENERATED_PW" = "1" ]; then
+    ok "Generated a random access password (shown at the end)"
+else
+    ok "Using password from \$PHONE_REMOTE_PASSWORD"
+fi
+
+# Best-effort LAN IP for the final connect instructions.
+LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+[ -n "$LAN_IP" ] || LAN_IP="<this-mac-LAN-ip>"
+
 # ── Step 7 — Write the LaunchAgent plist ─────────────────────────────────────
 mkdir -p "$HOME/Library/LaunchAgents"
 BINARY_PATH="$DEST/$BINARY_INSIDE_APP"
@@ -221,10 +245,19 @@ cat > "$PLIST_DST" <<PLIST
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <key>PHONE_REMOTE_HOST</key>
+        <string>${HOST}</string>
+        <key>PHONE_REMOTE_PORT</key>
+        <string>${PORT}</string>
+        <key>PHONE_REMOTE_PASSWORD</key>
+        <string>${PASSWORD}</string>
     </dict>
 </dict>
 </plist>
 PLIST
+
+# The plist embeds the password in plaintext — lock it to the user only.
+chmod 600 "$PLIST_DST"
 
 ok "LaunchAgent plist written: $PLIST_DST"
 
@@ -273,6 +306,16 @@ printf "  On unattended machines enable auto-login: System Settings > Users & Gr
 echo ""
 printf "${BOLD}━━━ Current LaunchAgent status ━━━${RESET}\n"
 launchctl print "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || info "(not running yet — grant permissions then kickstart)"
+
+echo ""
+printf "${BOLD}━━━ Connect from your iPhone ━━━${RESET}\n"
+printf "  1. Make sure the iPhone is on the same Wi-Fi as this Mac.\n"
+printf "  2. In iPhone Safari open:  ${BOLD}http://%s:%s/phone${RESET}\n" "$LAN_IP" "$PORT"
+printf "  3. Password: ${BOLD}%s${RESET}\n" "$PASSWORD"
+if [ "$GENERATED_PW" = "1" ]; then
+    printf "     ${YELLOW}(generated — save it; it's stored in %s)${RESET}\n" "$PLIST_DST"
+fi
+printf "     Change it later by editing PHONE_REMOTE_PASSWORD in that plist + kickstart.\n"
 
 echo ""
 printf "${BOLD}━━━ Quick reference ━━━${RESET}\n"
