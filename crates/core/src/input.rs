@@ -256,11 +256,14 @@ impl EventSink for RecordingSink {
 ///   coordinates (typically iPhone Mirroring, which must be brought to the
 ///   front first).
 ///
-/// - **Key / Text**: delegates to `cua-driver` via a child-process call
-///   (`cua-driver call press_key '{...}'` / `cua-driver call type_text '{...}'`,
-///   targeting the Mirroring window's `pid` + `window_id`).  This avoids
-///   reimplementing keyboard scan-code mapping in Rust. cua-driver 0.5.x has NO
-///   top-level `key`/`type`/`shortcut` subcommand — only `call <tool> '<json>'`.
+/// - **Text**: synthesized as CGEvent keyboard events with the Unicode string
+///   set (`CGEventKeyboardSetUnicodeString`), posted to the HID tap — the same
+///   path the mouse uses, which Mirroring forwards to the phone. (cua-driver
+///   `type_text` inserts into the Mac window's AX tree, which the phone never
+///   receives.) The phone field must already be focused.
+///
+/// - **Key**: a named key delegates to `cua-driver call press_key` (cua-driver
+///   0.5.x has NO top-level `key`/`type`/`shortcut` subcommand — only `call`).
 ///
 /// - **Shortcut**: mapped to the proven `iphone-act` hotkeys and sent via
 ///   `cua-driver call press_key` — `home` = ⌘1, `switcher` = ⌘2, `spotlight` = ⌘3.
@@ -326,13 +329,6 @@ fn press_key_json(pid: i32, window_id: u32, key: &str, cmd: bool) -> String {
     )
 }
 
-/// Build the JSON for `cua-driver call type_text`.
-fn type_text_json(pid: i32, window_id: u32, text: &str) -> String {
-    format!(
-        r#"{{"pid":{pid},"window_id":{window_id},"text":"{}"}}"#,
-        json_escape(text)
-    )
-}
 
 #[cfg(target_os = "macos")]
 impl CgEventSink {
@@ -432,9 +428,26 @@ impl EventSink for CgEventSink {
     }
 
     fn text(&mut self, s: &str) {
-        match self.target {
-            Some((pid, wid)) => self.cua_call("type_text", &type_text_json(pid, wid, s)),
-            None => eprintln!("text: no Mirroring window target; skipping"),
+        // Type via CGEvent keyboard events with the Unicode string set, posted to
+        // the HID tap — the SAME path the mouse uses, which iPhone Mirroring
+        // forwards to the phone. cua-driver `type_text` inserts into the Mac
+        // window's AX tree, which the phone never receives (Hermes-confirmed), so
+        // we synthesize real key events instead. The target field on the phone
+        // must already be focused (e.g. Spotlight after ⌘3, or a tapped field).
+        use core_graphics::event::{CGEvent, CGEventTapLocation};
+        for ch in s.chars() {
+            let mut buf = [0u16; 2];
+            let utf16: &[u16] = ch.encode_utf16(&mut buf);
+            if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), 0, true) {
+                down.set_string_from_utf16_unchecked(utf16);
+                down.post(CGEventTapLocation::HID);
+            }
+            if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), 0, false) {
+                up.set_string_from_utf16_unchecked(utf16);
+                up.post(CGEventTapLocation::HID);
+            }
+            // tiny gap so the receiver registers distinct keystrokes
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 
@@ -740,18 +753,6 @@ mod tests {
         assert_eq!(
             press_key_json(7, 9, "a", false),
             r#"{"pid":7,"window_id":9,"key":"a"}"#
-        );
-    }
-
-    #[test]
-    fn type_text_json_escapes() {
-        assert_eq!(
-            type_text_json(1, 2, "hi"),
-            r#"{"pid":1,"window_id":2,"text":"hi"}"#
-        );
-        assert_eq!(
-            type_text_json(1, 2, "a\"b\\c"),
-            r#"{"pid":1,"window_id":2,"text":"a\"b\\c"}"#
         );
     }
 
