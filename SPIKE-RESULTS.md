@@ -217,3 +217,92 @@ cargo run --bin s1b_session_input -- 179 724 session
 R0: NSApplicationLoad=true/false  crash gone? Y/N  frames live? Y/N
 R1: hid=Y/N  session=Y/N  cursor-commandeered? Y/N  reacted-when-not-frontmost? Y/N
 ```
+
+---
+
+# Authorized local run results (2026-06-09, c3d8f16)
+
+This run was executed from the local Hermes/macOS context against the real `iPhone镜像`
+window, after pulling `feat/webrtc-rebuild` to `c3d8f16`.
+
+## R0 — S0 capture
+
+Command:
+
+```bash
+cd /Users/leo/clawd/iphone-remote-panel
+cargo build --workspace
+/Users/leo/bin/iphone-shot /tmp/phase0-c3d8-before.png >/dev/null
+rm -rf s0-frames
+./target/debug/s0_capture
+```
+
+Result:
+
+- `NSApplicationLoad() -> true`: **Y**
+- crash gone: **Y**
+- true iPhone live frames: **Y**
+- output: 22 PNG frames written under `s0-frames/` before timeout.
+- dimensions: `312x694`.
+- luminance: non-black (`avg_lum` roughly 145–165; `nonzero_px` about 201k–214k).
+- frame difference check: first-to-later frames differ substantially; later frames become
+  mostly static once the home screen stops changing.
+- visual inspection: frames show the actual iPhone home screen, not a black/blank or
+  placeholder window.
+
+Notes:
+
+- Intermittent `frame extraction failed: get_pixel_buffer: CouldNotGetDataBuffer` messages
+  occurred between valid frames. This is not a gate failure because valid real frames were
+  produced; production code should tolerate/drop those samples.
+- The run eventually timed out after 22 saved frames rather than reaching 30. For the gate
+  question (can SCK capture real non-black Mirroring frames?), this is still **PASS**.
+
+## R1 — S1b session/HID input
+
+Setup:
+
+```bash
+/Users/leo/bin/iphone-act home
+/Users/leo/bin/iphone-shot /tmp/s1b-before.png
+osascript -e 'tell application "iPhone Mirroring" to activate'
+```
+
+Commands:
+
+```bash
+./target/debug/s1b_session_input 179 724 hid
+./target/debug/s1b_session_input 179 724 session
+```
+
+Result:
+
+- `hid`: **Y** — phone reacted; home screen entered edit/wiggle mode.
+- `session`: **Y** — independently confirmed from a normal home screen; phone entered
+  edit/wiggle mode.
+- cursor commandeered: **Y** — session/HID posting uses the real global cursor path; the
+  cursor ends at the target point (`179,724` top-left coordinate; AppKit reported the
+  corresponding bottom-origin mouse location as `179,425`).
+- reacted when not frontmost: **not tested in this run**.
+
+Artifacts:
+
+- `/tmp/s1b-before.png`
+- `/tmp/s1b-after-hid-center.png`
+- `/tmp/s1b-after-session-center.png`
+- `/tmp/s1b-session-before-isolated.png`
+- `/tmp/s1b-session-after-isolated.png`
+
+## Updated gate decision
+
+**Phase 0 hardware gate: PASS for the two immediate blockers tested here.**
+
+- S0 capture assumption is validated: SCK can capture real iPhone Mirroring frames on this
+  machine after `NSApplicationLoad()` and the window-picker fixes.
+- S1 input assumption is validated in the frontmost/window-focused case: session/HID tap
+  events drive the mirrored iPhone, but they use the global cursor path.
+
+Architecture implication: proceed with the GUI-session authorized daemon model. The daemon
+must run as a GUI LaunchAgent (or equivalent logged-in desktop session process) with Screen
+Recording + Accessibility granted to the signed binary. SSH/Hermes/control clients should
+connect to that daemon instead of trying to capture/input from their own unsigned context.
