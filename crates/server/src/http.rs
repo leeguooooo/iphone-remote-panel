@@ -100,6 +100,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // control lease). Bearer-token auth; see `agent_input` / `agent_status`.
         .route("/agent/status", get(agent_status))
         .route("/agent/input", post(agent_input))
+        .route("/agent/screenshot", get(agent_screenshot))
         .with_state(state)
 }
 
@@ -379,6 +380,69 @@ async fn agent_input(
     }
     state.injector.send(event);
     with_security_headers((StatusCode::OK, "ok").into_response())
+}
+
+/// `GET /agent/screenshot` — current phone screen as a PNG.
+///
+/// Captures the Mirroring window via `cua-driver get_window_state` (targets the
+/// window by pid/window_id, so it works regardless of which app is frontmost —
+/// unlike a CGEvent path). Gives a connect-in agent vision through the daemon
+/// without needing to decode the WebRTC stream. 503 if no cua-driver target.
+async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_agent_authed(&state, &headers) {
+        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    }
+    let (cua, pid, wid) = match &state.cua_target {
+        Some(t) => t.clone(),
+        None => {
+            return with_security_headers(
+                (StatusCode::SERVICE_UNAVAILABLE, "no phone target (cua-driver)").into_response(),
+            );
+        }
+    };
+    // Unique temp path (no external state; pid + monotonic counter).
+    static SHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_path = std::env::temp_dir().join(format!(
+        "iphone-remote-shot-{}-{seq}.png",
+        std::process::id()
+    ));
+
+    let png = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        let json = format!(
+            r#"{{"pid":{pid},"window_id":{wid},"capture_mode":"vision","screenshot_out_file":"{}"}}"#,
+            out_path.display()
+        );
+        let status = std::process::Command::new(&cua)
+            .args(["call", "get_window_state", &json])
+            .output()?;
+        if !status.status.success() {
+            return Err(std::io::Error::other(format!(
+                "cua-driver get_window_state failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            )));
+        }
+        let bytes = std::fs::read(&out_path)?;
+        let _ = std::fs::remove_file(&out_path); // best-effort cleanup
+        Ok(bytes)
+    })
+    .await;
+
+    match png {
+        Ok(Ok(bytes)) if !bytes.is_empty() => {
+            let resp = Response::builder()
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(bytes))
+                .unwrap();
+            with_security_headers(resp)
+        }
+        other => {
+            tracing::warn!("agent screenshot failed: {other:?}");
+            with_security_headers(
+                (StatusCode::BAD_GATEWAY, "screenshot capture failed").into_response(),
+            )
+        }
+    }
 }
 
 async fn ws_upgrade(

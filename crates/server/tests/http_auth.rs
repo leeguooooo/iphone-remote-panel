@@ -390,3 +390,30 @@ fn agent_open_mode_allows_without_bearer() {
         assert_eq!(resp.status(), StatusCode::OK);
     });
 }
+
+#[test]
+fn agent_screenshot_503_without_phone_target() {
+    block(async {
+        // Test state has cua_target: None → screenshot unavailable.
+        let app = http::router(build_state(Some("hunter2")));
+        // Auth still required.
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/agent/screenshot").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Authed but no target → 503.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/screenshot")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    });
+}
