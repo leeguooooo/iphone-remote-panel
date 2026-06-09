@@ -46,7 +46,11 @@
       --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
       --tb-h: 64px;                 /* toolbar height (content) */
+      /* Space the video must leave at the bottom so the floating toolbar never
+         covers the phone screen. Immersive mode (toolbar hidden) reclaims it. */
+      --tb-reserve: calc(var(--tb-h) + env(safe-area-inset-bottom) + 14px);
     }
+    body.immersive { --tb-reserve: env(safe-area-inset-bottom); }
     *, *::before, *::after { box-sizing: border-box; }
 
     /* [iOS-notes §Touch] suppress scroll/zoom/callout on html+body */
@@ -75,33 +79,42 @@
       background:
         radial-gradient(120% 80% at 50% 0%, #0c0e14 0%, #050608 70%);
       overflow: hidden;
-      /* room so the floating toolbar never covers the bottom of the phone screen */
-      padding-bottom: calc(var(--tb-h) + env(safe-area-inset-bottom) + 14px);
-      transition: padding-bottom .28s cubic-bezier(.2,.7,.2,1);
       /* [iOS-notes §Touch] */
       touch-action: none;
       user-select: none; -webkit-user-select: none;
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
     }
-    body.immersive #videoArea { padding-bottom: env(safe-area-inset-bottom); }
 
-    /* [iOS-notes §Video] all four attrs load-bearing */
+    /* [iOS-notes §Video] all four attrs load-bearing.
+       The video sits ABOVE the floating toolbar (bottom: --tb-reserve) rather than
+       filling the area behind it — otherwise the toolbar occludes the bottom of the
+       phone and taps there hit the toolbar. getBoundingClientRect() then yields the
+       visible rect, so the content-rect / coordinate math stays correct. */
     #screen {
-      position: absolute; inset: 0;
-      width: 100%; height: 100%;
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: var(--tb-reserve);
+      width: 100%;
       object-fit: contain;          /* letterbox; required for content-rect math */
       background: #000;
       pointer-events: none;         /* pointer events handled on #videoArea */
       touch-action: none;
+      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
     }
     /* subtle device-screen vignette + inset ring so the mirror reads as "a screen" */
     #videoArea::after {
-      content: ""; position: absolute; inset: 0; pointer-events: none;
+      content: ""; position: absolute;
+      top: 0; left: 0; right: 0; bottom: var(--tb-reserve); pointer-events: none;
       box-shadow: inset 0 0 0 1px rgba(255,255,255,.03),
                   inset 0 30px 60px -30px rgba(0,0,0,.5);
+      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
     }
 
-    #gridCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
+    #gridCanvas {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: var(--tb-reserve);
+      pointer-events: none; display: none;
+      transition: bottom .28s cubic-bezier(.2,.7,.2,1);
+    }
     #gridCanvas.on { display: block; }
 
     /* Tap dot (v1: 350ms fade) */
@@ -419,12 +432,12 @@ document.addEventListener('visibilitychange', () => {
 /* ── Grid overlay (v1: 12×24, numbered 1–288) ─────────────────── */
 function drawGrid() {
   if (!gridOn) return;
-  const rect = videoArea.getBoundingClientRect();
+  // Measure the canvas's own box (it sits above the toolbar via CSS --tb-reserve),
+  // not the full videoArea — keeps the grid aligned with the visible video.
+  const rect = gridCanvas.getBoundingClientRect();
   const dpr  = window.devicePixelRatio || 1;
   gridCanvas.width  = Math.round(rect.width  * dpr);
   gridCanvas.height = Math.round(rect.height * dpr);
-  gridCanvas.style.width  = rect.width  + 'px';
-  gridCanvas.style.height = rect.height + 'px';
   const ctx = gridCanvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, rect.width, rect.height);
