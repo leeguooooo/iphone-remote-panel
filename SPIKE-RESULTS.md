@@ -140,3 +140,80 @@ Stop Phase 1. Re-brainstorm around:
 
 1. Why `s0_capture` aborts with `CGS_REQUIRE_INIT` after successful window enumeration. This may be a probe/runtime issue to fix before judging SCK itself.
 2. Whether input should remain delegated to `cua-driver`/AX, or whether a different in-process event strategy is needed. Raw `CGEventPostToPid` is not validated on this hardware run.
+
+---
+
+# Root-cause investigation + re-probes (2026-06-09, post-gate)
+
+Both failures were investigated with the systematic-debugging skill. **Both have proven
+working references in this same environment** (screenpipe captures via SCK-in-Rust;
+`iphone-act`/`cua-driver` inject input), which strongly indicates integration bugs, not
+walls. Each got a minimal **single-variable** re-probe.
+
+## S0 crash — root cause: missing CG/WindowServer app context
+
+`SCShareableContent` enumeration succeeded; the abort is at `SCStream.startCapture`.
+`CGS_REQUIRE_INIT` / `did_initialize` is CoreGraphics asserting that the process never
+initialised its WindowServer/AppKit app connection — a bare CLI binary is a non-GUI
+process. The fix is to call **`NSApplicationLoad()`** (bootstraps the AppKit/CG app
+context) before any ScreenCaptureKit call — the same context screenpipe's SCK capture
+runs inside. This is NOT evidence that Mirroring is DRM-black; we never reached a frame.
+
+- **Re-probe:** `s0_capture` now calls `objc2_app_kit::NSApplicationLoad()` at the top of
+  `main()` (one added line; frame delivery already runs on an SCK delegate thread, so no
+  run loop is needed yet). If the assertion clears but frames never arrive, the next
+  iteration adds a main-thread `CFRunLoop`.
+
+## S1 input no-op — root cause: wrong event-tap target
+
+Events posted via `CGEvent::post_to_pid` are injected into the process's private queue;
+iPhone Mirroring (`com.apple.ScreenContinuity`) forwards only input it observes on the
+**system session/HID event tap** at the global cursor location — the path
+`iphone-act`/`cua-driver` use (cf. cua-driver's `bring_to_front` + `dispatch:"foreground"`).
+`iphone-act tap 105,840` working is the proof. `core-graphics 0.25` exposes
+`CGEvent::post(CGEventTapLocation::{HID,Session})` for exactly this.
+
+- **Architectural consequence:** input must flow through the global session/HID tap with
+  the Mirroring window **frontmost** → it **commandeers the real Mac cursor** and the
+  window must be front during control. Continuous native-feel drag still works (stream
+  `mouseDragged` via the tap); the human/agent control lease already enforces a single
+  owner, consistent with a single global cursor. This replaces the spec's "CGEvent to
+  pid" model — fold back into the spec once confirmed.
+- **Re-probe:** `s1b_session_input <x> <y> [hid|session]` — identical gesture to S1 but
+  posts via the session/HID tap at a **global screen** point, window frontmost. Single
+  variable changed: post target.
+
+## Re-probe RUNBOOK (real hardware)
+
+```bash
+cd /Users/leo/github.com/iphone-remote-panel
+git pull            # get the re-probes
+cargo build --bin s0_capture --bin s1b_session_input
+```
+
+**R0 — capture (expect the abort to be gone):**
+```bash
+cargo run --bin s0_capture        # Screen Recording TCC already granted
+```
+- PASS if it prints `NSApplicationLoad() -> true`, then frame lines, and `s0-frames/*.png`
+  show the live iPhone screen (changing as you interact). FAIL-still-crashes → tell me.
+- FAIL-hangs (no crash, no frames) → it needs a run loop; tell me, that's the next probe.
+
+**R1 — input via session tap (window FRONTMOST):**
+```bash
+# Mirroring window is at (23,377) size 312x694. Pick a global screen point INSIDE it —
+# e.g. roughly the Shortcuts icon. As a quick sanity target, the window centre ≈ (179,724).
+# Bring iPhone Mirroring to the front, then:
+cargo run --bin s1b_session_input -- 179 724 hid
+# if no reaction, try the session tap:
+cargo run --bin s1b_session_input -- 179 724 session
+```
+- PASS if the phone reacts (a tap/drag at that point). Note which tap (`hid`/`session`)
+  worked and whether the Mac cursor jumped. Then optionally test backgrounded/covered to
+  confirm the "must be frontmost" constraint.
+
+**Report back (minimal):**
+```
+R0: NSApplicationLoad=true/false  crash gone? Y/N  frames live? Y/N
+R1: hid=Y/N  session=Y/N  cursor-commandeered? Y/N  reacted-when-not-frontmost? Y/N
+```

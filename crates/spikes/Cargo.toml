@@ -11,6 +11,12 @@ path = "src/bin/s1_input.rs"
 name = "s0_capture"
 path = "src/bin/s0_capture.rs"
 
+[[bin]]
+# S1b re-probe: input via the session/HID event tap (CGEventPost) instead of
+# the failed per-pid path (CGEventPostToPid). See SPIKE-RESULTS.md.
+name = "s1b_session_input"
+path = "src/bin/s1b_session_input.rs"
+
 [dependencies]
 # elcapitan feature gates CGEvent::post_to_pid (CGEventPostToPid).
 # highsierra is not needed — we use only mouse events, not scroll.
@@ -18,6 +24,9 @@ core-graphics = { version = "0.25.0", features = ["elcapitan"] }
 
 # S0a capture probe: ScreenCaptureKit wrapper + PNG writer.
 screencapturekit = "0.3"
+# S0 re-probe: NSApplicationLoad() to initialise the CoreGraphics/WindowServer
+# app context that SCStream.startCapture requires (fixes CGS_REQUIRE_INIT).
+objc2-app-kit = "0.3"
 # core-media-rs / core-video-rs are screencapturekit's own transitive deps; we
 # depend on them directly to pull CMSampleBuffer / CVPixelBuffer pixels out.
 # Versions pinned to what screencapturekit 0.3 resolves so there's one copy.

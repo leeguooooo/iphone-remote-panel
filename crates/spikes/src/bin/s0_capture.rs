@@ -356,6 +356,14 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    // S0 re-probe fix for `Assertion failed: (did_initialize), CGS_REQUIRE_INIT`:
+    // a bare CLI process never initialises the CoreGraphics/WindowServer app
+    // connection that SCStream.startCapture requires. NSApplicationLoad()
+    // bootstraps the AppKit/CG app context (the same context screenpipe's SCK
+    // capture runs inside). Must run BEFORE any ScreenCaptureKit call.
+    let ok = objc2_app_kit::NSApplicationLoad();
+    eprintln!("NSApplicationLoad() -> {ok}");
+
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);
