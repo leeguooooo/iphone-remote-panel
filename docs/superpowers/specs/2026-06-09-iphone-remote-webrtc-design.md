@@ -98,7 +98,7 @@ survives window resize. Touch phases map: `touchstart → mouseDown`,
 - A human pointer event in Safari **pre-empts**: it takes the lock, the agent receives
   a `preempted` signal, and the agent's subsequent injections are rejected — but the
   agent can still `observe` (read frames/screenshots).
-- Idle timeout auto-releases the lock.
+- Idle timeout auto-releases the lock (default 30 s; configurable).
 
 ### 3.5 Agent MCP surface
 
@@ -106,8 +106,16 @@ Tools (high-level, phone-semantic — agents never compute raw screen coordinate
 `observe` (latest frame + window metadata), `screenshot` (JPEG from the live pipeline),
 `tap(x,y)` / `swipe(direction,distance)` / `type(text)` / `key(name)` /
 `shortcut(home|spotlight|switcher)`, `acquire_control` / `release_control`.
-Keyboard and discrete shortcuts MAY reuse `cua-driver` where it is already correct;
-continuous pointer gestures go through `core::input` CGEvents.
+`swipe(direction, distance)` is **not** a coarse one-shot gesture: like the human
+path, the host synthesizes intermediate `mouseDragged` points through `core::input`
+so the same code path serves both front-ends.
+
+**`cua-driver` dependency:** the default is to reimplement keyboard/text/shortcuts
+in-process via CGEvent so the shipped binary has **no runtime dependency** on
+`cua-driver` (window enumeration in `core::window` can fall back to its own SCK/AX
+query). `cua-driver` is used during development for parity checks; whether any path
+keeps shelling out to it at runtime is a plan-time decision, but the spec's intent is
+a self-contained binary.
 
 ## 4. Security
 
