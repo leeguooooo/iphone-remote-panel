@@ -236,7 +236,8 @@ fn find_mirroring_window(
     // A setup/welcome dialog ("Welcome to iPhone Mirroring") is size_ok but is
     // NOT the live mirror — skip it when a real phone window is also present.
     let is_setup = |w: &screencapturekit::shareable_content::SCWindow| {
-        w.title().to_lowercase().contains("welcome")
+        let t = w.title().to_lowercase();
+        t.contains("welcome") || t.contains("\u{6b22}\u{8fce}") // 欢迎 (CN welcome)
     };
     let mut size_matches: Vec<_> = candidates
         .iter()
