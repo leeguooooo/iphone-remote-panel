@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for iPhoneRemote.app bundle.
+  Placed at: iPhoneRemote.app/Contents/Info.plist by scripts/make-app.sh.
+
+  CFBundleIdentifier MUST stay "work.pwtk.iphone-remote" across all releases
+  so that TCC (Screen Recording + Accessibility) grants persist.  Changing it
+  forces every user to re-grant.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>work.pwtk.iphone-remote</string>
+
+    <key>CFBundleName</key>
+    <string>iPhoneRemote</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>iPhone Remote</string>
+
+    <!-- Must match the binary filename inside Contents/MacOS/ -->
+    <key>CFBundleExecutable</key>
+    <string>iphone-remote</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <!-- Versioning — injected at build time by make-app.sh / CI from Cargo.toml -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+
+    <!--
+      Required for ScreenCaptureKit / CGDisplayStream access.
+      macOS shows this string in the Screen Recording permission dialog.
+    -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>iPhone Remote needs to capture the iPhone Mirroring window to stream it to your iPhone over WebRTC.</string>
+
+    <!--
+      Required for CGEventPost (Accessibility) used to drive pointer input
+      into the iPhone Mirroring window.
+    -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>iPhone Remote needs Accessibility access to inject touch events into iPhone Mirroring.</string>
+
+    <!-- Suppress Dock icon — daemon runs in background -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Allow running from user's ~/Applications as well as /Applications -->
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
+</dict>
+</plist>

@@ -155,6 +155,32 @@ mod imp {
         Ok((win, width, height))
     }
 
+    /// Find the iPhone Mirroring window and build a [`crate::coords::SessionGeometry`]
+    /// describing its on-screen content rect, for mapping normalized input
+    /// coordinates back to absolute screen points.
+    ///
+    /// The content rect is the chosen window's on-screen frame (origin top-left,
+    /// in points, as ScreenCaptureKit reports it). Orientation is inferred from
+    /// the window aspect ratio: a window that is taller than it is wide is treated
+    /// as `Portrait`; otherwise `LandscapeLeft`. iPhone Mirroring renders the phone
+    /// upright inside the window regardless of physical device orientation, so the
+    /// content rect mapping is correct for portrait; landscape is a best-effort
+    /// inference (the orientation field is informational for `coords::to_screen`).
+    ///
+    /// `scale` is filled with the main display's backing scale factor (points per
+    /// pixel) when available, defaulting to `2.0` (Retina) — it is informational.
+    pub fn find_mirroring_geometry() -> anyhow::Result<crate::coords::SessionGeometry> {
+        let (win, w_px, _h_px) = find_mirroring_window()?;
+        let frame = win.get_frame();
+        Ok(super::geometry_from_window(
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+            w_px,
+        ))
+    }
+
     /// SCK output handler: turns each captured `CMSampleBuffer` into a [`Frame`]
     /// and invokes the user callback. Idle SCK samples carry no pixel buffer
     /// (`CouldNotGetDataBuffer`) and are dropped silently — normal SCK behaviour.
@@ -372,7 +398,60 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{CaptureStream, FrameCallback};
+pub use imp::{find_mirroring_geometry, CaptureStream, FrameCallback};
+
+// ---------------------------------------------------------------------------
+// Pure geometry construction (testable on every platform).
+// ---------------------------------------------------------------------------
+
+/// Build a [`crate::coords::SessionGeometry`] from a window's on-screen frame
+/// (points, origin top-left) and its captured pixel width.
+///
+/// * `content_rect` is the frame as given (the iPhone Mirroring window content).
+/// * `orientation` is inferred from the frame aspect ratio: `Portrait` when the
+///   window is at least as tall as it is wide, else `LandscapeLeft`. iPhone
+///   Mirroring renders the phone upright inside the window, so this matches the
+///   common portrait case; landscape is a best-effort inference and the field is
+///   informational for [`crate::coords::to_screen`].
+/// * `scale` ≈ pixels-per-point (`width_px / w`), clamped to ≥ 1.0, defaulting to
+///   `2.0` (Retina) when `w` is non-positive.
+pub fn geometry_from_window(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    width_px: u32,
+) -> crate::coords::SessionGeometry {
+    use crate::coords::{Orientation, Rect, SessionGeometry};
+    let orientation = if h >= w {
+        Orientation::Portrait
+    } else {
+        Orientation::LandscapeLeft
+    };
+    let scale = if w > 0.0 {
+        (width_px as f64 / w).max(1.0)
+    } else {
+        2.0
+    };
+    SessionGeometry {
+        content_rect: Rect { x, y, w, h },
+        scale,
+        orientation,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-macOS stub for find_mirroring_geometry (keeps the public surface stable).
+// ---------------------------------------------------------------------------
+
+/// Find the iPhone Mirroring window and return its [`crate::coords::SessionGeometry`]
+/// for input mapping. On non-macOS this always returns `None`.
+#[cfg(not(target_os = "macos"))]
+pub fn find_mirroring_geometry() -> anyhow::Result<crate::coords::SessionGeometry> {
+    Err(anyhow::anyhow!(
+        "find_mirroring_geometry is only supported on macOS (ScreenCaptureKit)"
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Non-macOS stub: same public surface, returns "unsupported" from start().
@@ -419,5 +498,54 @@ mod tests {
         let c2 = c.clone();
         assert_eq!(c2.fps, 60);
         assert!(c2.show_cursor);
+    }
+
+    // ── geometry_from_window (pure) ──────────────────────────────────────────
+
+    use crate::coords::Orientation;
+
+    #[test]
+    fn geometry_portrait_window_is_portrait() {
+        // A typical iPhone Mirroring window: 312×694 pts @ Retina (624 px wide).
+        let geo = geometry_from_window(100.0, 50.0, 312.0, 694.0, 624);
+        assert_eq!(geo.content_rect.x, 100.0);
+        assert_eq!(geo.content_rect.y, 50.0);
+        assert_eq!(geo.content_rect.w, 312.0);
+        assert_eq!(geo.content_rect.h, 694.0);
+        assert_eq!(geo.orientation, Orientation::Portrait);
+        assert!((geo.scale - 2.0).abs() < 1e-9, "scale={}", geo.scale);
+    }
+
+    #[test]
+    fn geometry_landscape_window_is_landscape() {
+        let geo = geometry_from_window(0.0, 0.0, 694.0, 312.0, 1388);
+        assert_eq!(geo.orientation, Orientation::LandscapeLeft);
+    }
+
+    #[test]
+    fn geometry_square_window_defaults_portrait() {
+        let geo = geometry_from_window(0.0, 0.0, 400.0, 400.0, 400);
+        assert_eq!(geo.orientation, Orientation::Portrait);
+        assert!((geo.scale - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn geometry_scale_clamped_and_default() {
+        // width_px smaller than w → clamp scale to ≥1.0.
+        let geo = geometry_from_window(0.0, 0.0, 312.0, 694.0, 100);
+        assert!(geo.scale >= 1.0);
+        // zero width → default 2.0.
+        let geo0 = geometry_from_window(0.0, 0.0, 0.0, 694.0, 624);
+        assert!((geo0.scale - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn geometry_maps_input_center_to_window_center() {
+        // Cross-check with coords::to_screen: a normalized center maps to the
+        // window-rect center.
+        let geo = geometry_from_window(100.0, 200.0, 300.0, 600.0, 600);
+        let p = crate::coords::to_screen((0.5, 0.5), &geo).unwrap();
+        assert!((p.0 - 250.0).abs() < 1e-9);
+        assert!((p.1 - 500.0).abs() < 1e-9);
     }
 }

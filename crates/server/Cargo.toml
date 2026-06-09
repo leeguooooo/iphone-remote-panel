@@ -3,10 +3,42 @@ name = "server"
 version = "0.1.0"
 edition = "2021"
 
+# The daemon binary. Lib stays for unit-testable glue (http/signaling/webrtc
+# decode helpers); the bin is the `iphone-remote serve`/`stop` CLI entrypoint.
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iphone-remote"
+path = "src/main.rs"
+
 [dependencies]
+core = { path = "../core" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 
+# Daemon integration layer.
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+# async runtime + HTTP/WebSocket server.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+
+# WebRTC peer connection + H.264 track (matches the validated spike).
+webrtc = "0.17"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+core-graphics = { version = "0.25", features = ["elcapitan"] }
+
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

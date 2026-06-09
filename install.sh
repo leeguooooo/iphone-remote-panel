@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# install.sh — install iPhoneRemote.app and register the GUI-session LaunchAgent
+#
+# USAGE (recommended — no auth required; GITHUB_TOKEN not needed for public releases):
+#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-remote-panel/main/install.sh | sh
+#
+# Local / dev usage (skip download; supply a pre-built .app):
+#   ./install.sh /path/to/iPhoneRemote.app
+#
+# Requirements:
+#   • Must run as the LOGGED-IN GUI user (not root, not over a bare SSH session).
+#   • Aqua (WindowServer) session must be active.
+#   • macOS 14 Sonoma or later.
+#
+set -eu
+
+# ── Inline sign helper (fallback when scripts/sign.sh is not available) ───────
+# Defined early so it is available throughout the script.
+_inline_sign() {
+    local app="$1"
+    local cert_name="iPhoneRemote Local Signing"
+    local existing
+    existing="$(security find-certificate -c "$cert_name" \
+                ~/Library/Keychains/login.keychain-db 2>/dev/null || true)"
+    if [ -z "$existing" ]; then
+        warn "Self-signed cert not found — creating '$cert_name' in login keychain ..."
+        local tmpd
+        tmpd="$(mktemp -d)"
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" \
+            -subj "/CN=$cert_name/O=iPhoneRemote/OU=Code Signing" 2>/dev/null
+        openssl pkcs12 -export \
+            -in "$tmpd/cert.pem" -inkey "$tmpd/key.pem" \
+            -out "$tmpd/cert.p12" -passout "pass:localonly" -name "$cert_name" 2>/dev/null
+        security import "$tmpd/cert.p12" \
+            -k ~/Library/Keychains/login.keychain-db \
+            -P "localonly" -T /usr/bin/codesign -f pkcs12
+        rm -rf "$tmpd"
+        ok "Self-signed cert created: $cert_name"
+    fi
+    codesign --force --options runtime --sign "$cert_name" --timestamp=none \
+        "$app/Contents/MacOS/iphone-remote"
+    codesign --force --options runtime --sign "$cert_name" --timestamp=none \
+        "$app"
+    ok "Signed with: $cert_name"
+}
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+BUNDLE_ID="work.pwtk.iphone-remote"
+APP_NAME="iPhoneRemote.app"
+INSTALL_DIR="$HOME/Applications"
+PLIST_LABEL="work.pwtk.iphone-remote"
+PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+LOG_DIR="$HOME/Library/Logs/iPhoneRemote"
+REPO="leeguooooo/iphone-remote-panel"
+BINARY_INSIDE_APP="Contents/MacOS/iphone-remote"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BOLD='\033[1m'; RESET='\033[0m'
+ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${RESET}  %s\n" "$*"; }
+die()  { printf "${RED}✗ ERROR:${RESET} %s\n" "$*" >&2; exit 1; }
+info() { printf "  %s\n" "$*"; }
+
+echo ""
+printf "${BOLD}=== iPhone Remote — install.sh ===${RESET}\n"
+echo ""
+
+# ── Guard: must be a GUI session ─────────────────────────────────────────────
+if [ -z "${HOME:-}" ]; then
+    die "HOME is not set.  Run as a normal user, not root."
+fi
+
+UID_NUM="$(id -u)"
+if [ "$UID_NUM" = "0" ]; then
+    die "Do not run as root.  Run as the logged-in desktop user."
+fi
+
+if ! launchctl print "gui/$UID_NUM" >/dev/null 2>&1; then
+    warn "Could not enumerate gui/$UID_NUM session."
+    warn "Make sure you are logged in to a desktop (Aqua) session."
+    warn "Running over SSH is fine ONLY if the desktop user is also logged in."
+fi
+
+# ── Step 1 — Obtain the .app ──────────────────────────────────────────────────
+APP_SRC=""
+if [ -n "${1:-}" ]; then
+    # Local path supplied (dev / CI / re-install)
+    APP_SRC="$1"
+    if [ ! -d "$APP_SRC" ]; then
+        die "Supplied path is not a directory: $APP_SRC"
+    fi
+    ok "Using local app: $APP_SRC"
+else
+    # Download from the latest GitHub Release
+    info "Fetching latest release from github.com/$REPO ..."
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOAD_CMD="curl -fsSL"
+    else
+        die "curl is required.  Install Xcode Command Line Tools: xcode-select --install"
+    fi
+
+    LATEST_JSON="$($DOWNLOAD_CMD "https://api.github.com/repos/$REPO/releases/latest")"
+    DOWNLOAD_URL="$(printf '%s' "$LATEST_JSON" \
+                    | grep '"browser_download_url"' \
+                    | grep "${APP_NAME}.zip" \
+                    | head -1 \
+                    | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        die "Could not find ${APP_NAME}.zip in the latest release.  Check https://github.com/$REPO/releases"
+    fi
+
+    TMPDIR_INSTALL="$(mktemp -d)"
+    ZIP="$TMPDIR_INSTALL/${APP_NAME}.zip"
+    info "Downloading $DOWNLOAD_URL ..."
+    $DOWNLOAD_CMD -o "$ZIP" "$DOWNLOAD_URL"
+
+    # Verify sha256 if checksum file is available
+    SHA_URL="${DOWNLOAD_URL}.sha256"
+    EXPECTED_SHA="$($DOWNLOAD_CMD "$SHA_URL" 2>/dev/null | awk '{print $1}' || true)"
+    if [ -n "$EXPECTED_SHA" ]; then
+        ACTUAL_SHA="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
+        if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            die "SHA-256 mismatch!\n  expected: $EXPECTED_SHA\n  actual:   $ACTUAL_SHA"
+        fi
+        ok "SHA-256 verified"
+    else
+        warn "No .sha256 file found; skipping checksum verification."
+    fi
+
+    info "Extracting ..."
+    unzip -q "$ZIP" -d "$TMPDIR_INSTALL"
+    APP_SRC="$TMPDIR_INSTALL/$APP_NAME"
+    if [ ! -d "$APP_SRC" ]; then
+        die "Extraction did not produce $APP_NAME in $TMPDIR_INSTALL"
+    fi
+    ok "Downloaded and extracted: $APP_SRC"
+fi
+
+# ── Step 2 — Remove quarantine ────────────────────────────────────────────────
+info "Removing quarantine attribute ..."
+xattr -dr com.apple.quarantine "$APP_SRC" 2>/dev/null || true
+ok "Quarantine cleared"
+
+# ── Step 3 — Sign locally if not already signed with a stable identity ────────
+SIGNED_ID="$(codesign --display --verbose=4 "$APP_SRC" 2>&1 \
+             | grep 'Identifier=' | head -1 \
+             | sed 's/.*Identifier=\(.*\)/\1/' || true)"
+
+if [ "$SIGNED_ID" = "$BUNDLE_ID" ]; then
+    ok "Already signed with bundle-id: $BUNDLE_ID"
+else
+    warn "App is unsigned or has a different bundle-id ('$SIGNED_ID'). Signing locally ..."
+    SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo ".")"
+    SIGN_SH="$SCRIPT_DIR/scripts/sign.sh"
+    if [ -f "$SIGN_SH" ]; then
+        bash "$SIGN_SH" "$APP_SRC"
+    else
+        warn "scripts/sign.sh not found; attempting inline self-signed codesign ..."
+        _inline_sign "$APP_SRC"
+    fi
+fi
+
+# ── Step 4 — Verify bundle-id in signature ────────────────────────────────────
+FINAL_ID="$(codesign --display --verbose=4 "$APP_SRC" 2>&1 \
+            | grep 'Identifier=' | head -1 \
+            | sed 's/.*Identifier=\(.*\)/\1/' || true)"
+if [ "$FINAL_ID" != "$BUNDLE_ID" ]; then
+    die "Signed bundle-id '$FINAL_ID' does not match expected '$BUNDLE_ID'.\n     TCC grants will not persist.  Check deploy/Info.plist."
+fi
+ok "Bundle-id verified: $BUNDLE_ID"
+
+# ── Step 5 — Install .app ─────────────────────────────────────────────────────
+mkdir -p "$INSTALL_DIR"
+DEST="$INSTALL_DIR/$APP_NAME"
+
+if [ -d "$DEST" ]; then
+    info "Removing existing install: $DEST"
+    rm -rf "$DEST"
+fi
+
+cp -R "$APP_SRC" "$DEST"
+ok "Installed: $DEST"
+
+# ── Step 6 — Create log directory ─────────────────────────────────────────────
+mkdir -p "$LOG_DIR"
+ok "Log directory: $LOG_DIR"
+
+# ── Step 7 — Write the LaunchAgent plist ─────────────────────────────────────
+mkdir -p "$HOME/Library/LaunchAgents"
+BINARY_PATH="$DEST/$BINARY_INSIDE_APP"
+
+cat > "$PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${BINARY_PATH}</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/iphone-remote.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/iphone-remote.err</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+ok "LaunchAgent plist written: $PLIST_DST"
+
+# ── Step 8 — Load / restart the LaunchAgent (no sudo; gui/$UID) ──────────────
+info "Loading LaunchAgent (gui/$UID_NUM) ..."
+
+# Unload if already running (idempotent)
+launchctl bootout "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || true
+
+# Bootstrap from the new plist
+launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST"
+ok "LaunchAgent bootstrapped"
+
+# Enable (persist across reboots)
+launchctl enable "gui/$UID_NUM/$PLIST_LABEL"
+ok "LaunchAgent enabled (persists across reboots)"
+
+# Kick it: -k kills a running instance first, then starts fresh
+launchctl kickstart -k "gui/$UID_NUM/$PLIST_LABEL"
+ok "LaunchAgent started"
+
+# ── Step 9 — Open TCC permission panes ───────────────────────────────────────
+echo ""
+printf "${BOLD}━━━ Grant permissions (required once) ━━━${RESET}\n"
+echo ""
+info "Opening System Settings > Privacy & Security > Screen Recording ..."
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+sleep 1
+info "Opening System Settings > Privacy & Security > Accessibility ..."
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+echo ""
+printf "${YELLOW}ACTION REQUIRED:${RESET}\n"
+printf "  1. In ${BOLD}Screen Recording${RESET}: enable the toggle next to ${BOLD}iPhoneRemote${RESET}.\n"
+printf "  2. In ${BOLD}Accessibility${RESET}: enable the toggle next to ${BOLD}iPhoneRemote${RESET}.\n"
+printf "  3. After granting both, restart the daemon:\n"
+printf "     ${BOLD}launchctl kickstart -k gui/%s/%s${RESET}\n" "$UID_NUM" "$PLIST_LABEL"
+printf "\n"
+printf "${YELLOW}NOTE (monthly):${RESET} macOS ~monthly re-prompts for Screen Recording.\n"
+printf "  You must re-grant it in the GUI; it cannot be suppressed without MDM/PPPC.\n"
+printf "\n"
+printf "${YELLOW}NOTE (headless):${RESET} The daemon only starts after a desktop login (Aqua session).\n"
+printf "  On unattended machines enable auto-login: System Settings > Users & Groups.\n"
+
+# ── Step 10 — Print current status ───────────────────────────────────────────
+echo ""
+printf "${BOLD}━━━ Current LaunchAgent status ━━━${RESET}\n"
+launchctl print "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || info "(not running yet — grant permissions then kickstart)"
+
+echo ""
+printf "${BOLD}━━━ Quick reference ━━━${RESET}\n"
+printf "  Status  : launchctl print gui/%s/%s\n"       "$UID_NUM" "$PLIST_LABEL"
+printf "  Restart : launchctl kickstart -k gui/%s/%s\n" "$UID_NUM" "$PLIST_LABEL"
+printf "  Stop    : launchctl bootout gui/%s/%s\n"      "$UID_NUM" "$PLIST_LABEL"
+printf "  Logs    : tail -f %s/iphone-remote.log\n"    "$LOG_DIR"
+printf "  Errors  : tail -f %s/iphone-remote.err\n"    "$LOG_DIR"
+echo ""
+ok "Install complete."

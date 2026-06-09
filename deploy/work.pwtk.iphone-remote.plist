@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent plist for iphone-remote daemon.
+  Label and filename MUST match: work.pwtk.iphone-remote
+  Bundle id is stable so TCC grants survive upgrades.
+
+  This file is a TEMPLATE.  install.sh generates the live copy under
+  ~/Library/LaunchAgents/work.pwtk.iphone-remote.plist by substituting
+  __HOME__ with the actual $HOME value.  Do not load this template directly.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Stable reverse-DNS label — equals CFBundleIdentifier -->
+    <key>Label</key>
+    <string>work.pwtk.iphone-remote</string>
+
+    <!-- Absolute path to binary inside the .app + subcommand -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/Applications/iPhoneRemote.app/Contents/MacOS/iphone-remote</string>
+        <string>serve</string>
+    </array>
+
+    <!-- Start immediately when the Aqua session boots -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash; launchd throttles relaunches to ≥10 s -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Logs — install.sh creates the parent dir before loading -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/iPhoneRemote/iphone-remote.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/iPhoneRemote/iphone-remote.err</string>
+
+    <!--
+      Interactive: scheduling hint for a GUI foreground-class process.
+      Does NOT affect TCC — it only controls CPU scheduling bucket.
+    -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!--
+      Aqua: only load in a desktop GUI session (not in SSH / system session 0).
+      Required so the daemon has a WindowServer connection for ScreenCaptureKit.
+    -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
