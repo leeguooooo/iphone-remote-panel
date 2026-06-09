@@ -117,7 +117,7 @@ async fn build_pc(
     state: &Arc<AppState>,
     out_tx: &mpsc::UnboundedSender<SignalMsg>,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
-    let ice_servers = state.ice_servers.clone();
+    let ice_servers = state.ice.load().servers.clone();
     let pc = crate::webrtc::build_viewer_pc(
         ice_servers,
         state.pipeline.clone(),

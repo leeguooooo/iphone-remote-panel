@@ -51,7 +51,9 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
     let pipeline: Arc<dyn VideoPipeline> = Arc::new(NullPipeline { tx });
 
     let ice_servers = http::build_ice_servers(None, None, None);
-    let turn_creds_json = http::ice_servers_json(&ice_servers);
+    let ice = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(http::IceState::new(
+        ice_servers,
+    )));
 
     // A geometry whose gate is irrelevant here (no input routes are exercised).
     let geo = SessionGeometry {
@@ -68,8 +70,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
 
     Arc::new(AppState {
         pipeline,
-        ice_servers,
-        turn_creds_json,
+        ice,
         password: password.map(|s| s.to_string()),
         secret: b"test-secret-key-0123456789abcdef".to_vec(),
         session_ttl_secs: 3600,

@@ -41,14 +41,31 @@ const INDEX_HTML: &str = include_str!("../../../web/index.html");
 /// The cookie name the web client and daemon agree on.
 const SESSION_COOKIE: &str = "phone_session";
 
+/// ICE servers + their precomputed `/turn-creds` JSON, kept together so a TURN
+/// refresh swaps both atomically (see [`AppState::ice`]).
+pub struct IceState {
+    /// ICE servers handed to each PeerConnection.
+    pub servers: Vec<RTCIceServer>,
+    /// JSON `iceServers` array body returned by `/turn-creds`.
+    pub json: String,
+}
+
+impl IceState {
+    /// Build from a server list, precomputing the `/turn-creds` JSON.
+    pub fn new(servers: Vec<RTCIceServer>) -> Self {
+        let json = ice_servers_json(&servers);
+        Self { servers, json }
+    }
+}
+
 /// Shared application state for all handlers.
 pub struct AppState {
     /// Running video pipeline the WebRTC feed subscribes to.
     pub pipeline: Arc<dyn VideoPipeline>,
-    /// ICE servers handed to each PeerConnection and returned by `/turn-creds`.
-    pub ice_servers: Vec<RTCIceServer>,
-    /// JSON `iceServers` array body for `/turn-creds` (precomputed).
-    pub turn_creds_json: String,
+    /// ICE servers + `/turn-creds` JSON. Behind an `ArcSwap` so the Cloudflare
+    /// TURN refresh task can hot-swap fresh ephemeral credentials without a
+    /// restart; readers `load()` the current snapshot.
+    pub ice: Arc<arc_swap::ArcSwap<IceState>>,
     /// Optional shared password; `None` = open (LAN dev) mode.
     pub password: Option<String>,
     /// Secret for signing session cookies (always present; generated if unset).
@@ -258,7 +275,7 @@ async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     }
     let mut resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(state.turn_creds_json.clone()))
+        .body(Body::from(state.ice.load().json.clone()))
         .unwrap();
     resp = with_security_headers(resp);
     resp

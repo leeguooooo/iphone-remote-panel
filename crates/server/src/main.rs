@@ -169,13 +169,15 @@ fn serve() -> Result<()> {
         ),
     }
 
-    // 7. ICE servers (STUN + optional env TURN).
+    // 7. ICE servers (STUN + optional static env TURN). Cloudflare dynamic TURN,
+    //    if configured, is minted + refreshed inside the async runtime and
+    //    hot-swapped into this `ArcSwap` (see `run_server`).
     let ice_servers = http::build_ice_servers(
         std::env::var("PHONE_REMOTE_TURN_URLS").ok(),
         std::env::var("PHONE_REMOTE_TURN_USERNAME").ok(),
         std::env::var("PHONE_REMOTE_TURN_CREDENTIAL").ok(),
     );
-    let turn_creds_json = http::ice_servers_json(&ice_servers);
+    let ice = Arc::new(arc_swap::ArcSwap::from_pointee(http::IceState::new(ice_servers)));
 
     // Control lease + input injector (drains decoded events on its own thread,
     // gated on the human lease being current).
@@ -201,8 +203,7 @@ fn serve() -> Result<()> {
     let cookie_secure = false;
     let state = Arc::new(AppState {
         pipeline,
-        ice_servers,
-        turn_creds_json,
+        ice,
         password: cfg.password.clone(),
         secret,
         session_ttl_secs: cfg.session_ttl_secs,
@@ -232,6 +233,14 @@ fn run_server(cfg: Config, state: Arc<AppState>) -> Result<()> {
 
         print_startup_banner(&cfg);
 
+        // Cloudflare dynamic TURN: if a TURN key is configured, mint ephemeral
+        // credentials now and refresh them before they expire, hot-swapping the
+        // shared ICE state. Absent config, the daemon stays on STUN + static env
+        // TURN (the initial value already in `state.ice`).
+        if let Some(cf) = server::turn::CfTurnConfig::from_env() {
+            spawn_cloudflare_turn_refresh(cf, state.ice.clone());
+        }
+
         let app = http::router(state);
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
@@ -255,6 +264,45 @@ fn print_startup_banner(cfg: &Config) {
         eprintln!("   note:     bound to 127.0.0.1; set PHONE_REMOTE_HOST=0.0.0.0 for LAN access");
     }
     eprintln!("──────────────────────────────────────────────");
+}
+
+/// Spawn the Cloudflare TURN refresh loop.
+///
+/// Mints ephemeral TURN credentials, hot-swaps them (alongside STUN + any static
+/// env TURN) into the shared ICE state, and re-mints before they expire. On a
+/// mint error it keeps the last-good (or initial STUN-only) ICE state and retries
+/// shortly — the daemon never goes credential-less.
+fn spawn_cloudflare_turn_refresh(
+    cf: server::turn::CfTurnConfig,
+    ice: Arc<arc_swap::ArcSwap<http::IceState>>,
+) {
+    // Base = STUN + any static env TURN; the CF ephemeral relay is appended each refresh.
+    let base = http::build_ice_servers(
+        std::env::var("PHONE_REMOTE_TURN_URLS").ok(),
+        std::env::var("PHONE_REMOTE_TURN_USERNAME").ok(),
+        std::env::var("PHONE_REMOTE_TURN_CREDENTIAL").ok(),
+    );
+    tokio::spawn(async move {
+        loop {
+            match server::turn::mint(&cf).await {
+                Ok(cf_server) => {
+                    let mut servers = base.clone();
+                    servers.push(cf_server);
+                    ice.store(std::sync::Arc::new(http::IceState::new(servers)));
+                    tracing::info!(
+                        "cloudflare TURN credentials refreshed (ttl {}s)",
+                        cf.ttl_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(cf.refresh_after_secs()))
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!("cloudflare TURN mint failed: {e:#}; retrying in 60s");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

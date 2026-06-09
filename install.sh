@@ -212,6 +212,24 @@ fi
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 [ -n "$LAN_IP" ] || LAN_IP="<this-mac-LAN-ip>"
 
+# Optional Cloudflare TURN (cross-network access). If both are exported, embed
+# them so the daemon mints ephemeral relay credentials. Absent → STUN-only
+# (LAN/same-network works; cellular/remote needs these).
+CF_TURN_KEY_ID="${PHONE_REMOTE_CF_TURN_KEY_ID:-}"
+CF_TURN_API_TOKEN="${PHONE_REMOTE_CF_TURN_API_TOKEN:-}"
+CF_PLIST_BLOCK=""
+if [ -n "$CF_TURN_KEY_ID" ] && [ -n "$CF_TURN_API_TOKEN" ]; then
+    CF_PLIST_BLOCK="        <key>PHONE_REMOTE_CF_TURN_KEY_ID</key>
+        <string>${CF_TURN_KEY_ID}</string>
+        <key>PHONE_REMOTE_CF_TURN_API_TOKEN</key>
+        <string>${CF_TURN_API_TOKEN}</string>
+"
+    ok "Cloudflare TURN configured — cross-network relay enabled"
+else
+    info "Cloudflare TURN not set (STUN-only; fine on same Wi-Fi). To enable cross-network,"
+    info "  export PHONE_REMOTE_CF_TURN_KEY_ID + PHONE_REMOTE_CF_TURN_API_TOKEN and re-run."
+fi
+
 # ── Step 7 — Write the LaunchAgent plist ─────────────────────────────────────
 mkdir -p "$HOME/Library/LaunchAgents"
 BINARY_PATH="$DEST/$BINARY_INSIDE_APP"
@@ -251,7 +269,7 @@ cat > "$PLIST_DST" <<PLIST
         <string>${PORT}</string>
         <key>PHONE_REMOTE_PASSWORD</key>
         <string>${PASSWORD}</string>
-    </dict>
+${CF_PLIST_BLOCK}    </dict>
 </dict>
 </plist>
 PLIST
