@@ -352,14 +352,21 @@ pub struct CgEventSink {
 
 /// Map a named shortcut to its macOS virtual keycode for the digit key (with ⌘).
 ///
-/// These are the iPhone Mirroring Mac-side View-menu shortcuts (⌘1/⌘2/⌘3).
+/// These are the iPhone Mirroring Mac-side View-menu shortcuts (⌘1/⌘2/⌘3/⌘4).
 /// The returned keycode is for the digit key only; the caller also posts a
 /// real Command key (keycode 55) around it.  Pure — unit-tested.
+///
+/// - `"home"`         → ⌘1 (keycode 18) — go to Home Screen
+/// - `"switcher"`     → ⌘2 (keycode 19) — open App Switcher
+/// - `"spotlight"`    → ⌘3 (keycode 20) — open Spotlight Search
+/// - `"controlcenter"` / `"control_center"` → ⌘4 (keycode 21) — open Control Center
+///   (macOS 27+ only; harmless no-op on macOS 15/26 which have no ⌘4 binding)
 fn shortcut_keymap(name: &str) -> Option<u16> {
     match name {
-        "home"      => Some(18), // '1'
-        "switcher"  => Some(19), // '2'
-        "spotlight" => Some(20), // '3'
+        "home"                             => Some(18), // '1'
+        "switcher"                         => Some(19), // '2'
+        "spotlight"                        => Some(20), // '3'
+        "controlcenter" | "control_center" => Some(21), // '4' — macOS 27+
         _ => None,
     }
 }
@@ -384,6 +391,27 @@ fn named_key_keycode(name: &str) -> Option<u16> {
         "right"                 => Some(124),
         _ => None,
     }
+}
+
+/// Returns `true` when `s` should be sent via clipboard-paste instead of
+/// char-by-char keycode synthesis.
+///
+/// If ANY character in `s` has no US-ANSI keycode (i.e. [`char_to_keycode`]
+/// returns `None` for it) the whole string goes through the clipboard path.
+/// Mixing keycode-typed and clipboard-pasted segments mid-string would reorder
+/// text, so the decision is all-or-nothing per string.
+///
+/// Typical case: CJK / Emoji / accented characters — none have US keycodes.
+/// The clipboard-paste path (pbcopy + real Cmd+V via iPhone Mirroring) bypasses
+/// the on-phone Pinyin IME entirely, resolving the digit-hijack described in
+/// GitHub issue #10.
+///
+/// Empty string → `false` (nothing to send either way).
+fn needs_clipboard_paste(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.chars().any(|c| char_to_keycode(c).is_none())
 }
 
 /// US-ANSI virtual keycode + whether Shift is held, for a printable ASCII char.
@@ -595,8 +623,30 @@ impl EventSink for CgEventSink {
         //      `CGEventFlagShift` alone made capitals arrive lowercase (`H` → `h`);
         //   3. space every transition by KEY_GAP_MS / CHAR_GAP_MS — events posted
         //      back-to-back too fast get dropped (`Hello123` → `hello13`, the `2` lost).
-        // The phone field must already be focused. Non-ASCII (CJK) has no US keycode
-        // and is skipped — that needs an on-phone IME, out of scope here.
+        // The phone field must already be focused.
+        //
+        // CJK / non-ASCII path (GitHub issue #10):
+        //   If ANY character in `s` has no US keycode, the WHOLE string is sent via
+        //   clipboard-paste instead of char-by-char synthesis.  Mixing both modes
+        //   mid-string would reorder text; the decision is all-or-nothing per call.
+        //   Clipboard-paste bypasses the on-phone Pinyin IME entirely, which prevents
+        //   the digit-hijack problem (#10 — IME intercepts digits like "1" to select
+        //   a candidate rather than inserting "1").
+        //   Implementation: write to the Mac clipboard via `/usr/bin/pbcopy` (spawn +
+        //   write stdin + wait — simplest approach, zero new dependencies; avoids
+        //   NSPasteboard FFI which would require objc/core-foundation crates not yet in
+        //   the workspace), sleep ~50 ms for clipboard to settle, then post a REAL
+        //   Cmd+V: Command key (keycode 55) down, 'v' (keycode 9) down+up with
+        //   CGEventFlagCommand, Command up — identical to the shortcut() real-modifier
+        //   pattern.  iPhone Mirroring drops modifier flags; the real Cmd key is required.
+        //   NOTE: the Mac clipboard is clobbered; not restored (acceptable trade-off;
+        //   clipboard restore is left as a future enhancement).
+        //   Hardware validation pending (targets the Pinyin digit-hijack in issue #10).
+        if needs_clipboard_paste(s) {
+            self.text_via_clipboard(s);
+            return;
+        }
+
         use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
         const KVK_SHIFT: u16 = 56;
         let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
@@ -604,6 +654,8 @@ impl EventSink for CgEventSink {
             let (kc, shift) = match char_to_keycode(ch) {
                 Some(v) => v,
                 None => {
+                    // Should not reach here after needs_clipboard_paste check,
+                    // but guard defensively.
                     eprintln!("text: no US keycode for {ch:?}; skipping (non-ASCII?)");
                     continue;
                 }
@@ -677,7 +729,10 @@ impl EventSink for CgEventSink {
         let digit_kc = match shortcut_keymap(name) {
             Some(k) => k,
             None => {
-                eprintln!("shortcut {name:?}: unknown shortcut (want home|switcher|spotlight)");
+                eprintln!(
+                    "shortcut {name:?}: unknown shortcut \
+                     (want home|switcher|spotlight|controlcenter)"
+                );
                 return;
             }
         };
@@ -724,6 +779,109 @@ impl EventSink for CgEventSink {
                 }
             }
             Err(e) => eprintln!("shortcut {name:?}: {e}; skipping cmd-up"),
+        }
+        gap();
+    }
+}
+
+// ── CgEventSink helpers (not part of the EventSink trait) ────────────────────
+
+#[cfg(target_os = "macos")]
+impl CgEventSink {
+    /// Send `s` to the phone by writing it to the Mac clipboard and posting a
+    /// real Cmd+V.  Called by [`EventSink::text`] when the string contains
+    /// non-ASCII chars that have no US keycode.
+    ///
+    /// Steps:
+    ///   1. Spawn `/usr/bin/pbcopy`, write `s` to its stdin, wait for it to exit.
+    ///   2. Sleep 50 ms so the clipboard is settled before Mirroring reads it.
+    ///   3. Post: Command-down (kc 55), 'v'-down (kc 9, with CGEventFlagCommand),
+    ///      'v'-up, Command-up — the same real-modifier pattern as `shortcut()`.
+    ///
+    /// Uses `pbcopy` (rather than NSPasteboard FFI) to avoid pulling in
+    /// `objc`/`core-foundation` crates that are not yet in the workspace.
+    ///
+    /// The Mac clipboard is clobbered and not restored; this is an acceptable
+    /// trade-off for the initial implementation (issue #10).
+    fn text_via_clipboard(&self, s: &str) {
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // 1. Write to clipboard via pbcopy
+        match Command::new("/usr/bin/pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(stdin) = child.stdin.take() {
+                    let mut stdin = stdin;
+                    if let Err(e) = stdin.write_all(s.as_bytes()) {
+                        eprintln!("text_via_clipboard: pbcopy stdin write failed: {e}; skipping");
+                        return;
+                    }
+                }
+                if let Err(e) = child.wait() {
+                    eprintln!("text_via_clipboard: pbcopy wait failed: {e}; skipping");
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("text_via_clipboard: failed to spawn pbcopy: {e}; skipping");
+                return;
+            }
+        }
+
+        // 2. Wait for clipboard to settle
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // 3. Post real Cmd+V to HID tap — same real-modifier pattern as shortcut()
+        const KVK_COMMAND: u16 = 55;
+        const KVK_V: u16 = 9;
+        let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
+
+        // Command key down
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(cmd_down) = CGEvent::new_keyboard_event(source, KVK_COMMAND, true) {
+                    cmd_down.set_flags(CGEventFlags::CGEventFlagCommand);
+                    cmd_down.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => { eprintln!("text_via_clipboard: {e}; skipping cmd-down"); return; }
+        }
+        gap();
+        // 'v' key down (⌘ held)
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(v_down) = CGEvent::new_keyboard_event(source, KVK_V, true) {
+                    v_down.set_flags(CGEventFlags::CGEventFlagCommand);
+                    v_down.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("text_via_clipboard: {e}; skipping v-down"),
+        }
+        gap();
+        // 'v' key up (⌘ still held)
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(v_up) = CGEvent::new_keyboard_event(source, KVK_V, false) {
+                    v_up.set_flags(CGEventFlags::CGEventFlagCommand);
+                    v_up.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("text_via_clipboard: {e}; skipping v-up"),
+        }
+        gap();
+        // Command key up
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(cmd_up) = CGEvent::new_keyboard_event(source, KVK_COMMAND, false) {
+                    cmd_up.set_flags(CGEventFlags::empty());
+                    cmd_up.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("text_via_clipboard: {e}; skipping cmd-up"),
         }
         gap();
     }
@@ -1042,6 +1200,41 @@ mod tests {
         assert_eq!(shortcut_keymap("switcher"),  Some(19_u16)); // '2' keycode
         assert_eq!(shortcut_keymap("spotlight"), Some(20_u16)); // '3' keycode
         assert_eq!(shortcut_keymap("nope"),      None);
+    }
+
+    #[test]
+    fn shortcut_keymap_controlcenter_both_spellings() {
+        // controlcenter = ⌘4 (macOS 27+ Mirroring View menu)
+        // Both spellings must resolve to keycode 21 ('4')
+        assert_eq!(shortcut_keymap("controlcenter"),  Some(21_u16));
+        assert_eq!(shortcut_keymap("control_center"), Some(21_u16));
+    }
+
+    // ── needs_clipboard_paste — partition helper ─────────────────────────────
+
+    #[test]
+    fn needs_clipboard_paste_pure_ascii_is_false() {
+        assert!(!needs_clipboard_paste("hello"));
+        assert!(!needs_clipboard_paste("Hello, World!"));
+        assert!(!needs_clipboard_paste("abc123!@#"));
+    }
+
+    #[test]
+    fn needs_clipboard_paste_chinese_is_true() {
+        assert!(needs_clipboard_paste("中文"));
+        assert!(needs_clipboard_paste("你好"));
+    }
+
+    #[test]
+    fn needs_clipboard_paste_mixed_is_true() {
+        // Even a single non-ASCII char triggers the clipboard path for the whole string
+        assert!(needs_clipboard_paste("hello中文"));
+        assert!(needs_clipboard_paste("test你好world"));
+    }
+
+    #[test]
+    fn needs_clipboard_paste_empty_is_false() {
+        assert!(!needs_clipboard_paste(""));
     }
 
     // ── named_key_keycode — named key → macOS virtual keycode ───────────────
