@@ -93,7 +93,11 @@ if [ -n "${1:-}" ]; then
     fi
     ok "Using local app: $APP_SRC"
 else
-    # Download from the latest GitHub Release
+    # Download from the latest GitHub Release.
+    # Use the redirect-based direct URL, NOT api.github.com: the API rate-limits
+    # anonymous clients to 60 req/h per IP and returns 403 when exhausted
+    # (hardware-tested failure mode). The /releases/latest/download/ path is
+    # served by the web tier with no API quota.
     info "Fetching latest release from github.com/$REPO ..."
     if command -v curl >/dev/null 2>&1; then
         DOWNLOAD_CMD="curl -fsSL"
@@ -101,16 +105,7 @@ else
         die "curl is required.  Install Xcode Command Line Tools: xcode-select --install"
     fi
 
-    LATEST_JSON="$($DOWNLOAD_CMD "https://api.github.com/repos/$REPO/releases/latest")"
-    DOWNLOAD_URL="$(printf '%s' "$LATEST_JSON" \
-                    | grep '"browser_download_url"' \
-                    | grep "${APP_NAME}.zip" \
-                    | head -1 \
-                    | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
-
-    if [ -z "$DOWNLOAD_URL" ]; then
-        die "Could not find ${APP_NAME}.zip in the latest release.  Check https://github.com/$REPO/releases"
-    fi
+    DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/${APP_NAME}.zip"
 
     TMPDIR_INSTALL="$(mktemp -d)"
     ZIP="$TMPDIR_INSTALL/${APP_NAME}.zip"
