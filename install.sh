@@ -2,7 +2,7 @@
 # install.sh — install iPhoneRemote.app and register the GUI-session LaunchAgent
 #
 # USAGE (recommended — no auth required; GITHUB_TOKEN not needed for public releases):
-#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-remote-panel/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 #
 # Local / dev usage (skip download; supply a pre-built .app):
 #   ./install.sh /path/to/iPhoneRemote.app
@@ -52,7 +52,7 @@ INSTALL_DIR="$HOME/Applications"
 PLIST_LABEL="work.pwtk.iphone-remote"
 PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 LOG_DIR="$HOME/Library/Logs/iPhoneRemote"
-REPO="leeguooooo/iphone-remote-panel"
+REPO="leeguooooo/iphone-use"
 BINARY_INSIDE_APP="Contents/MacOS/iphone-remote"
 
 # ── Colours ───────────────────────────────────────────────────────────────────

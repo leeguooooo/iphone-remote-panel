@@ -1,4 +1,6 @@
-# iPhone Remote Panel
+# iphone-use
+
+> *Computer-use, but for the iPhone — let AI agents (and your browser) see and drive a real phone.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Platform: macOS 15+](https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey)

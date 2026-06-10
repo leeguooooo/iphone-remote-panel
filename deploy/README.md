@@ -39,7 +39,7 @@ Operational checklist for unattended boxes:
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-remote-panel/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```
 
 For local / dev installs (pre-built .app):
