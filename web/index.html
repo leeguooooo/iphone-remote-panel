@@ -267,6 +267,55 @@
       color: var(--muted); border-radius: 12px; padding: 12px 12px; font-size: 14px; cursor: pointer;
     }
 
+    /* ── Offline / stall overlay ────────────────────────────────── */
+    #offlineOverlay {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: calc(100% - var(--tb-reserve));
+      z-index: 15;                /* above video (z=0) and tapDot (z=5), below playOverlay (z=20) */
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 10px;
+      background: rgba(8,9,12,.72);
+      backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+      pointer-events: none;       /* taps pass through to #videoArea so a tap can wake Mirroring */
+      transition: opacity .3s, height .28s cubic-bezier(.2,.7,.2,1);
+      opacity: 0;
+    }
+    #offlineOverlay.visible { opacity: 1; }
+    #offlineOverlay .ol-icon  { font-size: 36px; line-height: 1; }
+    #offlineOverlay .ol-title {
+      font-family: var(--sans); font-size: 16px; font-weight: 600;
+      color: var(--text); letter-spacing: .02em;
+    }
+    #offlineOverlay .ol-sub {
+      font-family: var(--sans); font-size: 12px;
+      color: var(--muted); letter-spacing: .02em;
+      max-width: 260px; text-align: center; line-height: 1.5;
+    }
+    /* Pulsing dot — instrument-panel style */
+    #offlineOverlay .ol-pulse {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 0 rgba(250,204,21,.5);
+      animation: ol-pulse 2s infinite;
+    }
+    #offlineOverlay.disconnected .ol-pulse {
+      background: var(--danger);
+      box-shadow: 0 0 0 0 rgba(255,90,102,.5);
+      animation: ol-pulse-red 2s infinite;
+    }
+    @keyframes ol-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(250,204,21,.55); }
+      60%  { box-shadow: 0 0 0 9px rgba(250,204,21,0); }
+      100% { box-shadow: 0 0 0 0 rgba(250,204,21,0); }
+    }
+    @keyframes ol-pulse-red {
+      0%   { box-shadow: 0 0 0 0 rgba(255,90,102,.55); }
+      60%  { box-shadow: 0 0 0 9px rgba(255,90,102,0); }
+      100% { box-shadow: 0 0 0 0 rgba(255,90,102,0); }
+    }
+
     /* ── Toast (v1: 1600ms) ─────────────────────────────────────── */
     #toast {
       position: fixed; left: 50%;
@@ -288,6 +337,14 @@
            disablePictureInPicture disableRemotePlayback></video>
     <canvas id="gridCanvas"></canvas>
     <div id="tapDot"></div>
+
+    <!-- offline / stall overlay (pointer-events:none so taps still reach videoArea) -->
+    <div id="offlineOverlay" aria-live="polite" aria-atomic="true">
+      <div class="ol-pulse"></div>
+      <div class="ol-icon">📵</div>
+      <div class="ol-title" id="olTitle">画面已停止</div>
+      <div class="ol-sub"  id="olSub">手机可能已锁屏、断开或镜像已暂停</div>
+    </div>
 
     <!-- floating status pill -->
     <div id="statusPill">
@@ -375,14 +432,21 @@ const ICE_RESTART_DEBOUNCE_MS = 2000;
 const RECONNECT_BASE_MS = 1500;
 
 /* ── DOM refs ─────────────────────────────────────────────────── */
-const video       = document.getElementById('screen');
-const videoArea   = document.getElementById('videoArea');
-const gridCanvas  = document.getElementById('gridCanvas');
-const tapDot      = document.getElementById('tapDot');
-const playOverlay = document.getElementById('playOverlay');
-const statusLine  = document.getElementById('statusLine');
-const toastEl     = document.getElementById('toast');
-const textInput   = document.getElementById('textInput');
+const video          = document.getElementById('screen');
+const videoArea      = document.getElementById('videoArea');
+const gridCanvas     = document.getElementById('gridCanvas');
+const tapDot         = document.getElementById('tapDot');
+const playOverlay    = document.getElementById('playOverlay');
+const statusLine     = document.getElementById('statusLine');
+const toastEl        = document.getElementById('toast');
+const textInput      = document.getElementById('textInput');
+const offlineOverlay = document.getElementById('offlineOverlay');
+const olTitle        = document.getElementById('olTitle');
+const olSub          = document.getElementById('olSub');
+
+/* ── Stall detection constants ────────────────────────────────── */
+const STALL_THRESHOLD_MS  = 4000;   /* no new frame for >4 s → stalled */
+const STALL_POLL_INTERVAL = 1000;   /* fallback poll (when rVFC unavailable) */
 
 /* ── State ────────────────────────────────────────────────────── */
 let pc = null, ws = null, controlCh = null, moveCh = null;
@@ -391,6 +455,9 @@ let iceRestartTimer = null, reconnectTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS, statsInterval = null;
 let lastRtt = '--', connState = 'new';
 
+/* ── Overlay state: 'hidden' | 'stalled' | 'disconnected' ────── */
+let overlayState = 'hidden';
+
 /* ── Toast ────────────────────────────────────────────────────── */
 let toastTimer = null;
 function toast(msg) {
@@ -398,6 +465,34 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastEl.classList.remove('on'), 1600);
 }
+
+/* ── Offline overlay management ──────────────────────────────── */
+function showOverlay(kind) {
+  /* kind: 'stalled' | 'disconnected' */
+  if (overlayState === kind) return;
+  overlayState = kind;
+  offlineOverlay.classList.remove('disconnected');
+  if (kind === 'disconnected') {
+    olTitle.textContent = '连接已断开';
+    olSub.textContent   = '正在尝试重连…';
+    offlineOverlay.classList.add('disconnected');
+  } else {
+    olTitle.textContent = '画面已停止';
+    olSub.textContent   = '手机可能已锁屏、断开或镜像已暂停';
+  }
+  offlineOverlay.classList.add('visible');
+  paintDot();
+}
+function hideOverlay() {
+  if (overlayState === 'hidden') return;
+  overlayState = 'hidden';
+  offlineOverlay.classList.remove('visible', 'disconnected');
+  paintDot();
+}
+
+/* ── Status pill dot colour ───────────────────────────────────── */
+/* Forward-declared here; defined fully below after paintDot() exists.
+   paintDot() reads overlayState + connState directly rather than scraping text. */
 
 /* ── Status line ──────────────────────────────────────────────── */
 function setStatus(msg) { statusLine.textContent = msg; }
@@ -680,7 +775,16 @@ function wirePc(newPc) {
       statsInterval = setInterval(pollStats, STATS_INTERVAL_MS);
     }
   };
-  pc.onconnectionstatechange = () => { connState = pc.connectionState; updateStatusLine(); if (pc.connectionState === 'failed') scheduleIceRestart(); };
+  pc.onconnectionstatechange = () => {
+    connState = pc.connectionState; updateStatusLine();
+    if (pc.connectionState === 'failed') scheduleIceRestart();
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+      showOverlay('disconnected');
+    } else if (pc.connectionState === 'connected') {
+      /* Only clear a 'disconnected' overlay here; stall detection clears 'stalled'. */
+      if (overlayState === 'disconnected') hideOverlay();
+    }
+  };
 }
 
 function onControlMessage(e) {
@@ -759,13 +863,111 @@ window.addEventListener('resize', syncToolbarReserve);
 window.addEventListener('orientationchange', () => setTimeout(syncToolbarReserve, 200));
 syncToolbarReserve();
 
-/* ── Status pill dot colour (observe statusLine text) ─────────── */
+/* ── Status pill dot colour ───────────────────────────────────── */
+/* Reads overlayState + connState directly (more reliable than text scraping). */
 const connDot = document.querySelector('#statusPill .conn-dot');
 function paintDot() {
-  const t = statusLine.textContent || '';
-  connDot.className = 'conn-dot ' + (/(connected|completed)/.test(t) ? 'ok' : /(failed|closed|error)/.test(t) ? 'bad' : 'warn');
+  let cls;
+  if (overlayState === 'disconnected' || /(failed|closed|error)/.test(connState)) {
+    cls = 'bad';
+  } else if (overlayState === 'stalled') {
+    cls = 'warn';
+  } else if (/(connected|completed)/.test(connState)) {
+    cls = 'ok';
+  } else {
+    cls = 'warn';
+  }
+  connDot.className = 'conn-dot ' + cls;
 }
+/* Also keep the MutationObserver so any direct setStatus() call refreshes the dot. */
 new MutationObserver(paintDot).observe(statusLine, { childList:true, characterData:true, subtree:true });
+
+/* ── Stall detection ─────────────────────────────────────────── */
+/* Timestamps the last rendered frame via requestVideoFrameCallback when
+   available (Chrome/Safari), falling back to a 1-second currentTime-delta
+   poll (Firefox and older Safari). If no new frame arrives for >STALL_THRESHOLD_MS
+   while pc.connectionState === 'connected' → show stalled overlay.
+   Any new frame → recovery (hide overlay immediately). */
+
+let _lastFrameTs = 0;         /* performance.now() of last known rendered frame */
+let _stallPollId = null;      /* setInterval id for fallback poll */
+let _rvfcActive  = false;     /* true when rVFC loop is running */
+let _lastKnownTime = -1;      /* video.currentTime at last poll (fallback) */
+
+function _onNewFrame() {
+  /* Called every time a frame is painted; resets the stall clock. */
+  _lastFrameTs = performance.now();
+  if (overlayState === 'stalled') hideOverlay();
+}
+
+/* requestVideoFrameCallback loop (Chrome 83+, Safari 15.4+) */
+function _rVFCLoop(now, meta) {
+  void meta;
+  _onNewFrame();
+  if (_rvfcActive) video.requestVideoFrameCallback(_rVFCLoop);
+}
+
+function _startStallWatch() {
+  _lastFrameTs = performance.now();
+  _lastKnownTime = video.currentTime;
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    _rvfcActive = true;
+    video.requestVideoFrameCallback(_rVFCLoop);
+  } else {
+    /* Fallback: poll currentTime + getVideoPlaybackQuality */
+    if (_stallPollId) return;
+    _stallPollId = setInterval(() => {
+      if (video.paused) return;                 /* user-frozen or not started */
+      const ct = video.currentTime;
+      let newFrame = ct !== _lastKnownTime;
+      /* also check decoded frame count if available */
+      if (!newFrame && typeof video.getVideoPlaybackQuality === 'function') {
+        const q = video.getVideoPlaybackQuality();
+        if (q && q.totalVideoFrames > 0) newFrame = q.totalVideoFrames !== (_startStallWatch._lastFrameCount || 0);
+        _startStallWatch._lastFrameCount = q ? q.totalVideoFrames : 0;
+      }
+      if (newFrame) { _lastKnownTime = ct; _onNewFrame(); }
+    }, STALL_POLL_INTERVAL);
+  }
+}
+
+function _stopStallWatch() {
+  _rvfcActive = false;
+  if (_stallPollId) { clearInterval(_stallPollId); _stallPollId = null; }
+}
+
+/* Master stall-checker: runs every second regardless of method */
+let _stallCheckId = null;
+function _startStallChecker() {
+  if (_stallCheckId) return;
+  _stallCheckId = setInterval(() => {
+    if (frozen || video.paused) return;           /* intentional freeze → ignore */
+    if (!pc || pc.connectionState !== 'connected') return; /* let conn-state handler own it */
+    if (!video.srcObject) return;                 /* no track yet */
+    const age = performance.now() - _lastFrameTs;
+    if (age > STALL_THRESHOLD_MS && overlayState !== 'stalled') {
+      showOverlay('stalled');
+    }
+  }, STALL_POLL_INTERVAL);
+}
+function _stopStallChecker() {
+  if (_stallCheckId) { clearInterval(_stallCheckId); _stallCheckId = null; }
+}
+
+/* Wire into video lifecycle */
+video.addEventListener('playing', () => {
+  _lastFrameTs = performance.now();
+  _startStallWatch();
+  _startStallChecker();
+  /* A frame is flowing — clear any stall overlay (but not 'disconnected') */
+  if (overlayState === 'stalled') hideOverlay();
+});
+video.addEventListener('pause', () => {
+  /* rVFC stops firing on its own when paused; stop the loop.
+     The stall-checker guards with (frozen || video.paused) so won't false-alarm. */
+  _stopStallWatch();
+});
+video.addEventListener('emptied', () => { _stopStallWatch(); _stopStallChecker(); });
 
 /* ── Boot ─────────────────────────────────────────────────────── */
 document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
