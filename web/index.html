@@ -468,13 +468,20 @@ function toast(msg) {
 
 /* ── Offline overlay management ──────────────────────────────── */
 function showOverlay(kind) {
-  /* kind: 'stalled' | 'disconnected' */
+  /* kind: 'stalled' | 'disconnected' | 'gone'
+     'gone' = daemon-reported: the Mirroring window vanished (phone fully
+     disconnected / Mirroring quit). The daemon's keepalive keeps frames
+     flowing, so only the phone_status signal can tell us this. */
   if (overlayState === kind) return;
   overlayState = kind;
   offlineOverlay.classList.remove('disconnected');
   if (kind === 'disconnected') {
     olTitle.textContent = '连接已断开';
     olSub.textContent   = '正在尝试重连…';
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'gone') {
+    olTitle.textContent = '手机已断开';
+    olSub.textContent   = 'iPhone 镜像窗口已消失 — 检查手机与 Mac 的连接';
     offlineOverlay.classList.add('disconnected');
   } else {
     olTitle.textContent = '画面已停止';
@@ -811,6 +818,13 @@ async function connectWs() {
     let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (msg.type === 'offer') await handleOffer(msg.sdp);
     else if (msg.type === 'ice' && pc && msg.candidate) { try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (_) {} }
+    else if (msg.type === 'phone_status') {
+      // Daemon-side truth about the Mirroring window. Keepalive frames keep
+      // flowing when the window vanishes, so this signal (not frame flow)
+      // drives the "phone gone" overlay.
+      if (msg.present === false) showOverlay('gone');
+      else if (overlayState === 'gone') hideOverlay();
+    }
   };
 }
 async function handleOffer(sdp) {
@@ -945,7 +959,9 @@ function _startStallChecker() {
     if (!pc || pc.connectionState !== 'connected') return; /* let conn-state handler own it */
     if (!video.srcObject) return;                 /* no track yet */
     const age = performance.now() - _lastFrameTs;
-    if (age > STALL_THRESHOLD_MS && overlayState !== 'stalled') {
+    /* 'gone' (daemon-reported window vanished) outranks 'stalled' — don't
+       downgrade the message; the phone_status signal owns clearing it. */
+    if (age > STALL_THRESHOLD_MS && overlayState !== 'stalled' && overlayState !== 'gone') {
       showOverlay('stalled');
     }
   }, STALL_POLL_INTERVAL);

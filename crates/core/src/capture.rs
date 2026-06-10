@@ -339,6 +339,12 @@ mod imp {
         // Held to keep the active stream alive; replaced on restart.
         stream: Arc<Mutex<Option<SCStream>>>,
         watcher: Option<std::thread::JoinHandle<()>>,
+        // Whether the watcher could find a Mirroring window on its last poll.
+        // `false` = the window is gone (Mirroring quit / phone fully disconnected)
+        // — the keepalive keeps re-encoding the last frame, so frame flow alone
+        // can't tell a viewer the phone is offline. The daemon surfaces this to
+        // viewers as a `phone_status` signaling message.
+        window_present: Arc<AtomicBool>,
     }
 
     impl CaptureStream {
@@ -351,6 +357,7 @@ mod imp {
             let current_id = Arc::new(AtomicU32::new(id));
             let dimensions = Arc::new((AtomicU32::new(width), AtomicU32::new(height)));
             let stop = Arc::new(AtomicBool::new(false));
+            let window_present = Arc::new(AtomicBool::new(true)); // start() just found it
             let stream_slot: Arc<Mutex<Option<SCStream>>> = Arc::new(Mutex::new(None));
 
             let stream = open_stream(&win, width, height, &cfg, cb.clone())?;
@@ -364,6 +371,7 @@ mod imp {
                 let dimensions = dimensions.clone();
                 let stop = stop.clone();
                 let stream_slot = stream_slot.clone();
+                let window_present = window_present.clone();
                 std::thread::Builder::new()
                     .name("capture-watcher".into())
                     .spawn(move || {
@@ -375,6 +383,7 @@ mod imp {
                             }
                             match find_mirroring_window() {
                                 Ok((new_win, w, h)) => {
+                                    window_present.store(true, Ordering::Relaxed);
                                     let new_id = new_win.window_id();
                                     if new_id != current_id.load(Ordering::Relaxed) {
                                         // Window changed — restart the stream.
@@ -396,7 +405,10 @@ mod imp {
                                     // Window temporarily gone (phone disconnected).
                                     // Keep the last stream; it will resume frames
                                     // when the window reappears, or the next poll
-                                    // restarts on a new id.
+                                    // restarts on a new id. Publish the absence so
+                                    // viewers get a "phone offline" state instead
+                                    // of a keepalive-frozen frame.
+                                    window_present.store(false, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -412,7 +424,14 @@ mod imp {
                 stop,
                 stream: stream_slot,
                 watcher: Some(watcher),
+                window_present,
             })
+        }
+
+        /// Whether the Mirroring window was found on the watcher's last poll.
+        /// `false` while the window is gone (Mirroring quit / phone disconnected).
+        pub fn window_present(&self) -> bool {
+            self.window_present.load(Ordering::Relaxed)
         }
 
         /// Current frame dimensions (width, height).
@@ -568,6 +587,11 @@ impl CaptureStream {
         Err(anyhow::anyhow!(
             "capture is only supported on macOS (ScreenCaptureKit)"
         ))
+    }
+
+    /// Non-macOS stub — there is never a window.
+    pub fn window_present(&self) -> bool {
+        false
     }
 }
 

@@ -47,6 +47,13 @@ pub enum SignalMsg {
     },
     /// Client → daemon: request an ICE restart (re-offer).
     Restart,
+    /// Daemon → client: whether the phone's Mirroring window is present.
+    ///
+    /// Pushed on connect and on transitions. Needed because the static-screen
+    /// keepalive keeps re-encoding the last frame when the window vanishes, so
+    /// the client cannot infer "phone offline" from frame flow alone.
+    #[serde(rename = "phone_status")]
+    PhoneStatus { present: bool },
 }
 
 /// Drive one viewer WebSocket session to completion.
@@ -78,9 +85,24 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
         return;
     }
 
+    // Phone-presence push: tell the client the current window state up front,
+    // then again on every transition (polled below). See SignalMsg::PhoneStatus.
+    let mut phone_present = state.pipeline.phone_present();
+    let _ = out_tx.send(SignalMsg::PhoneStatus { present: phone_present });
+    let mut presence_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    presence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Pump: forward outbound signaling to the socket, and handle inbound messages.
     loop {
         tokio::select! {
+            // Phone-presence poll → push on transition.
+            _ = presence_tick.tick() => {
+                let present = state.pipeline.phone_present();
+                if present != phone_present {
+                    phone_present = present;
+                    let _ = out_tx.send(SignalMsg::PhoneStatus { present });
+                }
+            }
             // Outbound signaling (offer / ICE candidates) → socket.
             maybe_out = out_rx.recv() => {
                 match maybe_out {
@@ -222,9 +244,9 @@ async fn handle_inbound(
             }
             true
         }
-        SignalMsg::Offer { .. } => {
-            // The daemon is the offerer; an inbound offer is a protocol error.
-            tracing::debug!("unexpected inbound offer; ignoring");
+        SignalMsg::Offer { .. } | SignalMsg::PhoneStatus { .. } => {
+            // Daemon-to-client-only messages; inbound copies are protocol errors.
+            tracing::debug!("unexpected inbound daemon-only message; ignoring");
             false
         }
     }
@@ -279,6 +301,12 @@ mod tests {
     fn restart_parses() {
         let msg: SignalMsg = serde_json::from_str(r#"{"type":"restart"}"#).unwrap();
         assert!(matches!(msg, SignalMsg::Restart));
+    }
+
+    #[test]
+    fn phone_status_serializes_with_snake_case_tag() {
+        let json = serde_json::to_string(&SignalMsg::PhoneStatus { present: false }).unwrap();
+        assert_eq!(json, r#"{"type":"phone_status","present":false}"#);
     }
 
     #[test]

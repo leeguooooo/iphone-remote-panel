@@ -98,6 +98,19 @@ pub trait VideoPipeline: Send + Sync {
     /// Call this on viewer-join and on RTCP PLI so a new/recovering decoder gets
     /// a clean entry point without waiting for the next GOP boundary.
     fn request_keyframe(&self);
+
+    /// Whether the phone's Mirroring window is currently present.
+    ///
+    /// `false` means the capture watcher can't find the window (Mirroring quit /
+    /// phone fully disconnected). Frame flow alone can't convey this to viewers:
+    /// the static-screen keepalive keeps re-encoding the last frame, so the
+    /// browser still receives "new" frames of stale content. The signaling layer
+    /// polls this and pushes a `phone_status` message on transitions.
+    ///
+    /// Defaults to `true` so test doubles without a capture layer are unaffected.
+    fn phone_present(&self) -> bool {
+        true
+    }
 }
 
 const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
@@ -537,6 +550,12 @@ mod imp {
         }
         fn request_keyframe(&self) {
             self.force_idr.store(true, Ordering::Relaxed);
+        }
+        fn phone_present(&self) -> bool {
+            self.capture
+                .as_ref()
+                .map(|c| c.window_present())
+                .unwrap_or(false)
         }
     }
 
