@@ -142,6 +142,7 @@ fn serve() -> Result<()> {
         current_lease,
         injector,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
+        agent_token: cfg.agent_token.clone(),
     });
 
     run_server(cfg, state)
@@ -188,6 +189,10 @@ fn print_startup_banner(cfg: &Config) {
     match &cfg.password {
         Some(_) => eprintln!("   password: (set via PHONE_REMOTE_PASSWORD)"),
         None => eprintln!("   password: (none — open LAN mode)"),
+    }
+    match &cfg.agent_token {
+        Some(_) => eprintln!("   agent:    (dedicated token set via PHONE_REMOTE_AGENT_TOKEN)"),
+        None => eprintln!("   agent:    (no dedicated token — uses password for bearer auth)"),
     }
     if cfg.host == "127.0.0.1" {
         eprintln!("   note:     bound to 127.0.0.1; set PHONE_REMOTE_HOST=0.0.0.0 for LAN access");

@@ -26,6 +26,15 @@ pub struct Config {
     pub session_ttl_secs: u64,
     /// Optional directory for persistent state files.
     pub state_dir: Option<PathBuf>,
+    /// Optional dedicated bearer token for agent/API access (`PHONE_REMOTE_AGENT_TOKEN`).
+    ///
+    /// When set, the agent `Authorization: Bearer <token>` path checks this value
+    /// **instead of** the human login password — the password is no longer accepted
+    /// as a bearer credential (clean separation of human and machine secrets).
+    ///
+    /// When absent (the default), the existing behavior is preserved: the password
+    /// is also accepted as a bearer, and open mode (no password) passes everything.
+    pub agent_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +80,8 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        let agent_token = get("PHONE_REMOTE_AGENT_TOKEN").filter(|s| !s.is_empty());
+
         Config {
             host,
             port,
@@ -78,6 +89,7 @@ impl Config {
             secret,
             session_ttl_secs,
             state_dir,
+            agent_token,
         }
     }
 }
@@ -184,5 +196,35 @@ mod tests {
     fn empty_password_gives_none() {
         let cfg = map_cfg(&[("PHONE_REMOTE_PASSWORD", "")]);
         assert_eq!(cfg.password, None);
+    }
+
+    // --- agent_token ---
+
+    #[test]
+    fn agent_token_unset_gives_none() {
+        let cfg = map_cfg(&[]);
+        assert_eq!(cfg.agent_token, None);
+    }
+
+    #[test]
+    fn agent_token_empty_gives_none() {
+        let cfg = map_cfg(&[("PHONE_REMOTE_AGENT_TOKEN", "")]);
+        assert_eq!(cfg.agent_token, None);
+    }
+
+    #[test]
+    fn agent_token_set_is_preserved() {
+        let cfg = map_cfg(&[("PHONE_REMOTE_AGENT_TOKEN", "sk-agent-abc123")]);
+        assert_eq!(cfg.agent_token, Some("sk-agent-abc123".to_owned()));
+    }
+
+    #[test]
+    fn agent_token_can_coexist_with_password() {
+        let cfg = map_cfg(&[
+            ("PHONE_REMOTE_PASSWORD", "hunter2"),
+            ("PHONE_REMOTE_AGENT_TOKEN", "sk-agent-xyz"),
+        ]);
+        assert_eq!(cfg.password, Some("hunter2".to_owned()));
+        assert_eq!(cfg.agent_token, Some("sk-agent-xyz".to_owned()));
     }
 }

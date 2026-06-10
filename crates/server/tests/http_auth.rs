@@ -79,6 +79,48 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         current_lease: Arc::new(Mutex::new(None)),
         injector,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
+        agent_token: None,
+    })
+}
+
+/// Like [`build_state`] but also sets a dedicated agent bearer token.
+///
+/// When `agent_token` is `Some`, the agent paths only accept that token as a
+/// bearer credential; the human login password is rejected as a bearer.
+fn build_state_with_agent_token(
+    password: Option<&str>,
+    agent_token: Option<&str>,
+) -> Arc<AppState> {
+    use server::core_crate::coords::{Orientation, Rect, SessionGeometry};
+
+    let (tx, _rx) = tokio::sync::broadcast::channel::<server::core_crate::encode::EncodedFrame>(4);
+    let pipeline: Arc<dyn server::core_crate::encode::VideoPipeline> =
+        Arc::new(NullPipeline { tx });
+
+    let ice_servers = http::build_ice_servers(None, None, None);
+    let ice = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(http::IceState::new(
+        ice_servers,
+    )));
+
+    let geo = SessionGeometry {
+        content_rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 },
+        scale: 2.0,
+        orientation: Orientation::Portrait,
+    };
+    let injector = server::input_bridge::spawn_injector(geo, || false);
+
+    Arc::new(AppState {
+        pipeline,
+        ice,
+        password: password.map(|s| s.to_string()),
+        secret: b"test-secret-key-0123456789abcdef".to_vec(),
+        session_ttl_secs: 3600,
+        cookie_secure: false,
+        control: Arc::new(Mutex::new(Control::new())),
+        current_lease: Arc::new(Mutex::new(None)),
+        injector,
+        auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
+        agent_token: agent_token.map(|s| s.to_string()),
     })
 }
 
@@ -664,6 +706,124 @@ fn login_failures_lock_out_agent_endpoints_via_shared_counter() {
             resp.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "shared lockout must cover the agent path too"
+        );
+    });
+}
+
+// ── Dedicated agent_token tests (issue #7) ───────────────────────────────────
+
+/// (a) When `agent_token` is set, a bearer matching it passes; a bearer matching
+///     the (human) password is rejected.
+#[test]
+fn agent_token_set_accepts_token_rejects_password_as_bearer() {
+    block(async {
+        let state = build_state_with_agent_token(Some("human-pass"), Some("sk-agent-secret"));
+        let app = http::router(state);
+
+        // Bearer = agent token → 200.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer sk-agent-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "agent token should be accepted");
+
+        // Bearer = human password → 401 (password is no longer a valid bearer).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer human-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "password must not be accepted as bearer when agent_token is configured"
+        );
+    });
+}
+
+/// (b) When `agent_token` is NOT set, the password-as-bearer path still works
+///     (backward-compatibility: existing behavior is unchanged).
+#[test]
+fn agent_token_unset_password_still_valid_bearer() {
+    block(async {
+        // No agent_token → falls back to password-as-bearer (original behavior).
+        let state = build_state(Some("hunter2"));
+        let app = http::router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "password-as-bearer must still work when no agent_token is configured"
+        );
+    });
+}
+
+/// (c) A wrong `agent_token` bearer must count toward the rate-limit lockout,
+///     eventually returning 429.
+#[test]
+fn wrong_agent_token_counts_toward_rate_limit_lockout() {
+    block(async {
+        let state =
+            build_state_with_agent_token(Some("human-pass"), Some("sk-agent-secret"));
+        let app = http::router(state);
+
+        // 5 wrong bearer attempts (wrong agent token) → each should be 401.
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/agent/status")
+                        .header(header::AUTHORIZATION, "Bearer wrong-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "wrong agent token attempt {i} should be 401"
+            );
+        }
+
+        // 6th attempt (wrong token again) should be 429 — locked out.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "wrong agent_token failures must trigger rate-limit lockout"
         );
     });
 }

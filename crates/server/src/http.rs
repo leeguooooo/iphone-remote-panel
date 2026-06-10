@@ -154,6 +154,15 @@ pub struct AppState {
     /// Rate limiter for login and agent bearer auth failures.
     /// After 5 consecutive failures requests are rejected with 429 for 30 s.
     pub auth_limiter: Arc<Mutex<AuthLimiter>>,
+    /// Optional dedicated bearer token for agent/API access.
+    ///
+    /// When `Some`, the `Authorization: Bearer` credential on the agent paths must
+    /// match this token; the human login password is **not** accepted as a bearer
+    /// (clean separation of human and machine secrets).
+    ///
+    /// When `None`, the existing behavior applies: the password (if set) is used as
+    /// the bearer check, and open mode (no password) passes everything through.
+    pub agent_token: Option<String>,
 }
 
 /// Build the axum router for the daemon.
@@ -390,21 +399,39 @@ fn bearer_credential(headers: &HeaderMap) -> Option<&[u8]> {
     Some(v.as_bytes().strip_prefix(b"Bearer ")?.trim_ascii())
 }
 
-/// Return `true` if the bearer credential matches the configured password.
+/// Constant-time byte-level equality check (length-guarded, UTF-8 safe).
+///
+/// Returns `true` iff `a` and `b` are byte-for-byte identical.  Uses a
+/// fold over XOR so the compiler cannot short-circuit, preventing timing
+/// oracles regardless of value length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Return `true` if the bearer credential matches the effective agent secret.
+///
+/// **Selection logic** (in order):
+/// 1. `agent_token` is configured → the bearer must match it; the password is
+///    **not** a valid bearer credential (clean separation).
+/// 2. `agent_token` is absent and `password` is configured → fall back to the
+///    original behavior (password doubles as the bearer secret).
+/// 3. Neither is configured (open mode) → always returns `true`.
 ///
 /// Does NOT touch the rate limiter — callers must check / record against the
 /// shared `auth_limiter` themselves so the limiter covers both login and agent
 /// paths with a unified counter.
 fn check_bearer(state: &AppState, headers: &HeaderMap) -> bool {
-    match &state.password {
-        None => true,
-        Some(pw) => bearer_credential(headers).is_some_and(|token| {
-            // length-checked constant-time byte compare (no early exit, UTF-8 safe)
-            let pw = pw.as_bytes();
-            token.len() == pw.len()
-                && token.iter().zip(pw).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-        }),
-    }
+    // Determine which secret governs bearer auth.
+    let expected: &str = match (&state.agent_token, &state.password) {
+        // Dedicated agent token takes precedence; password is NOT accepted.
+        (Some(tok), _) => tok,
+        // No dedicated token → fall back to the password (original behavior).
+        (None, Some(pw)) => pw,
+        // Open mode (neither configured) → always authed.
+        (None, None) => return true,
+    };
+    bearer_credential(headers)
+        .is_some_and(|token| ct_eq(token, expected.as_bytes()))
 }
 
 /// Outcome of an agent auth check (combines lockout + credential verify).
@@ -422,10 +449,11 @@ enum AgentAuth {
 /// * Checks the limiter BEFORE credential verification.
 /// * Records a failure (wrong or missing bearer) or success (correct) in the
 ///   shared [`AuthLimiter`].
-/// * Open-mode (no password configured): always returns `Ok` without touching
-///   the limiter so open-mode integration tests stay clean.
+/// * Open-mode (neither `agent_token` nor `password` configured): always returns
+///   `Ok` without touching the limiter so open-mode integration tests stay clean.
 fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
-    if state.password.is_none() {
+    // Open mode: no credential of any kind is configured.
+    if state.agent_token.is_none() && state.password.is_none() {
         return AgentAuth::Ok;
     }
     {
