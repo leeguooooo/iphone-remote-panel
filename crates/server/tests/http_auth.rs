@@ -66,7 +66,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         scale: 2.0,
         orientation: Orientation::Portrait,
     };
-    let injector = server::input_bridge::spawn_injector(geo, None, || false);
+    let injector = server::input_bridge::spawn_injector(geo, || false);
 
     Arc::new(AppState {
         pipeline,
@@ -78,7 +78,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         control: Arc::new(Mutex::new(Control::new())),
         current_lease: Arc::new(Mutex::new(None)),
         injector,
-        cua_target: None,
+        auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
     })
 }
 
@@ -303,7 +303,9 @@ fn agent_status_requires_bearer_when_password_set() {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json = String::from_utf8_lossy(&body);
         assert!(json.contains("\"ok\":true"), "{json}");
-        assert!(json.contains("\"phone_target\":false"), "{json}");
+        // phone_target reflects whether a Mirroring window is up at probe time;
+        // its exact value depends on the test environment — just verify the key exists.
+        assert!(json.contains("\"phone_target\":"), "{json}");
     });
 }
 
@@ -392,18 +394,25 @@ fn agent_open_mode_allows_without_bearer() {
 }
 
 #[test]
-fn agent_screenshot_503_without_phone_target() {
+fn agent_screenshot_unauthed_is_401() {
     block(async {
-        // Test state has cua_target: None → screenshot unavailable.
+        // Auth still required before any screenshot attempt.
         let app = http::router(build_state(Some("hunter2")));
-        // Auth still required.
         let resp = app
-            .clone()
             .oneshot(Request::builder().uri("/agent/screenshot").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        // Authed but no target → 503.
+    });
+}
+
+#[test]
+fn agent_screenshot_authed_returns_503_or_png_depending_on_platform() {
+    block(async {
+        // Authed: on macOS with no Mirroring window → 503; on non-macOS stub → 503.
+        // Either way the response is not 401 (auth passed) and not 200 (no window
+        // in the test environment).
+        let app = http::router(build_state(Some("hunter2")));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -414,7 +423,14 @@ fn agent_screenshot_503_without_phone_target() {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // 503 = Mirroring window not found (expected in CI / no real phone connected).
+        // 502 would indicate an unexpected panic in spawn_blocking — fail loudly.
+        assert!(
+            resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                || resp.status() == StatusCode::OK,
+            "expected 503 (no window) or 200 (window present), got {}",
+            resp.status()
+        );
     });
 }
 
@@ -452,5 +468,202 @@ fn agent_auth_accepts_non_ascii_password_bearer() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+}
+
+// ── Rate limiter integration tests ───────────────────────────────────────────
+//
+// Each test builds its own fresh AppState so limiters don't bleed.
+
+#[test]
+fn login_sixth_wrong_password_returns_429() {
+    block(async {
+        // Each test has its own fresh state — limiters are isolated.
+        let state = build_state(Some("hunter2"));
+        let app = http::router(state);
+
+        // 5 failures — each should return 401.
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/login")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from("password=wrong"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt {i} should be 401");
+        }
+
+        // 6th attempt should be 429.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=wrong"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    });
+}
+
+#[test]
+fn login_correct_after_four_failures_succeeds_and_resets() {
+    block(async {
+        let state = build_state(Some("hunter2"));
+        let app = http::router(state);
+
+        // 4 wrong attempts — below the lockout threshold.
+        for _ in 0..4 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/login")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from("password=wrong"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Correct password should succeed (303 + Set-Cookie) and reset the counter.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=hunter2"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "correct login should succeed");
+        assert!(resp.headers().get(header::SET_COOKIE).is_some(), "should set session cookie");
+
+        // After a success the counter is reset — a 5th wrong attempt should be 401
+        // (not 429 — the lockout was lifted).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=wrong"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "first wrong after reset should be 401");
+    });
+}
+
+#[test]
+fn agent_bearer_failures_trigger_lockout() {
+    block(async {
+        let state = build_state(Some("hunter2"));
+        let app = http::router(state);
+
+        // 5 wrong bearer attempts → limiter fills up.
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/agent/input")
+                        .header(header::AUTHORIZATION, "Bearer nope")
+                        .body(Body::from(r#"{"type":"tap","x":0.5,"y":0.5}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "agent attempt {i} should be 401");
+        }
+
+        // 6th wrong agent request → 429.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::from(r#"{"type":"tap","x":0.5,"y":0.5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Locked-out agent/status also returns 429.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    });
+}
+
+#[test]
+fn login_failures_lock_out_agent_endpoints_via_shared_counter() {
+    block(async {
+        // The limiter is one shared counter across the cookie login AND the agent
+        // bearer paths — 5 wrong /login attempts must 429 a subsequent agent call
+        // even though the agent itself never failed.
+        let state = build_state(Some("hunter2"));
+        let app = http::router(state);
+
+        for _ in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/login")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from("password=wrong"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Agent request with the CORRECT bearer is still rejected while locked.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "shared lockout must cover the agent path too"
+        );
     });
 }

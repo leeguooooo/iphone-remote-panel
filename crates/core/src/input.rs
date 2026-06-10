@@ -311,17 +311,26 @@ impl EventSink for RecordingSink {
 ///   coordinates (typically iPhone Mirroring, which must be brought to the
 ///   front first).
 ///
-/// - **Text**: synthesized as CGEvent keyboard events with the Unicode string
-///   set (`CGEventKeyboardSetUnicodeString`), posted to the HID tap — the same
-///   path the mouse uses, which Mirroring forwards to the phone. (cua-driver
-///   `type_text` inserts into the Mac window's AX tree, which the phone never
-///   receives.) The phone field must already be focused.
+/// - **Text**: synthesized as CGEvent keyboard events posted to the HID tap.
+///   iPhone Mirroring forwards the virtual KEYCODE to the phone, not the
+///   Unicode payload nor modifier flags.  Capitals/symbols need a real Shift
+///   key (keycode 56) pressed around them — `CGEventFlagShift` alone is
+///   dropped by Mirroring.  The phone field must already be focused.
 ///
-/// - **Key**: a named key delegates to `cua-driver call press_key` (cua-driver
-///   0.5.x has NO top-level `key`/`type`/`shortcut` subcommand — only `call`).
+/// - **Key**: maps the named key to a macOS US-ANSI virtual keycode and posts
+///   native CGEvent keyboard down+up to the HID tap — no external tooling
+///   required.  iPhone Mirroring forwards the keycode to the phone.
+///   Frontmost window is guaranteed by the injector layer before `key` is
+///   called.  Hardware validation pending (phone currently offline).
 ///
-/// - **Shortcut**: mapped to the proven `iphone-act` hotkeys and sent via
-///   `cua-driver call press_key` — `home` = ⌘1, `switcher` = ⌘2, `spotlight` = ⌘3.
+/// - **Shortcut**: posts a real Command key (keycode 55) down, then the digit
+///   key (home=18/'1', switcher=19/'2', spotlight=20/'3') down+up with
+///   `CGEventFlagCommand` set on the digit events, then Command up.  These are
+///   the iPhone Mirroring Mac-app View-menu shortcuts (⌘1/⌘2/⌘3), handled on
+///   the Mac side — no external tooling required.  Each transition is separated
+///   by [`KEY_GAP_MS`] (same pattern as `text()` Shift handling).  Frontmost
+///   window is guaranteed by the injector layer.  Hardware validation pending
+///   (phone currently offline).
 ///
 /// - **Tap dwell**: when called from a `Tap` sequence, `mouse_up` sleeps
 ///   [`TAP_DWELL_MS`] ms *before* posting the up event so iOS does not
@@ -339,40 +348,42 @@ pub struct CgEventSink {
     /// Set by `mouse_down` so that a `Tap` (which is always down→up with no
     /// intervening drag) gets the short dwell.  Cleared after `mouse_up` fires.
     pending_tap_dwell: bool,
-    /// Path to the `cua-driver` binary used for key/text/shortcut injection.
-    cua_driver: String,
-    /// `(pid, window_id)` of the Mirroring window, for cua-driver `call` tools.
-    /// `None` → key/text/shortcut are logged and skipped (the pointer path,
-    /// which uses CGEvent directly, still works without a target).
-    target: Option<(i32, u32)>,
 }
 
-/// Map a named shortcut to the cua-driver `press_key` key (always with ⌘).
-/// Matches the proven `iphone-act` mapping. Pure — unit-tested.
-fn shortcut_keymap(name: &str) -> Option<&'static str> {
+/// Map a named shortcut to its macOS virtual keycode for the digit key (with ⌘).
+///
+/// These are the iPhone Mirroring Mac-side View-menu shortcuts (⌘1/⌘2/⌘3).
+/// The returned keycode is for the digit key only; the caller also posts a
+/// real Command key (keycode 55) around it.  Pure — unit-tested.
+fn shortcut_keymap(name: &str) -> Option<u16> {
     match name {
-        "home" => Some("1"),
-        "switcher" => Some("2"),
-        "spotlight" => Some("3"),
+        "home"      => Some(18), // '1'
+        "switcher"  => Some(19), // '2'
+        "spotlight" => Some(20), // '3'
         _ => None,
     }
 }
 
-/// Minimal JSON string escaping for cua-driver `call` payloads.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
+/// Map a named key to its macOS US-ANSI virtual keycode.
+///
+/// iPhone Mirroring forwards VIRTUAL KEYCODES to the phone (not Unicode),
+/// so named keys must post real keycodes.  Frontmost window is guaranteed
+/// by the injector layer before any key is sent.
+///
+/// Hardware validation for key() is pending (phone currently offline).
+fn named_key_keycode(name: &str) -> Option<u16> {
+    match name {
+        "return" | "enter"      => Some(36),
+        "escape" | "esc"        => Some(53),
+        "space"                 => Some(49),
+        "tab"                   => Some(48),
+        "delete" | "backspace"  => Some(51),
+        "up"                    => Some(126),
+        "down"                  => Some(125),
+        "left"                  => Some(123),
+        "right"                 => Some(124),
+        _ => None,
     }
-    out
 }
 
 /// US-ANSI virtual keycode + whether Shift is held, for a printable ASCII char.
@@ -416,16 +427,6 @@ fn char_to_keycode(c: char) -> Option<(u16, bool)> {
     })
 }
 
-/// Build the JSON for `cua-driver call press_key`.
-fn press_key_json(pid: i32, window_id: u32, key: &str, cmd: bool) -> String {
-    let mods = if cmd { r#","modifiers":["cmd"]"# } else { "" };
-    format!(
-        r#"{{"pid":{pid},"window_id":{window_id},"key":"{}"{mods}}}"#,
-        json_escape(key)
-    )
-}
-
-
 #[cfg(target_os = "macos")]
 impl CgEventSink {
     /// Create a new sink.  Panics if there is no window server session.
@@ -437,18 +438,7 @@ impl CgEventSink {
             .expect("CGEventSource::new failed — is there a macOS window server session?");
         CgEventSink {
             pending_tap_dwell: false,
-            cua_driver: "cua-driver".to_string(),
-            target: None,
         }
-    }
-
-    /// Create a sink wired to the Mirroring window's `pid` + `window_id` and a
-    /// `cua-driver` binary path, so key/text/shortcut injection works.
-    pub fn with_cua(cua_driver: impl Into<String>, pid: i32, window_id: u32) -> Self {
-        let mut s = Self::new();
-        s.cua_driver = cua_driver.into();
-        s.target = Some((pid, window_id));
-        s
     }
 
     fn make_source() -> core_graphics::event_source::CGEventSource {
@@ -471,17 +461,6 @@ impl CgEventSink {
         evt.post(CGEventTapLocation::HID);
     }
 
-    /// Run `cua-driver call <tool> '<json>'`. Best-effort; logs on failure.
-    fn cua_call(&self, tool: &str, json: &str) {
-        match std::process::Command::new(&self.cua_driver)
-            .args(["call", tool, json])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("cua-driver call {tool} exited {s}"),
-            Err(e) => eprintln!("cua-driver ({}) not found / failed: {e}", self.cua_driver),
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -551,10 +530,29 @@ impl EventSink for CgEventSink {
     }
 
     fn key(&mut self, name: &str) {
-        match self.target {
-            Some((pid, wid)) => self.cua_call("press_key", &press_key_json(pid, wid, name, false)),
-            None => eprintln!("key {name:?}: no Mirroring window target; skipping"),
+        // iPhone Mirroring forwards virtual KEYCODES to the phone — not Unicode,
+        // not modifier flags.  Post a real keycode down+up to the HID tap.
+        // Frontmost window is guaranteed by the injector layer before this call.
+        // Hardware validation is pending (phone currently offline).
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+        let kc = match named_key_keycode(name) {
+            Some(k) => k,
+            None => {
+                eprintln!("key {name:?}: unknown key name; skipping");
+                return;
+            }
+        };
+        let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
+        if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), kc, true) {
+            down.set_flags(CGEventFlags::empty());
+            down.post(CGEventTapLocation::HID);
         }
+        gap();
+        if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), kc, false) {
+            up.set_flags(CGEventFlags::empty());
+            up.post(CGEventTapLocation::HID);
+        }
+        gap();
     }
 
     fn text(&mut self, s: &str) {
@@ -617,13 +615,46 @@ impl EventSink for CgEventSink {
     }
 
     fn shortcut(&mut self, name: &str) {
-        match (shortcut_keymap(name), self.target) {
-            (Some(key), Some((pid, wid))) => {
-                self.cua_call("press_key", &press_key_json(pid, wid, key, true))
+        // iPhone Mirroring's View-menu shortcuts (⌘1/⌘2/⌘3) are handled on the
+        // Mac side — post a real Command key (keycode 55) around the digit key.
+        // CGEventFlagCommand alone is dropped by Mirroring; the physical Cmd key
+        // must be held via its own keycode, exactly like Shift in text().
+        // Frontmost window is guaranteed by the injector layer before this call.
+        // Hardware validation is pending (phone currently offline).
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+        const KVK_COMMAND: u16 = 55;
+        let digit_kc = match shortcut_keymap(name) {
+            Some(k) => k,
+            None => {
+                eprintln!("shortcut {name:?}: unknown shortcut (want home|switcher|spotlight)");
+                return;
             }
-            (None, _) => eprintln!("unknown shortcut {name:?} (want home|spotlight|switcher)"),
-            (Some(_), None) => eprintln!("shortcut {name:?}: no Mirroring window target; skipping"),
+        };
+        let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
+        // Command key down
+        if let Ok(cmd_down) = CGEvent::new_keyboard_event(Self::make_source(), KVK_COMMAND, true) {
+            cmd_down.set_flags(CGEventFlags::CGEventFlagCommand);
+            cmd_down.post(CGEventTapLocation::HID);
         }
+        gap();
+        // Digit key down (⌘ held)
+        if let Ok(digit_down) = CGEvent::new_keyboard_event(Self::make_source(), digit_kc, true) {
+            digit_down.set_flags(CGEventFlags::CGEventFlagCommand);
+            digit_down.post(CGEventTapLocation::HID);
+        }
+        gap();
+        // Digit key up (⌘ still held)
+        if let Ok(digit_up) = CGEvent::new_keyboard_event(Self::make_source(), digit_kc, false) {
+            digit_up.set_flags(CGEventFlags::CGEventFlagCommand);
+            digit_up.post(CGEventTapLocation::HID);
+        }
+        gap();
+        // Command key up
+        if let Ok(cmd_up) = CGEvent::new_keyboard_event(Self::make_source(), KVK_COMMAND, false) {
+            cmd_up.set_flags(CGEventFlags::empty());
+            cmd_up.post(CGEventTapLocation::HID);
+        }
+        gap();
     }
 }
 
@@ -931,28 +962,50 @@ mod tests {
         );
     }
 
-    // ── cua-driver invocation builders (the bug Hermes found) ────────────────
+    // ── shortcut_keymap — native CGEvent keycode mapping ────────────────────
 
     #[test]
     fn shortcut_keymap_matches_iphone_act() {
-        assert_eq!(shortcut_keymap("home"), Some("1"));
-        assert_eq!(shortcut_keymap("switcher"), Some("2"));
-        assert_eq!(shortcut_keymap("spotlight"), Some("3"));
-        assert_eq!(shortcut_keymap("nope"), None);
+        // home=⌘1, switcher=⌘2, spotlight=⌘3 — iPhone Mirroring View-menu shortcuts
+        assert_eq!(shortcut_keymap("home"),      Some(18_u16)); // '1' keycode
+        assert_eq!(shortcut_keymap("switcher"),  Some(19_u16)); // '2' keycode
+        assert_eq!(shortcut_keymap("spotlight"), Some(20_u16)); // '3' keycode
+        assert_eq!(shortcut_keymap("nope"),      None);
+    }
+
+    // ── named_key_keycode — named key → macOS virtual keycode ───────────────
+
+    #[test]
+    fn named_key_keycode_covers_required_keys() {
+        assert_eq!(named_key_keycode("return"),    Some(36_u16));
+        assert_eq!(named_key_keycode("enter"),     Some(36_u16)); // alias
+        assert_eq!(named_key_keycode("escape"),    Some(53_u16));
+        assert_eq!(named_key_keycode("esc"),       Some(53_u16)); // alias
+        assert_eq!(named_key_keycode("space"),     Some(49_u16));
+        assert_eq!(named_key_keycode("tab"),       Some(48_u16));
+        assert_eq!(named_key_keycode("delete"),    Some(51_u16));
+        assert_eq!(named_key_keycode("backspace"), Some(51_u16)); // alias
+        assert_eq!(named_key_keycode("up"),        Some(126_u16));
+        assert_eq!(named_key_keycode("down"),      Some(125_u16));
+        assert_eq!(named_key_keycode("left"),      Some(123_u16));
+        assert_eq!(named_key_keycode("right"),     Some(124_u16));
+        assert_eq!(named_key_keycode("unknown"),   None);
+        assert_eq!(named_key_keycode(""),          None);
     }
 
     #[test]
-    fn press_key_json_shape() {
-        // spotlight = ⌘3 on the Mirroring window
-        assert_eq!(
-            press_key_json(40374, 353, "3", true),
-            r#"{"pid":40374,"window_id":353,"key":"3","modifiers":["cmd"]}"#
-        );
-        // a plain key (no cmd)
-        assert_eq!(
-            press_key_json(7, 9, "a", false),
-            r#"{"pid":7,"window_id":9,"key":"a"}"#
-        );
+    fn named_key_keycode_arrow_keys_are_distinct() {
+        let up    = named_key_keycode("up").unwrap();
+        let down  = named_key_keycode("down").unwrap();
+        let left  = named_key_keycode("left").unwrap();
+        let right = named_key_keycode("right").unwrap();
+        // All four arrow key codes must be different from each other
+        assert_ne!(up, down);
+        assert_ne!(up, left);
+        assert_ne!(up, right);
+        assert_ne!(down, left);
+        assert_ne!(down, right);
+        assert_ne!(left, right);
     }
 
     #[test]
@@ -968,9 +1021,4 @@ mod tests {
         assert_eq!(char_to_keycode('中'), None); // non-ASCII → skipped
     }
 
-    #[test]
-    fn json_escape_control_chars() {
-        assert_eq!(json_escape("a\nb"), "a\\nb");
-        assert_eq!(json_escape("\"\\"), "\\\"\\\\");
-    }
 }

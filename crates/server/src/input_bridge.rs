@@ -141,11 +141,9 @@ impl InputInjector {
 /// from one place.
 ///
 /// On non-macOS it drains and discards events (no OS sink available).
-/// `target` = `(cua_driver_path, pid, window_id)` of the Mirroring window, used
-/// for key/text/shortcut injection via cua-driver. `None` → pointer-only.
+/// Input is fully native (CGEvent) — no external binary required.
 pub fn spawn_injector<F>(
     geo: core::coords::SessionGeometry,
-    target: Option<(String, i32, u32)>,
     is_allowed: F,
 ) -> InputInjector
 where
@@ -154,7 +152,7 @@ where
     let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
     std::thread::Builder::new()
         .name("input-injector".into())
-        .spawn(move || injector_loop(geo, target, rx, is_allowed))
+        .spawn(move || injector_loop(geo, rx, is_allowed))
         .expect("spawn input-injector thread");
     InputInjector { tx }
 }
@@ -162,17 +160,13 @@ where
 #[cfg(target_os = "macos")]
 fn injector_loop<F>(
     geo: core::coords::SessionGeometry,
-    target: Option<(String, i32, u32)>,
     rx: std::sync::mpsc::Receiver<InputEvent>,
     is_allowed: F,
 ) where
     F: Fn() -> bool,
 {
     use core::input::{inject, CgEventSink};
-    let mut sink = match target {
-        Some((cua, pid, wid)) => CgEventSink::with_cua(cua, pid, wid),
-        None => CgEventSink::new(),
-    };
+    let mut sink = CgEventSink::new();
     // HID-tap / scroll-wheel events land only on the *frontmost* app. Re-assert
     // frontmost when (and only when) focus was stolen — the check is a cheap
     // in-process query, while the `open -a` re-activation is throttled so a brief
@@ -200,7 +194,6 @@ fn injector_loop<F>(
 #[cfg(not(target_os = "macos"))]
 fn injector_loop<F>(
     _geo: core::coords::SessionGeometry,
-    _target: Option<(String, i32, u32)>,
     rx: std::sync::mpsc::Receiver<InputEvent>,
     _is_allowed: F,
 ) where

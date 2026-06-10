@@ -155,6 +155,101 @@ mod imp {
         Ok((win, width, height))
     }
 
+    /// Resolve only the CGWindowID of the current Mirroring window.
+    ///
+    /// Thin wrapper around [`find_mirroring_window`] that discards the `SCWindow`
+    /// and dimensions — used by [`screenshot_mirroring_png`] so the ID extraction
+    /// logic lives in one place.
+    pub(super) fn mirroring_window_id() -> anyhow::Result<u32> {
+        let (win, _, _) = find_mirroring_window()?;
+        Ok(win.window_id())
+    }
+
+    /// Build the `screencapture` argument list for the given window id and output
+    /// path string.  Factored out so it can be unit-tested without hardware.
+    ///
+    /// Flags:
+    ///   `-x`  — no sound effect on capture
+    ///   `-o`  — no drop shadow (shadow-free rectangle, matches the bare phone UI)
+    ///   `-l <id>` — capture exactly this CGWindowID (works for non-frontmost windows)
+    pub(super) fn screencapture_args(window_id: u32, out_path: &str) -> Vec<String> {
+        vec![
+            "-x".into(),
+            "-o".into(),
+            "-l".into(),
+            window_id.to_string(),
+            out_path.into(),
+        ]
+    }
+
+    /// Capture the iPhone Mirroring window as a PNG byte vector.
+    ///
+    /// # Why `/usr/sbin/screencapture` instead of `SCScreenshotManager`?
+    ///
+    /// The `screencapturekit` crate (0.3.6) lacks a clean one-shot screenshot API;
+    /// `SCScreenshotManager` is available from macOS 14.0 but the crate binding
+    /// is async/callback-heavy and would require a new Tokio runtime or unsafe
+    /// CFRunLoop juggling.  The built-in `/usr/sbin/screencapture` CLI is stable,
+    /// ships on every macOS version we target (11+), accepts a CGWindowID via `-l`,
+    /// captures non-frontmost windows with `-o` (no shadow), and returns a
+    /// standard PNG that every consumer can use without a custom pixel-format
+    /// conversion.  The daemon already holds the Screen Recording TCC grant
+    /// (required for `CaptureStream::start`); child processes spawned by a
+    /// TCC-granted process inherit that authorization under macOS's responsible-
+    /// process rule, so `screencapture` gets the permission it needs automatically.
+    ///
+    /// # Hardware validation note
+    /// Validated at the API level; live hardware test pending (phone offline at
+    /// time of implementation).  The integration pass should run:
+    ///   `curl http://localhost:<port>/agent/screenshot -o /tmp/test.png`
+    /// and verify the PNG opens correctly.
+    pub fn screenshot_mirroring_png() -> anyhow::Result<Vec<u8>> {
+        // Unique temp path: pid + monotonic counter avoids collisions between
+        // concurrent callers (e.g., two agent requests racing).
+        static SHOT_SEQ: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out_path = std::env::temp_dir().join(format!(
+            "iphone-remote-shot-{}-{seq}.png",
+            std::process::id()
+        ));
+        let out_str = out_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("temp path is not valid UTF-8: {out_path:?}"))?
+            .to_owned();
+
+        let window_id = mirroring_window_id()?;
+        let args = screencapture_args(window_id, &out_str);
+
+        let status = std::process::Command::new("/usr/sbin/screencapture")
+            .args(&args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to spawn /usr/sbin/screencapture: {e}"))?;
+
+        if !status.status.success() {
+            // Best-effort cleanup even on failure.
+            let _ = std::fs::remove_file(&out_path);
+            return Err(anyhow::anyhow!(
+                "screencapture exited {}: {}",
+                status.status,
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+
+        let bytes = std::fs::read(&out_path).map_err(|e| {
+            anyhow::anyhow!(
+                "screencapture reported success but output file is unreadable ({e}): {out_path:?}"
+            )
+        })?;
+        let _ = std::fs::remove_file(&out_path); // best-effort cleanup
+        if bytes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "screencapture wrote an empty file — is the Mirroring window visible?"
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Find the iPhone Mirroring window and build a [`crate::coords::SessionGeometry`]
     /// describing its on-screen content rect, for mapping normalized input
     /// coordinates back to absolute screen points.
@@ -398,7 +493,7 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{find_mirroring_geometry, CaptureStream, FrameCallback};
+pub use imp::{find_mirroring_geometry, screenshot_mirroring_png, CaptureStream, FrameCallback};
 
 // ---------------------------------------------------------------------------
 // Pure geometry construction (testable on every platform).
@@ -476,6 +571,23 @@ impl CaptureStream {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-macOS stub for screenshot_mirroring_png.
+// ---------------------------------------------------------------------------
+
+/// Capture the iPhone Mirroring window as a PNG byte vector.
+///
+/// On non-macOS this always returns an error; the implementation requires
+/// ScreenCaptureKit (window enumeration) and `/usr/sbin/screencapture` (both
+/// macOS-only). See the macOS implementation in `imp::screenshot_mirroring_png`
+/// for the full rationale.
+#[cfg(not(target_os = "macos"))]
+pub fn screenshot_mirroring_png() -> anyhow::Result<Vec<u8>> {
+    Err(anyhow::anyhow!(
+        "screenshot_mirroring_png is only supported on macOS"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +659,59 @@ mod tests {
         let p = crate::coords::to_screen((0.5, 0.5), &geo).unwrap();
         assert!((p.0 - 250.0).abs() < 1e-9);
         assert!((p.1 - 500.0).abs() < 1e-9);
+    }
+
+    // ── screenshot_mirroring_png helpers (pure / no hardware) ───────────────
+
+    /// `screencapture_args` is defined only on macOS (inside `imp`); these tests
+    /// are gated accordingly.
+    #[cfg(target_os = "macos")]
+    mod screenshot_tests {
+        use super::super::imp::screencapture_args;
+
+        #[test]
+        fn screencapture_args_structure() {
+            // Verify the exact argument layout expected by /usr/sbin/screencapture.
+            // -x: no sound, -o: no shadow, -l <id>: window id, then the output path.
+            let args = screencapture_args(12345, "/tmp/test.png");
+            assert_eq!(args.len(), 5, "expected exactly 5 args: {args:?}");
+            assert_eq!(args[0], "-x");
+            assert_eq!(args[1], "-o");
+            assert_eq!(args[2], "-l");
+            assert_eq!(args[3], "12345");
+            assert_eq!(args[4], "/tmp/test.png");
+        }
+
+        #[test]
+        fn screencapture_args_window_id_is_stringified() {
+            let args = screencapture_args(0, "/out.png");
+            assert_eq!(args[3], "0");
+            let args = screencapture_args(u32::MAX, "/out.png");
+            assert_eq!(args[3], u32::MAX.to_string());
+        }
+    }
+
+    /// Temp-path uniqueness test — platform-agnostic (uses the same formula as
+    /// `screenshot_mirroring_png` on macOS and the non-macOS stub shares the
+    /// same naming scheme).
+    #[test]
+    fn screenshot_temp_paths_are_unique() {
+        // Simulate two concurrent path constructions (same pid, different seq).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        let pid = std::process::id();
+        let make = || {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("iphone-remote-shot-{pid}-{seq}.png"))
+        };
+        let p1 = make();
+        let p2 = make();
+        assert_ne!(p1, p2, "two consecutive temp paths must differ: {p1:?} == {p2:?}");
+        // Both must share the same directory.
+        assert_eq!(p1.parent(), p2.parent());
+        // Both must end with .png.
+        assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("png"));
+        assert_eq!(p2.extension().and_then(|e| e.to_str()), Some("png"));
     }
 }

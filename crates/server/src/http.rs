@@ -18,6 +18,7 @@
 //! DENY`, `Referrer-Policy: no-referrer` on every response.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -40,6 +41,66 @@ const INDEX_HTML: &str = include_str!("../../../web/index.html");
 
 /// The cookie name the web client and daemon agree on.
 const SESSION_COOKIE: &str = "phone_session";
+
+// ---------------------------------------------------------------------------
+// Rate limiter (login + agent bearer auth failures)
+// ---------------------------------------------------------------------------
+
+/// In-memory failure tracking for `/login` (wrong password) and failed agent
+/// bearer auth.  After [`AUTH_MAX_FAILURES`] consecutive failures the limiter
+/// locks out all auth attempts for [`AUTH_LOCKOUT_SECS`] seconds.
+///
+/// **Design notes / tradeoffs:**
+/// - Global (not per-IP) to keep the implementation simple and testable.
+///   This daemon fronts a single household: the realistic threat is a brute-
+///   force bot, not a multi-origin attack, and per-IP requires `ConnectInfo`
+///   which is unavailable in axum oneshot tests.
+/// - A success (correct password) resets the failure counter and lifts an
+///   active lockout immediately — legitimate users are never permanently
+///   locked out by their own typos.
+/// - The lockout window is 30 seconds (sliding, reset by a success).
+pub struct AuthLimiter {
+    pub(crate) failures: u32,
+    pub(crate) locked_until: Option<Instant>,
+}
+
+/// Number of consecutive failures that trigger a lockout.
+const AUTH_MAX_FAILURES: u32 = 5;
+
+/// Lockout duration in seconds after hitting [`AUTH_MAX_FAILURES`].
+const AUTH_LOCKOUT_SECS: u64 = 30;
+
+impl AuthLimiter {
+    pub fn new() -> Self {
+        AuthLimiter { failures: 0, locked_until: None }
+    }
+
+    /// Returns `true` if requests should be rejected right now.
+    pub fn is_locked(&self) -> bool {
+        match self.locked_until {
+            Some(until) => Instant::now() < until,
+            None => false,
+        }
+    }
+
+    /// Record an auth failure.  Starts or extends the lockout window once
+    /// the failure count reaches [`AUTH_MAX_FAILURES`].
+    pub fn record_failure(&mut self) {
+        self.failures += 1;
+        if self.failures >= AUTH_MAX_FAILURES {
+            self.locked_until = Some(
+                Instant::now() + std::time::Duration::from_secs(AUTH_LOCKOUT_SECS),
+            );
+        }
+    }
+
+    /// Record a successful auth.  Resets the failure counter and lifts any
+    /// active lockout.
+    pub fn record_success(&mut self) {
+        self.failures = 0;
+        self.locked_until = None;
+    }
+}
 
 /// ICE servers + their precomputed `/turn-creds` JSON, kept together so a TURN
 /// refresh swaps both atomically (see [`AppState::ice`]).
@@ -81,10 +142,9 @@ pub struct AppState {
     pub current_lease: Arc<Mutex<Option<Lease>>>,
     /// Input injector (decoded events → CgEventSink on its own thread).
     pub injector: InputInjector,
-    /// cua-driver target `(binary_path, pid, window_id)` of the Mirroring window,
-    /// if found — used by the agent API to report `phone_target` (and, later, to
-    /// capture screenshots). `None` = pointer-only (no key/text/shortcut target).
-    pub cua_target: Option<(String, i32, u32)>,
+    /// Rate limiter for login and agent bearer auth failures.
+    /// After 5 consecutive failures requests are rejected with 429 for 30 s.
+    pub auth_limiter: Arc<Mutex<AuthLimiter>>,
 }
 
 /// Build the axum router for the daemon.
@@ -242,13 +302,24 @@ async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let expected = match &state.password {
-        // Open mode: any login succeeds (no password configured).
+        // Open mode: any login succeeds (no password configured); no limiting.
         None => return redirect_with_cookie(&state, "/phone", &headers),
-        Some(p) => p,
+        Some(p) => p.clone(),
     };
-    if core::auth::verify_password(&form.password, expected) {
+    // Check the limiter BEFORE verifying the password (prevents timing oracle).
+    {
+        let limiter = state.auth_limiter.lock().unwrap();
+        if limiter.is_locked() {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            );
+        }
+    }
+    if core::auth::verify_password(&form.password, &expected) {
+        state.auth_limiter.lock().unwrap().record_success();
         redirect_with_cookie(&state, "/phone", &headers)
     } else {
+        state.auth_limiter.lock().unwrap().record_failure();
         let body = LOGIN_HTML.replace("__ERR__", "密码错误");
         let mut resp = Html(body).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
@@ -311,12 +382,12 @@ fn bearer_credential(headers: &HeaderMap) -> Option<&[u8]> {
     Some(v.as_bytes().strip_prefix(b"Bearer ")?.trim_ascii())
 }
 
-/// Return `true` if the request may use the agent API.
+/// Return `true` if the bearer credential matches the configured password.
 ///
-/// When a password is configured the agent must present it as a bearer token
-/// (`Authorization: Bearer <password>`). With no password the daemon is in open
-/// LAN-dev mode and the agent API is open too — same policy as [`is_authed`].
-fn is_agent_authed(state: &AppState, headers: &HeaderMap) -> bool {
+/// Does NOT touch the rate limiter — callers must check / record against the
+/// shared `auth_limiter` themselves so the limiter covers both login and agent
+/// paths with a unified counter.
+fn check_bearer(state: &AppState, headers: &HeaderMap) -> bool {
     match &state.password {
         None => true,
         Some(pw) => bearer_credential(headers).is_some_and(|token| {
@@ -328,18 +399,66 @@ fn is_agent_authed(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
+/// Outcome of an agent auth check (combines lockout + credential verify).
+enum AgentAuth {
+    /// Request may proceed.
+    Ok,
+    /// Auth limiter triggered — respond 429.
+    Locked,
+    /// Credential missing or wrong — respond 401.
+    Denied,
+}
+
+/// Check the agent bearer token and advance the rate limiter.
+///
+/// * Checks the limiter BEFORE credential verification.
+/// * Records a failure (wrong or missing bearer) or success (correct) in the
+///   shared [`AuthLimiter`].
+/// * Open-mode (no password configured): always returns `Ok` without touching
+///   the limiter so open-mode integration tests stay clean.
+fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
+    if state.password.is_none() {
+        return AgentAuth::Ok;
+    }
+    {
+        let limiter = state.auth_limiter.lock().unwrap();
+        if limiter.is_locked() {
+            return AgentAuth::Locked;
+        }
+    }
+    if check_bearer(state, headers) {
+        state.auth_limiter.lock().unwrap().record_success();
+        AgentAuth::Ok
+    } else {
+        state.auth_limiter.lock().unwrap().record_failure();
+        AgentAuth::Denied
+    }
+}
+
 /// `GET /agent/status` — auth/health probe. `{"ok":true,"phone_target":bool}`.
 ///
-/// `phone_target` reports whether the daemon has a cua-driver window target
-/// (needed for key/text/shortcut); pointer/tap/scroll work regardless.
+/// `phone_target` is `true` when an iPhone Mirroring window is currently
+/// findable on-screen (cheap `find_mirroring_geometry` probe at request time;
+/// macOS only — non-macOS always returns `false`).  This replaces the old
+/// cua-driver window-target check: input is now fully native (CGEvent), so no
+/// external binary is needed for key/text/shortcut — `phone_target` simply
+/// tells the agent whether the Mirroring window is up right now.
 async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !is_agent_authed(&state, &headers) {
-        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => return with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        ),
+        AgentAuth::Denied => return with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        ),
+        AgentAuth::Ok => {}
     }
-    let body = format!(
-        r#"{{"ok":true,"phone_target":{}}}"#,
-        state.cua_target.is_some()
-    );
+    // Cheap probe: returns Ok if ScreenCaptureKit can see the window.
+    #[cfg(target_os = "macos")]
+    let phone_target = core::capture::find_mirroring_geometry().is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let phone_target = false;
+    let body = format!(r#"{{"ok":true,"phone_target":{phone_target}}}"#);
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
@@ -361,8 +480,14 @@ async fn agent_input(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if !is_agent_authed(&state, &headers) {
-        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => return with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        ),
+        AgentAuth::Denied => return with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        ),
+        AgentAuth::Ok => {}
     }
     let event = match crate::input_bridge::decode_control(&body) {
         Some(ev) => ev,
@@ -390,50 +515,20 @@ async fn agent_input(
 
 /// `GET /agent/screenshot` — current phone screen as a PNG.
 ///
-/// Captures the Mirroring window via `cua-driver get_window_state` (targets the
-/// window by pid/window_id, so it works regardless of which app is frontmost —
-/// unlike a CGEvent path). Gives a connect-in agent vision through the daemon
-/// without needing to decode the WebRTC stream. 503 if no cua-driver target.
+/// Captures the Mirroring window via [`core::capture::screenshot_mirroring_png`]
+/// (uses `screencapture -l <window_id>` internally — no external cua-driver
+/// dependency).  503 if the Mirroring window is not currently found.
 async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !is_agent_authed(&state, &headers) {
-        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => return with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        ),
+        AgentAuth::Denied => return with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        ),
+        AgentAuth::Ok => {}
     }
-    let (cua, pid, wid) = match &state.cua_target {
-        Some(t) => t.clone(),
-        None => {
-            return with_security_headers(
-                (StatusCode::SERVICE_UNAVAILABLE, "no phone target (cua-driver)").into_response(),
-            );
-        }
-    };
-    // Unique temp path (no external state; pid + monotonic counter).
-    static SHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let out_path = std::env::temp_dir().join(format!(
-        "iphone-remote-shot-{}-{seq}.png",
-        std::process::id()
-    ));
-
-    let png = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-        let json = format!(
-            r#"{{"pid":{pid},"window_id":{wid},"capture_mode":"vision","screenshot_out_file":"{}"}}"#,
-            out_path.display()
-        );
-        let status = std::process::Command::new(&cua)
-            .args(["call", "get_window_state", &json])
-            .output()?;
-        if !status.status.success() {
-            return Err(std::io::Error::other(format!(
-                "cua-driver get_window_state failed: {}",
-                String::from_utf8_lossy(&status.stderr)
-            )));
-        }
-        let bytes = std::fs::read(&out_path)?;
-        let _ = std::fs::remove_file(&out_path); // best-effort cleanup
-        Ok(bytes)
-    })
-    .await;
-
+    let png = tokio::task::spawn_blocking(core::capture::screenshot_mirroring_png).await;
     match png {
         Ok(Ok(bytes)) if !bytes.is_empty() => {
             let resp = Response::builder()
@@ -441,6 +536,12 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
                 .body(Body::from(bytes))
                 .unwrap();
             with_security_headers(resp)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("agent screenshot: no Mirroring window: {e:#}");
+            with_security_headers(
+                (StatusCode::SERVICE_UNAVAILABLE, "Mirroring window not found").into_response(),
+            )
         }
         other => {
             tracing::warn!("agent screenshot failed: {other:?}");
@@ -552,6 +653,55 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AuthLimiter unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn auth_limiter_not_locked_initially() {
+        let limiter = AuthLimiter::new();
+        assert!(!limiter.is_locked());
+        assert_eq!(limiter.failures, 0);
+    }
+
+    #[test]
+    fn auth_limiter_locks_after_max_failures() {
+        let mut limiter = AuthLimiter::new();
+        for _ in 0..AUTH_MAX_FAILURES {
+            assert!(!limiter.is_locked(), "should not lock before reaching max");
+            limiter.record_failure();
+        }
+        assert!(limiter.is_locked(), "should be locked after max failures");
+    }
+
+    #[test]
+    fn auth_limiter_four_failures_not_locked() {
+        let mut limiter = AuthLimiter::new();
+        for _ in 0..(AUTH_MAX_FAILURES - 1) {
+            limiter.record_failure();
+        }
+        assert!(!limiter.is_locked(), "4 failures should not trigger lockout (max=5)");
+    }
+
+    #[test]
+    fn auth_limiter_success_resets_counter_and_lifts_lockout() {
+        let mut limiter = AuthLimiter::new();
+        for _ in 0..AUTH_MAX_FAILURES {
+            limiter.record_failure();
+        }
+        assert!(limiter.is_locked());
+        limiter.record_success();
+        assert!(!limiter.is_locked(), "success should lift active lockout");
+        assert_eq!(limiter.failures, 0, "success should reset failure counter");
+    }
+
+    #[test]
+    fn auth_limiter_lockout_expires_after_duration() {
+        let mut limiter = AuthLimiter::new();
+        // Manually set a lockout that already expired.
+        limiter.failures = AUTH_MAX_FAILURES;
+        limiter.locked_until = Some(Instant::now() - std::time::Duration::from_secs(1));
+        assert!(!limiter.is_locked(), "expired lockout should not block requests");
+    }
 
     #[test]
     fn ice_servers_stun_only_by_default() {

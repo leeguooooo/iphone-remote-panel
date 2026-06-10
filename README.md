@@ -77,10 +77,10 @@ agent would corrupt each other's gestures fighting over the same cursor.
   Mirroring** set up and signed in. Validated on macOS 15 Sequoia / 26 Tahoe;
   see the [Roadmap](#roadmap) for macOS 27 support.
 - Rust toolchain (to build) — `cargo`.
-- **`cua-driver`** (external) for key / text / shortcut injection. Pointer input
-  (tap / scroll) works without it; it is only needed for the keyboard and Home /
-  Spotlight / App-Switcher shortcuts. Point the daemon at it with the `CUA_DRIVER`
-  env var (an absolute path — a LaunchAgent runs with a minimal `PATH`).
+- **Zero external runtime dependencies** — all input (tap, scroll, text, key,
+  shortcuts) is injected via native `CGEvent` directly, and screenshots use the
+  built-in `screencapture` CLI. No third-party binary (`cua-driver` or otherwise)
+  is required at runtime.
 - *(optional)* a Cloudflare TURN key for cross-network (cellular / remote) access.
 
 ## Install
@@ -112,7 +112,6 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | `PHONE_REMOTE_HOST` | `127.0.0.1` | Listen address (`0.0.0.0` for LAN). |
 | `PHONE_REMOTE_PORT` | `8787` | Listen port. |
 | `PHONE_REMOTE_PASSWORD` | *(none)* | Shared password (cookie login + agent bearer). |
-| `CUA_DRIVER` | *(local path)* | Absolute path to the cua-driver binary (key/text/shortcut). |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → ephemeral relay creds for cross-network. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Static TURN server (alternative to Cloudflare). |
 

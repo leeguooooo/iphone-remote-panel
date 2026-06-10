@@ -82,9 +82,11 @@
 <p>Returns <code>200</code> with JSON when the bearer is valid.</p>
 <pre><code>{ "ok": true, "phone_target": true }</code></pre>
 <p class="muted">
-  <code>phone_target</code> is <code>true</code> when the daemon found a cua-driver window target
-  (needed for <code>text</code>/<code>key</code>/<code>shortcut</code> and for screenshots).
-  Pointer events (<code>tap</code>/<code>scroll</code>) work either way.
+  <code>phone_target</code> is <code>true</code> when the iPhone Mirroring window is currently
+  visible on-screen (a cheap ScreenCaptureKit probe at request time). All event types —
+  <code>tap</code>, <code>scroll</code>, <code>text</code>, <code>key</code>,
+  <code>shortcut</code> — use fully native <code>CGEvent</code> injection; no external
+  binary is required.
 </p>
 
 <h3><span class="method post">POST</span> <span class="ep">/agent/input</span></h3>
@@ -112,9 +114,10 @@
 
 <h3><span class="method get">GET</span> <span class="ep">/agent/screenshot</span></h3>
 <p>
-  Returns <code>image/png</code> of the current phone screen, captured via cua-driver (targets the
-  window by id, so it works regardless of which app is frontmost). <code>503</code> if the daemon
-  has no cua-driver target.
+  Returns <code>image/png</code> of the current phone screen, captured via the built-in
+  <code>screencapture</code> CLI (targets the Mirroring window by id, so it works regardless
+  of which app is frontmost — no external binary required). <code>503</code> if the Mirroring
+  window is not currently found.
 </p>
 
 <h2>Example — a see-decide-act loop</h2>
