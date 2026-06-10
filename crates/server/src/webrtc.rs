@@ -58,10 +58,27 @@ pub async fn build_viewer_pc(
     let registry = Registry::new();
     let registry = register_default_interceptors(registry, &mut media_engine)?;
 
+    let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+
+    // Disable mDNS candidate obfuscation. webrtc-rs defaults to advertising LAN host
+    // candidates as random `<uuid>.local` mDNS names instead of raw IPs. That needs
+    // multicast to resolve — which silently dies behind a VPN (Cloudflare WARP, etc.)
+    // with "No route to host", so the phone never learns the Mac's real LAN IP and the
+    // only surviving candidate is a useless VPN-egress srflx → ICE fails the instant the
+    // page opens. This is a self-hosted LAN-first tool: advertise the real IP directly.
+    setting_engine
+        .set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+
+    // Only gather candidates on physical interfaces. VPN tunnels (utun*/ipsec*/ppp*) add
+    // dead POINTOPOINT candidates (a WARP host has 10+ utun NICs) that bloat the SDP, slow
+    // gathering, and never pair with a LAN phone. Keep en*/bridge* (Wi-Fi/Ethernet) only.
+    setting_engine.set_interface_filter(Box::new(|name: &str| {
+        !(name.starts_with("utun") || name.starts_with("ipsec") || name.starts_with("ppp"))
+    }));
+
     // Drop IPv6 link-local (`fe80::/10`) candidates: webrtc-rs fails to bind them
     // ("Can't assign requested address", os error 49), which spams the log and can
     // stall candidate pairing. LAN (IPv4), STUN and TURN don't need them.
-    let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
     setting_engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| match ip {
         std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
         std::net::IpAddr::V4(_) => true,
