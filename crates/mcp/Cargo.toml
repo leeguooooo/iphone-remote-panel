@@ -1,0 +1,45 @@
+[package]
+name = "iphone-remote-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP stdio server that wraps the iphone-remote daemon's agent HTTP API"
+
+[[bin]]
+name = "iphone-remote-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP protocol — official Rust SDK.
+# Version 1.7.0 (stable as of 2026-06).  Features:
+#   server        — ServerHandler trait + tool routing macros (default-on)
+#   macros        — #[tool], #[tool_router] proc-macro (default-on)
+#   transport-io  — tokio stdio transport for the MCP stdio server mode
+#   schemars      — JSON Schema generation for tool parameter types
+rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "0.8"
+
+# HTTP client — same version / features as crates/server so the workspace
+# resolves a single copy of the crate.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Logging — stderr so it does not contaminate the MCP stdio pipe
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Base64 encode for PNG → MCP image content
+base64 = "0.22"
+
+# Structured errors
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# Used in unit tests for JSON assertion helpers
+serde_json = "1"
