@@ -16,33 +16,20 @@ set -eu
 
 # ── Inline sign helper (fallback when scripts/sign.sh is not available) ───────
 # Defined early so it is available throughout the script.
+# Ad-hoc sign locally. Why ad-hoc (`codesign --sign -`) over a self-signed cert:
+# a self-signed cert lives in the login keychain, and codesign then pops a
+# keychain-password dialog to use its private key — which blocks any unattended
+# install (and is friction even for a present user). Ad-hoc signing needs no
+# keychain, no cert, and no prompt: the signature is keyed on the binary's
+# cdhash + the Info.plist bundle id, which is a stable identity for a given build
+# — so TCC grants (Screen Recording / Accessibility) persist until you UPDATE to
+# a new release (then re-grant once). For zero-friction persistent grants across
+# updates, ship a Developer-ID-signed + notarized release from CI instead.
 _inline_sign() {
     local app="$1"
-    local cert_name="iPhoneRemote Local Signing"
-    local existing
-    existing="$(security find-certificate -c "$cert_name" \
-                ~/Library/Keychains/login.keychain-db 2>/dev/null || true)"
-    if [ -z "$existing" ]; then
-        warn "Self-signed cert not found — creating '$cert_name' in login keychain ..."
-        local tmpd
-        tmpd="$(mktemp -d)"
-        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
-            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" \
-            -subj "/CN=$cert_name/O=iPhoneRemote/OU=Code Signing" 2>/dev/null
-        openssl pkcs12 -export \
-            -in "$tmpd/cert.pem" -inkey "$tmpd/key.pem" \
-            -out "$tmpd/cert.p12" -passout "pass:localonly" -name "$cert_name" 2>/dev/null
-        security import "$tmpd/cert.p12" \
-            -k ~/Library/Keychains/login.keychain-db \
-            -P "localonly" -T /usr/bin/codesign -f pkcs12
-        rm -rf "$tmpd"
-        ok "Self-signed cert created: $cert_name"
-    fi
-    codesign --force --options runtime --sign "$cert_name" --timestamp=none \
-        "$app/Contents/MacOS/iphone-remote"
-    codesign --force --options runtime --sign "$cert_name" --timestamp=none \
-        "$app"
-    ok "Signed with: $cert_name"
+    codesign --force --sign - "$app/Contents/MacOS/iphone-remote"
+    codesign --force --sign - "$app"
+    ok "Ad-hoc signed (no keychain prompt; re-grant TCC after an update)"
 }
 
 # ── Configuration ─────────────────────────────────────────────────────────────
