@@ -61,12 +61,18 @@ pub enum SignalMsg {
 /// Acquires the control lease for `session_id`, builds the PeerConnection, sends
 /// the offer, and pumps signaling messages until the socket closes.
 pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id: String) {
-    // Acquire the human control lease for this viewer.
-    {
+    // Acquire the human control lease for this viewer. Keep OUR lease handle
+    // locally: with two concurrent viewers, the newer acquire() supersedes the
+    // older one (last-connected-wins), and teardown must only release/clear the
+    // shared slot if WE are still the current holder — a blind take() would rip
+    // the newer viewer's lease out of the slot when the older session closes
+    // first, silently killing the newer viewer's input (issue #8).
+    let my_lease = {
         let mut control = recover(state.control.lock());
         let lease = control.acquire(core::control::Holder::Human(session_id.clone()), now_secs());
-        *recover(state.current_lease.lock()) = Some(lease);
-    }
+        *recover(state.current_lease.lock()) = Some(lease.clone());
+        lease
+    };
 
     // Outbound queue: PC callbacks (ICE candidates) and the offer push here.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMsg>();
@@ -132,11 +138,14 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
         }
     }
 
-    // Tear down: release the lease and close the PC.
+    // Tear down: release OUR lease only if we are still the current holder.
+    // If a newer viewer (or an agent) superseded us, the slot holds THEIR lease —
+    // taking/clearing it would silently gate out their input (issue #8).
     {
         let mut control = recover(state.control.lock());
-        if let Some(lease) = recover(state.current_lease.lock()).take() {
-            control.release(&lease);
+        if control.is_current(&my_lease) {
+            control.release(&my_lease);
+            *recover(state.current_lease.lock()) = None;
         }
     }
     let _ = pc.close().await;
