@@ -1,10 +1,14 @@
 name: Release Binaries
 
-# Trigger on version tags (e.g. v0.2.0) pushed to the repo.
+# Trigger on version tags (e.g. v0.2.0) pushed to the repo,
+# OR manually via the Actions UI (workflow_dispatch).
+# On a tag push  → full release: build + bundle + sign + upload to GitHub Release.
+# On manual run  → dry-run: build + bundle + upload zip as a workflow artifact only.
 on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: write   # required to create/upload GitHub Release assets
@@ -12,7 +16,7 @@ permissions:
 jobs:
   build-macos:
     name: Build macOS binary & create release
-    runs-on: macos-latest
+    runs-on: macos-14
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -46,7 +50,7 @@ jobs:
           chmod +x target/universal-apple-darwin/release/iphone-remote
 
       # Expose universal binary where make-app.sh expects it
-      - name: Symlink release directory for make-app.sh
+      - name: Copy universal binary to target/release
         run: |
           mkdir -p target/release
           cp target/universal-apple-darwin/release/iphone-remote target/release/iphone-remote
@@ -57,9 +61,7 @@ jobs:
 
       # ── Sign (Developer ID path, only when secrets are present) ──────────────
       - name: Import Developer ID certificate
-        if: >
-          env.APPLE_SIGNING_CERTIFICATE != '' &&
-          env.APPLE_SIGNING_CERTIFICATE_PASSWORD != ''
+        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
         env:
           APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
           APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
@@ -80,21 +82,15 @@ jobs:
           rm -f /tmp/signing_cert.p12
 
       - name: Sign with Developer ID
-        if: >
-          env.APPLE_SIGNING_CERTIFICATE != '' &&
-          env.APPLE_SIGNING_CERTIFICATE_PASSWORD != ''
+        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
         env:
-          APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
           SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
         run: bash scripts/sign.sh "$GITHUB_WORKSPACE/iPhoneRemote.app"
 
       # ── Notarize (only when notarization secrets are present) ──────────────
       # Users get Gatekeeper-clean installs without the "damaged app" prompt.
       - name: Notarize
-        if: >
-          env.APPLE_ID != '' &&
-          env.APPLE_ID_PASSWORD != '' &&
-          env.APPLE_TEAM_ID != ''
+        if: ${{ secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -111,15 +107,10 @@ jobs:
           xcrun stapler staple "$APP"
           rm -f "$ZIP_FOR_NOTARIZE"
 
-      # Ship unsigned app when no Developer ID secrets exist.
+      # Note when shipping an unsigned build (no Developer ID secrets configured).
       # install.sh handles local re-signing on the user's machine.
       - name: Note (unsigned build)
-        if: >
-          env.APPLE_SIGNING_CERTIFICATE == '' ||
-          env.APPLE_SIGNING_CERTIFICATE_PASSWORD == ''
-        env:
-          APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
-          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE == '' || secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD == '' }}
         run: |
           echo "No APPLE_SIGNING_CERTIFICATE secret — shipping unsigned .app."
           echo "install.sh will create a local self-signed cert on the user's machine."
@@ -136,8 +127,11 @@ jobs:
           shasum -a 256 iPhoneRemote.app.zip > iPhoneRemote.app.zip.sha256
           cat iPhoneRemote.app.zip.sha256
 
-      # ── Release ────────────────────────────────────────────────────────────
+      # ── Release (tag push only) ────────────────────────────────────────────
+      # On a workflow_dispatch run there is no tag ref, so we upload as an
+      # artifact instead to allow smoke-testing without creating a release.
       - name: Create GitHub Release and upload assets
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -148,3 +142,13 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact (dry-run / workflow_dispatch)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneRemote-dry-run
+          path: |
+            iPhoneRemote.app.zip
+            iPhoneRemote.app.zip.sha256
+          retention-days: 7

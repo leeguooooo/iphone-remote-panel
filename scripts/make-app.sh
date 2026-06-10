@@ -46,10 +46,13 @@ mkdir -p "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/iphone-remote"
 chmod 755 "$APP/Contents/MacOS/iphone-remote"
 
-# Write Info.plist, substituting version placeholders from template
+# Write Info.plist, substituting version placeholders from template.
+# Uses context-sensitive sed (n command: advance to next line after the key) so
+# the version value is updated regardless of what it was before — bumping the
+# version in Cargo.toml is reflected without touching this script.
 sed \
-    -e "s|<string>0\.1\.0</string>|<string>${CARGO_VERSION}</string>|" \
-    -e "s|<string>1</string>|<string>${BUNDLE_VERSION}</string>|" \
+    -e "/CFBundleShortVersionString/{n; s|<string>[^<]*</string>|<string>${CARGO_VERSION}</string>|;}" \
+    -e "/CFBundleVersion/{n; s|<string>[^<]*</string>|<string>${BUNDLE_VERSION}</string>|;}" \
     "$DEPLOY_DIR/Info.plist" \
     > "$APP/Contents/Info.plist"
 

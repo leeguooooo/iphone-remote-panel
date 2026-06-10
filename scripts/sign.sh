@@ -25,6 +25,52 @@ APP="${1:-"$(pwd)/iPhoneRemote.app"}"
 CERT_NAME="iPhoneRemote Local Signing"
 BUNDLE_ID="work.pwtk.iphone-remote"
 
+# ── Helper: openssl fallback for self-signed cert import ─────────────────────
+# Must be defined before any code path that calls it.
+# Only called when 'security create-keychain-cert' is unavailable.
+_create_selfsigned_cert_via_openssl() {
+    local name="$1"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    local key="$tmpdir/key.pem"
+    local cert="$tmpdir/cert.pem"
+    local p12="$tmpdir/cert.p12"
+    local pass="iphone-remote-local-only"
+
+    # Generate key + self-signed cert
+    openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+        -keyout "$key" -out "$cert" \
+        -subj "/CN=$name/O=iPhoneRemote/OU=Code Signing" \
+        -extensions v3_ca \
+        2>/dev/null
+
+    # Pack into PKCS#12 for Keychain import
+    openssl pkcs12 -export \
+        -in "$cert" -inkey "$key" \
+        -out "$p12" \
+        -passout "pass:$pass" \
+        -name "$name" \
+        2>/dev/null
+
+    # Import into login keychain; mark as trusted for Code Signing
+    security import "$p12" \
+        -k ~/Library/Keychains/login.keychain-db \
+        -P "$pass" \
+        -T /usr/bin/codesign \
+        -f pkcs12
+
+    # Trust the cert for Code Signing
+    local cert_sha256
+    cert_sha256="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 \
+                   | sed 's/.*=//;s/://g')"
+    security set-key-partition-list \
+        -S apple-tool:,apple: \
+        -k "" \
+        ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+
+    rm -rf "$tmpdir"
+}
+
 # ── Resolve signing identity ─────────────────────────────────────────────────
 if [ -n "${SIGN_IDENTITY:-}" ]; then
     IDENTITY="$SIGN_IDENTITY"
@@ -113,48 +159,3 @@ else
 fi
 
 echo "Signing complete."
-
-# ── Helper: openssl fallback for self-signed cert import ─────────────────────
-# Only called when 'security create-keychain-cert' is unavailable.
-_create_selfsigned_cert_via_openssl() {
-    local name="$1"
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    local key="$tmpdir/key.pem"
-    local cert="$tmpdir/cert.pem"
-    local p12="$tmpdir/cert.p12"
-    local pass="iphone-remote-local-only"
-
-    # Generate key + self-signed cert
-    openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
-        -keyout "$key" -out "$cert" \
-        -subj "/CN=$name/O=iPhoneRemote/OU=Code Signing" \
-        -extensions v3_ca \
-        2>/dev/null
-
-    # Pack into PKCS#12 for Keychain import
-    openssl pkcs12 -export \
-        -in "$cert" -inkey "$key" \
-        -out "$p12" \
-        -passout "pass:$pass" \
-        -name "$name" \
-        2>/dev/null
-
-    # Import into login keychain; mark as trusted for Code Signing
-    security import "$p12" \
-        -k ~/Library/Keychains/login.keychain-db \
-        -P "$pass" \
-        -T /usr/bin/codesign \
-        -f pkcs12
-
-    # Trust the cert for Code Signing
-    local cert_sha256
-    cert_sha256="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 \
-                   | sed 's/.*=//;s/://g')"
-    security set-key-partition-list \
-        -S apple-tool:,apple: \
-        -k "" \
-        ~/Library/Keychains/login.keychain-db 2>/dev/null || true
-
-    rm -rf "$tmpdir"
-}
