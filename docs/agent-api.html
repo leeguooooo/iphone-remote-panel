@@ -61,12 +61,26 @@
 
 <h2>Authentication</h2>
 <p>
-  Every <code>/agent/*</code> endpoint takes the daemon password as a bearer token:
+  Every <code>/agent/*</code> endpoint requires a bearer token. Two modes:
 </p>
-<pre><code>Authorization: Bearer &lt;PHONE_REMOTE_PASSWORD&gt;</code></pre>
+<table>
+  <tr><th>Mode</th><th>When</th><th>Token to use</th></tr>
+  <tr>
+    <td><strong>Dedicated token</strong></td>
+    <td><code>PHONE_REMOTE_AGENT_TOKEN</code> is set on the daemon</td>
+    <td>That token — the password is no longer accepted as a bearer</td>
+  </tr>
+  <tr>
+    <td><strong>Password fallback</strong> (legacy)</td>
+    <td><code>PHONE_REMOTE_AGENT_TOKEN</code> is unset</td>
+    <td><code>PHONE_REMOTE_PASSWORD</code></td>
+  </tr>
+</table>
+<pre><code>Authorization: Bearer &lt;PHONE_REMOTE_AGENT_TOKEN or PHONE_REMOTE_PASSWORD&gt;</code></pre>
 <p class="muted">
-  When the daemon runs with no password (open LAN-dev mode) the agent API is open too — the same
-  policy as the browser cookie gate. The bearer is compared in length-checked constant time.
+  When the daemon runs with no password and no agent token (open LAN-dev mode) the agent
+  API is open too — the same policy as the browser cookie gate. The bearer is compared in
+  length-checked constant time.
 </p>
 
 <h2>Endpoints</h2>
@@ -146,9 +160,9 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"scroll","x":0.5,"y":
 </aside>
 <aside class="note">
   <strong>CJK-IME caveat.</strong> <code>text</code> sends real US keycodes (capitals via a real
-  Shift key). If the iPhone keyboard is on Chinese Pinyin, number keys are hijacked as
-  candidate-selectors (e.g. <code>a1</code> → 啊). For literal Latin + digits, switch the phone to
-  the English ABC keyboard first. Real CJK input needs an on-phone IME (out of scope).
+  Shift key). If the iPhone keyboard is on Chinese Pinyin, digits become candidate-selectors
+  (e.g. <code>a1b2c3</code> → <code>啊不c3</code>). For literal Latin + digits, switch the phone
+  to the English ABC keyboard first. Real CJK input needs the on-phone IME and is out of scope.
 </aside>
 <aside class="note">
   <strong>Vision in v1.</strong> <code>/agent/screenshot</code> is the daemon-native way to see.
