@@ -1,4 +1,4 @@
-//! `iphone-remote-mcp` — MCP stdio server wrapping the iphone-remote daemon's
+//! `iphone-use-mcp` — MCP stdio server wrapping the iphone-use daemon's
 //! agent HTTP API.
 //!
 //! # Usage
@@ -6,7 +6,7 @@
 //! ```
 //! PHONE_REMOTE_URL=http://192.168.1.x:8787 \
 //! PHONE_REMOTE_TOKEN=your-password \
-//!   iphone-remote-mcp
+//!   iphone-use-mcp
 //! ```
 //!
 //! The process speaks the Model Context Protocol over stdin/stdout.  Add it to
@@ -34,13 +34,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the daemon client from env.
     let daemon = client::DaemonClient::from_env();
-    tracing::info!(url = %daemon.base_url(), "iphone-remote-mcp starting");
+    tracing::info!(url = %daemon.base_url(), "iphone-use-mcp starting");
 
     // Run until the MCP client closes the pipe.
     let handler = server::PhoneHandler::new(daemon);
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
 
-    tracing::info!("iphone-remote-mcp exiting");
+    tracing::info!("iphone-use-mcp exiting");
     Ok(())
 }

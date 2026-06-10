@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  iPhone Remote — WebRTC web client  (web/index.html)
+  iphone-use — WebRTC web client  (web/index.html)
   =====================================================
   Served at /phone (auth-gated).  Daemon is the OFFERER.
   Signaling:  WebSocket /ws
@@ -415,7 +415,7 @@
 
 <script>
 /* ================================================================
-   iPhone Remote — WebRTC client
+   iphone-use — WebRTC client
    Contract legend:
      [SIG] signaling (/ws)  [ICE] /turn-creds + ICE  [CH] data channels
      [TOUCH] Pointer Events  [iOS] Safari notes  [v1] parity affordance
@@ -757,7 +757,7 @@ async function pollStats() {
           const localType  = local  ? local.candidateType  : '?';
           const remoteType = remote ? remote.candidateType : '?';
           console.log(
-            `[iphone-remote] active candidate-pair: local=${localType} remote=${remoteType}` +
+            `[iphone-use] active candidate-pair: local=${localType} remote=${remoteType}` +
             (FORCE_RELAY ? '  ← ?relay=1 mode (expect relay/relay)' : '')
           );
           _candidateTypeLogged = true;

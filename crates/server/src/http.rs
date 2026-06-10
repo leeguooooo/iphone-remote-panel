@@ -299,7 +299,7 @@ async fn phone(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
 /// The login form HTML (self-contained, no external assets).
 const LOGIN_HTML: &str = r#"<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · iPhone Remote</title>
+<title>登录 · iphone-use</title>
 <style>
 :root{color-scheme:dark}
 html,body{margin:0;height:100%;background:#08090c;color:#eef2ff;
@@ -316,7 +316,7 @@ button{background:#4f8cff;border:1px solid #4f8cff;color:#fff;border-radius:12px
 .err{color:#ff5a66;font-size:13px;min-height:1em}
 </style></head><body>
 <form method="POST" action="/login">
-  <h1>iPhone Remote</h1>
+  <h1>iphone-use</h1>
   <div class="err">__ERR__</div>
   <input type="password" name="password" placeholder="密码" autofocus
     autocomplete="current-password" />
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn embedded_index_html_is_the_client() {
         // include_str! must pick up web/index.html (the WebRTC client).
-        assert!(INDEX_HTML.contains("iPhone Remote"));
+        assert!(INDEX_HTML.contains("iphone-use"));
         assert!(INDEX_HTML.contains("/ws"));
         assert!(INDEX_HTML.contains("turn-creds"));
     }

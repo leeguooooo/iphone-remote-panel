@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# scripts/sign.sh — codesign iPhoneRemote.app with a stable identity
+# scripts/sign.sh — codesign iPhoneUse.app with a stable identity
 #
 # Usage:
 #   ./scripts/sign.sh [APP_PATH]
 #
-# APP_PATH defaults to ./iPhoneRemote.app
+# APP_PATH defaults to ./iPhoneUse.app
 #
 # Identity selection (first match wins):
 #   1. $SIGN_IDENTITY env var  — use verbatim (Developer ID Application or cert name)
 #   2. Any "Developer ID Application" cert in the login keychain
-#   3. Self-signed "iPhoneRemote Local Signing" cert (created if absent)
+#   3. Self-signed "iPhoneUse Local Signing" cert (created if absent)
 #
 # Why a STABLE identity matters:
 #   TCC grants (Screen Recording, Accessibility) are keyed on the Designated
@@ -21,9 +21,9 @@
 #
 set -eu
 
-APP="${1:-"$(pwd)/iPhoneRemote.app"}"
-CERT_NAME="iPhoneRemote Local Signing"
-BUNDLE_ID="work.pwtk.iphone-remote"
+APP="${1:-"$(pwd)/iPhoneUse.app"}"
+CERT_NAME="iPhoneUse Local Signing"
+BUNDLE_ID="com.leeguoo.iphone-use"
 
 # ── Helper: openssl fallback for self-signed cert import ─────────────────────
 # Must be defined before any code path that calls it.
@@ -35,12 +35,12 @@ _create_selfsigned_cert_via_openssl() {
     local key="$tmpdir/key.pem"
     local cert="$tmpdir/cert.pem"
     local p12="$tmpdir/cert.p12"
-    local pass="iphone-remote-local-only"
+    local pass="iphone-use-local-only"
 
     # Generate key + self-signed cert
     openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
         -keyout "$key" -out "$cert" \
-        -subj "/CN=$name/O=iPhoneRemote/OU=Code Signing" \
+        -subj "/CN=$name/O=iPhoneUse/OU=Code Signing" \
         -extensions v3_ca \
         2>/dev/null
 
@@ -120,7 +120,7 @@ if [ ! -d "$APP" ]; then
     exit 1
 fi
 
-BINARY="$APP/Contents/MacOS/iphone-remote"
+BINARY="$APP/Contents/MacOS/iphone-use"
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: binary missing inside bundle: $BINARY" >&2
     exit 1

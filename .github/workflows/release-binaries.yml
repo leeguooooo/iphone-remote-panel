@@ -41,25 +41,25 @@ jobs:
       # ── Build ────────────────────────────────────────────────────────────────
       # Build for both Apple Silicon and Intel; lipo them into a universal binary.
       - name: Build (arm64)
-        run: cargo build --release --locked --bin iphone-remote --target aarch64-apple-darwin
+        run: cargo build --release --locked --bin iphone-use --target aarch64-apple-darwin
 
       - name: Build (x86_64)
-        run: cargo build --release --locked --bin iphone-remote --target x86_64-apple-darwin
+        run: cargo build --release --locked --bin iphone-use --target x86_64-apple-darwin
 
       - name: Create universal binary
         run: |
           mkdir -p target/universal-apple-darwin/release
           lipo -create \
-            target/aarch64-apple-darwin/release/iphone-remote \
-            target/x86_64-apple-darwin/release/iphone-remote \
-            -output target/universal-apple-darwin/release/iphone-remote
-          chmod +x target/universal-apple-darwin/release/iphone-remote
+            target/aarch64-apple-darwin/release/iphone-use \
+            target/x86_64-apple-darwin/release/iphone-use \
+            -output target/universal-apple-darwin/release/iphone-use
+          chmod +x target/universal-apple-darwin/release/iphone-use
 
       # Expose universal binary where make-app.sh expects it
       - name: Copy universal binary to target/release
         run: |
           mkdir -p target/release
-          cp target/universal-apple-darwin/release/iphone-remote target/release/iphone-remote
+          cp target/universal-apple-darwin/release/iphone-use target/release/iphone-use
 
       # ── Bundle ────────────────────────────────────────────────────────────────
       - name: Build .app bundle
@@ -91,7 +91,7 @@ jobs:
         if: ${{ env.HAS_SIGNING == 'true' }}
         env:
           SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
-        run: bash scripts/sign.sh "$GITHUB_WORKSPACE/iPhoneRemote.app"
+        run: bash scripts/sign.sh "$GITHUB_WORKSPACE/iPhoneUse.app"
 
       # ── Notarize (only when notarization secrets are present) ──────────────
       # Users get Gatekeeper-clean installs without the "damaged app" prompt.
@@ -102,7 +102,7 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          APP="$GITHUB_WORKSPACE/iPhoneRemote.app"
+          APP="$GITHUB_WORKSPACE/iPhoneUse.app"
           ZIP_FOR_NOTARIZE="$(mktemp).zip"
           ditto -c -k --keepParent "$APP" "$ZIP_FOR_NOTARIZE"
           xcrun notarytool submit "$ZIP_FOR_NOTARIZE" \
@@ -125,13 +125,13 @@ jobs:
       - name: Zip .app bundle
         run: |
           cd "$GITHUB_WORKSPACE"
-          ditto -c -k --keepParent iPhoneRemote.app iPhoneRemote.app.zip
+          ditto -c -k --keepParent iPhoneUse.app iPhoneUse.app.zip
 
       - name: Generate SHA-256 checksum
         run: |
           cd "$GITHUB_WORKSPACE"
-          shasum -a 256 iPhoneRemote.app.zip > iPhoneRemote.app.zip.sha256
-          cat iPhoneRemote.app.zip.sha256
+          shasum -a 256 iPhoneUse.app.zip > iPhoneUse.app.zip.sha256
+          cat iPhoneUse.app.zip.sha256
 
       # ── Release (tag push only) ────────────────────────────────────────────
       # On a workflow_dispatch run there is no tag ref, so we upload as an
@@ -141,8 +141,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            iPhoneRemote.app.zip
-            iPhoneRemote.app.zip.sha256
+            iPhoneUse.app.zip
+            iPhoneUse.app.zip.sha256
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -153,8 +153,8 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: iPhoneRemote-dry-run
+          name: iPhoneUse-dry-run
           path: |
-            iPhoneRemote.app.zip
-            iPhoneRemote.app.zip.sha256
+            iPhoneUse.app.zip
+            iPhoneUse.app.zip.sha256
           retention-days: 7

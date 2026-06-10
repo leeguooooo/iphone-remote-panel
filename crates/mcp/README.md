@@ -1,16 +1,16 @@
-# iphone-remote-mcp
+# iphone-use-mcp
 
-MCP stdio server that wraps the `iphone-remote` daemon's agent HTTP API,
+MCP stdio server that wraps the `iphone-use` daemon's agent HTTP API,
 giving MCP clients (Claude Desktop, Claude Code, etc.) native tool access
 to an iPhone via iPhone Mirroring.
 
 ## Prerequisites
 
-The `iphone-remote` daemon must already be running on the Mac that has iPhone
+The `iphone-use` daemon must already be running on the Mac that has iPhone
 Mirroring open:
 
 ```bash
-iphone-remote serve
+iphone-use serve
 ```
 
 ## Installation
@@ -18,8 +18,8 @@ iphone-remote serve
 Build from the workspace:
 
 ```bash
-cargo build --release -p iphone-remote-mcp
-# Binary at: target/release/iphone-remote-mcp
+cargo build --release -p iphone-use-mcp
+# Binary at: target/release/iphone-use-mcp
 ```
 
 ## Configuration
@@ -36,8 +36,8 @@ cargo build --release -p iphone-remote-mcp
 ```json
 {
   "mcpServers": {
-    "iphone-remote": {
-      "command": "/path/to/iphone-remote-mcp",
+    "iphone-use": {
+      "command": "/path/to/iphone-use-mcp",
       "env": {
         "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
         "PHONE_REMOTE_TOKEN": "your-password"
@@ -52,8 +52,8 @@ cargo build --release -p iphone-remote-mcp
 ```json
 {
   "mcpServers": {
-    "iphone-remote": {
-      "command": "/path/to/iphone-remote-mcp",
+    "iphone-use": {
+      "command": "/path/to/iphone-use-mcp",
       "env": {
         "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
         "PHONE_REMOTE_TOKEN": "your-password"
@@ -68,8 +68,8 @@ Remote Mac (daemon on a different machine on the LAN):
 ```json
 {
   "mcpServers": {
-    "iphone-remote": {
-      "command": "/path/to/iphone-remote-mcp",
+    "iphone-use": {
+      "command": "/path/to/iphone-use-mcp",
       "env": {
         "PHONE_REMOTE_URL": "http://192.168.1.50:8787",
         "PHONE_REMOTE_TOKEN": "your-password"

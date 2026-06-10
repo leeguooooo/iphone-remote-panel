@@ -79,7 +79,7 @@ pub struct ShortcutParams {
 // PhoneHandler
 // ---------------------------------------------------------------------------
 
-/// MCP server that forwards tool calls to the iphone-remote daemon.
+/// MCP server that forwards tool calls to the iphone-use daemon.
 #[derive(Clone)]
 pub struct PhoneHandler {
     daemon: DaemonClient,
@@ -198,7 +198,7 @@ impl PhoneHandler {
     // phone_status
     // -----------------------------------------------------------------------
 
-    #[tool(description = "Query the iphone-remote daemon status. \
+    #[tool(description = "Query the iphone-use daemon status. \
         Returns a JSON object: \
         'ok' (bool) — daemon is reachable; \
         'phone_target' (bool) — an iPhone Mirroring window is currently on-screen. \
@@ -231,7 +231,7 @@ impl ServerHandler for PhoneHandler {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(Implementation::new(
-                "iphone-remote-mcp",
+                "iphone-use-mcp",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(

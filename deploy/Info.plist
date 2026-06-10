@@ -2,27 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Info.plist for iPhoneRemote.app bundle.
-  Placed at: iPhoneRemote.app/Contents/Info.plist by scripts/make-app.sh.
+  Info.plist for iPhoneUse.app bundle.
+  Placed at: iPhoneUse.app/Contents/Info.plist by scripts/make-app.sh.
 
-  CFBundleIdentifier MUST stay "work.pwtk.iphone-remote" across all releases
+  CFBundleIdentifier MUST stay "com.leeguoo.iphone-use" across all releases
   so that TCC (Screen Recording + Accessibility) grants persist.  Changing it
   forces every user to re-grant.
 -->
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>work.pwtk.iphone-remote</string>
+    <string>com.leeguoo.iphone-use</string>
 
     <key>CFBundleName</key>
-    <string>iPhoneRemote</string>
+    <string>iPhoneUse</string>
 
     <key>CFBundleDisplayName</key>
-    <string>iPhone Remote</string>
+    <string>iphone-use</string>
 
     <!-- Must match the binary filename inside Contents/MacOS/ -->
     <key>CFBundleExecutable</key>
-    <string>iphone-remote</string>
+    <string>iphone-use</string>
+
+    <!-- App icon — Resources/AppIcon.icns, copied in by make-app.sh -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -45,14 +49,14 @@
       macOS shows this string in the Screen Recording permission dialog.
     -->
     <key>NSScreenCaptureUsageDescription</key>
-    <string>iPhone Remote needs to capture the iPhone Mirroring window to stream it to your iPhone over WebRTC.</string>
+    <string>iphone-use needs to capture the iPhone Mirroring window to stream it to your iPhone over WebRTC.</string>
 
     <!--
       Required for CGEventPost (Accessibility) used to drive pointer input
       into the iPhone Mirroring window.
     -->
     <key>NSAppleEventsUsageDescription</key>
-    <string>iPhone Remote needs Accessibility access to inject touch events into iPhone Mirroring.</string>
+    <string>iphone-use needs Accessibility access to inject touch events into iPhone Mirroring.</string>
 
     <!-- Suppress Dock icon — daemon runs in background -->
     <key>LSUIElement</key>

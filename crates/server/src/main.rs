@@ -1,8 +1,8 @@
-//! `iphone-remote` daemon CLI.
+//! `iphone-use` daemon CLI.
 //!
 //! ```text
-//! iphone-remote serve   # TCC preflight → start capture/encode → axum on host:port
-//! iphone-remote stop    # best-effort: kill the recorded pid
+//! iphone-use serve   # TCC preflight → start capture/encode → axum on host:port
+//! iphone-use stop    # best-effort: kill the recorded pid
 //! ```
 //!
 //! The `serve` path ties together every validated module:
@@ -24,12 +24,12 @@ use server::config::Config;
 use server::http::{self, AppState};
 
 /// PID file name inside the runtime dir.
-const PID_FILE: &str = "iphone-remote.pid";
+const PID_FILE: &str = "iphone-use.pid";
 /// Secret file name inside the runtime dir.
 const SECRET_FILE: &str = "secret";
 
 #[derive(Parser)]
-#[command(name = "iphone-remote", about = "iPhone Mirroring → WebRTC remote daemon")]
+#[command(name = "iphone-use", about = "iPhone Mirroring → WebRTC remote daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -185,7 +185,7 @@ fn run_server(cfg: Config, state: Arc<AppState>) -> Result<()> {
 fn print_startup_banner(cfg: &Config) {
     let url = format!("http://{}:{}/phone", cfg.host, cfg.port);
     eprintln!("──────────────────────────────────────────────");
-    eprintln!(" iphone-remote serving");
+    eprintln!(" iphone-use serving");
     eprintln!("   url:      {url}");
     match &cfg.password {
         Some(_) => eprintln!("   password: (set via PHONE_REMOTE_PASSWORD)"),
@@ -271,7 +271,7 @@ fn preflight_tcc() -> Result<()> {
     if !status.screen_recording {
         server::macos::request_screen_capture();
     }
-    anyhow::bail!("missing TCC permissions; grant them and re-run `iphone-remote serve`")
+    anyhow::bail!("missing TCC permissions; grant them and re-run `iphone-use serve`")
 }
 
 // ---------------------------------------------------------------------------

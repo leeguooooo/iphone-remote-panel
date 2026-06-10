@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# scripts/make-app.sh — wrap target/release/iphone-remote into iPhoneRemote.app
+# scripts/make-app.sh — wrap target/release/iphone-use into iPhoneUse.app
 #
 # Usage:
 #   ./scripts/make-app.sh [OUTPUT_DIR]
 #
 # OUTPUT_DIR defaults to the repo root.  The resulting .app is always at:
-#   <OUTPUT_DIR>/iPhoneRemote.app
+#   <OUTPUT_DIR>/iPhoneUse.app
 #
 # Called by CI (release-binaries.yml) and local dev after:
-#   cargo build --release --bin iphone-remote
+#   cargo build --release --bin iphone-use
 #
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${1:-"$REPO_ROOT"}"
-APP="$OUTPUT_DIR/iPhoneRemote.app"
-BINARY="$REPO_ROOT/target/release/iphone-remote"
+APP="$OUTPUT_DIR/iPhoneUse.app"
+BINARY="$REPO_ROOT/target/release/iphone-use"
 DEPLOY_DIR="$REPO_ROOT/deploy"
 
 # ── Verify the binary was built ───────────────────────────────────────────────
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: binary not found: $BINARY" >&2
-    echo "       Run: cargo build --release --bin iphone-remote" >&2
+    echo "       Run: cargo build --release --bin iphone-use" >&2
     exit 1
 fi
 
@@ -43,8 +43,8 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
 # Copy the binary
-cp "$BINARY" "$APP/Contents/MacOS/iphone-remote"
-chmod 755 "$APP/Contents/MacOS/iphone-remote"
+cp "$BINARY" "$APP/Contents/MacOS/iphone-use"
+chmod 755 "$APP/Contents/MacOS/iphone-use"
 
 # Write Info.plist, substituting version placeholders from template.
 # Uses context-sensitive sed (n command: advance to next line after the key) so
@@ -56,9 +56,16 @@ sed \
     "$DEPLOY_DIR/Info.plist" \
     > "$APP/Contents/Info.plist"
 
+# App icon (Info.plist references CFBundleIconFile = AppIcon).
+ICNS="$REPO_ROOT/assets/AppIcon.icns"
+if [ -f "$ICNS" ]; then
+    cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
+fi
+
 # PkgInfo (type + creator; conventional for macOS .app bundles)
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "Created: $APP"
-echo "  Binary : $APP/Contents/MacOS/iphone-remote"
+echo "  Binary : $APP/Contents/MacOS/iphone-use"
 echo "  Plist  : $APP/Contents/Info.plist"
+[ -f "$ICNS" ] && echo "  Icon   : $APP/Contents/Resources/AppIcon.icns"

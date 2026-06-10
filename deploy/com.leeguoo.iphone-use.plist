@@ -2,24 +2,24 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent plist for iphone-remote daemon.
-  Label and filename MUST match: work.pwtk.iphone-remote
+  LaunchAgent plist for iphone-use daemon.
+  Label and filename MUST match: com.leeguoo.iphone-use
   Bundle id is stable so TCC grants survive upgrades.
 
   This file is a TEMPLATE.  install.sh generates the live copy under
-  ~/Library/LaunchAgents/work.pwtk.iphone-remote.plist by substituting
+  ~/Library/LaunchAgents/com.leeguoo.iphone-use.plist by substituting
   __HOME__ with the actual $HOME value.  Do not load this template directly.
 -->
 <plist version="1.0">
 <dict>
     <!-- Stable reverse-DNS label — equals CFBundleIdentifier -->
     <key>Label</key>
-    <string>work.pwtk.iphone-remote</string>
+    <string>com.leeguoo.iphone-use</string>
 
     <!-- Absolute path to binary inside the .app + subcommand -->
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/Applications/iPhoneRemote.app/Contents/MacOS/iphone-remote</string>
+        <string>__HOME__/Applications/iPhoneUse.app/Contents/MacOS/iphone-use</string>
         <string>serve</string>
     </array>
 
@@ -33,9 +33,9 @@
 
     <!-- Logs — install.sh creates the parent dir before loading -->
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/iPhoneRemote/iphone-remote.log</string>
+    <string>__HOME__/Library/Logs/iPhoneUse/iphone-use.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/iPhoneRemote/iphone-remote.err</string>
+    <string>__HOME__/Library/Logs/iPhoneUse/iphone-use.err</string>
 
     <!--
       Interactive: scheduling hint for a GUI foreground-class process.

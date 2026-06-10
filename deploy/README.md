@@ -1,20 +1,20 @@
-# iPhone Remote — Deployment Operator Notes
+# iphone-use — Deployment Operator Notes
 
 ## Why a GUI-session LaunchAgent (not a LaunchDaemon)
 
-iphone-remote requires **Screen Recording** (ScreenCaptureKit) and **Accessibility** (CGEventPost)
+iphone-use requires **Screen Recording** (ScreenCaptureKit) and **Accessibility** (CGEventPost)
 TCC grants. Both grants are evaluated by macOS against the *responsible-process chain*:
 
 - A **LaunchDaemon** runs in session 0, which has no WindowServer. ScreenCaptureKit will
   refuse to capture and the grants are not evaluated. **Wrong tool.**
 - An **SSH-spawned process** inherits the SSH terminal's chain, not the GUI user's Accessibility
   grant. CGEventPost is silently dropped.
-- A **GUI-session LaunchAgent** (label `work.pwtk.iphone-remote`, `LimitLoadToSessionType=Aqua`)
+- A **GUI-session LaunchAgent** (label `com.leeguoo.iphone-use`, `LimitLoadToSessionType=Aqua`)
   is a direct child of `launchd` in the Aqua session, so macOS evaluates the daemon's own TCC
   entry. **This is the only correct deployment mode.**
 
 **Consequence:** no client (SSH session, MCP call, Hermes, iPhone app) may spawn its own copy
-of `iphone-remote`. All callers connect to the *already-running* LaunchAgent over HTTP/IPC.
+of `iphone-use`. All callers connect to the *already-running* LaunchAgent over HTTP/IPC.
 
 ## Auto-login requirement for unattended machines
 
@@ -32,9 +32,9 @@ without an MDM PPPC profile. The daemon detects the loss via `CGPreflightScreenC
 and exits cleanly (KeepAlive restarts it), but capture will fail until re-granted.
 
 Operational checklist for unattended boxes:
-1. Monitor `~/Library/Logs/iPhoneRemote/iphone-remote.err` for "Screen Capture permission lost".
+1. Monitor `~/Library/Logs/iPhoneUse/iphone-use.err` for "Screen Capture permission lost".
 2. Log in to the GUI (VNC / Screen Sharing) and re-grant Screen Recording.
-3. Restart: `launchctl kickstart -k gui/$(id -u)/work.pwtk.iphone-remote`
+3. Restart: `launchctl kickstart -k gui/$(id -u)/com.leeguoo.iphone-use`
 
 ## Install
 
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.
 For local / dev installs (pre-built .app):
 
 ```sh
-./install.sh /path/to/iPhoneRemote.app
+./install.sh /path/to/iPhoneUse.app
 ```
 
 After install, grant **Screen Recording** and **Accessibility** in System Settings when prompted.
@@ -54,7 +54,7 @@ After install, grant **Screen Recording** and **Accessibility** in System Settin
 
 ```sh
 UID=$(id -u)
-LABEL=work.pwtk.iphone-remote
+LABEL=com.leeguoo.iphone-use
 
 # Status
 launchctl print gui/$UID/$LABEL
@@ -72,35 +72,35 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/$LABEL.plist
 launchctl enable gui/$UID/$LABEL
 
 # View logs
-tail -f ~/Library/Logs/iPhoneRemote/iphone-remote.log
-tail -f ~/Library/Logs/iPhoneRemote/iphone-remote.err
+tail -f ~/Library/Logs/iPhoneUse/iphone-use.log
+tail -f ~/Library/Logs/iPhoneUse/iphone-use.err
 ```
 
 ## Uninstall
 
 ```sh
 UID=$(id -u)
-LABEL=work.pwtk.iphone-remote
+LABEL=com.leeguoo.iphone-use
 
 launchctl bootout gui/$UID/$LABEL 2>/dev/null || true
 launchctl disable gui/$UID/$LABEL 2>/dev/null || true
 rm -f ~/Library/LaunchAgents/$LABEL.plist
-rm -rf ~/Applications/iPhoneRemote.app
-rm -rf ~/Library/Logs/iPhoneRemote
+rm -rf ~/Applications/iPhoneUse.app
+rm -rf ~/Library/Logs/iPhoneUse
 ```
 
 To also revoke TCC grants: System Settings → Privacy & Security → Screen Recording / Accessibility,
-find iPhoneRemote and toggle off.
+find iPhoneUse and toggle off.
 
 ## Codesigning and TCC grant stability
 
 TCC grants are keyed on the code-signing **Designated Requirement** (bundle-id + signing identity).
 To preserve grants across upgrades:
 
-- The bundle id **must remain `work.pwtk.iphone-remote`** in every release.
+- The bundle id **must remain `com.leeguoo.iphone-use`** in every release.
 - The signing identity must be reused. CI uses Developer ID (via `APPLE_SIGNING_CERTIFICATE` secret)
   when available; otherwise `install.sh` creates a persistent self-signed cert named
-  `"iPhoneRemote Local Signing"` in the login keychain and re-signs the downloaded .app.
+  `"iPhoneUse Local Signing"` in the login keychain and re-signs the downloaded .app.
   Either way the DR is stable — re-granting after an upgrade should not be required.
 
 ## Secrets for CI (optional — only needed for Developer ID signing + notarization)

@@ -1,16 +1,16 @@
 [package]
 name = "server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # The daemon binary. Lib stays for unit-testable glue (http/signaling/webrtc
-# decode helpers); the bin is the `iphone-remote serve`/`stop` CLI entrypoint.
+# decode helpers); the bin is the `iphone-use serve`/`stop` CLI entrypoint.
 [lib]
 name = "server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "iphone-remote"
+name = "iphone-use"
 path = "src/main.rs"
 
 [dependencies]

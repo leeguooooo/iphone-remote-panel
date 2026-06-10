@@ -1,11 +1,17 @@
-# iphone-use
+<p align="center">
+  <img src="assets/icon-1024.png" alt="iphone-use icon" width="120">
+</p>
 
-> *Computer-use, but for the iPhone — let AI agents (and your browser) see and drive a real phone.*
+<h1 align="center">iphone-use</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Platform: macOS 15+](https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey)
-![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
-![Streaming: WebRTC / H.264](https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success)
+<p align="center"><em>Computer-use, but for the iPhone — let AI agents (and your browser) see and drive a real phone.</em></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey" alt="Platform: macOS 15+">
+  <img src="https://img.shields.io/badge/built%20with-Rust-orange" alt="Built with Rust">
+  <img src="https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success" alt="Streaming: WebRTC / H.264">
+</p>
 
 <p align="center">
   <img src="assets/hero.png" alt="Controlling an iPhone from a browser — live screen plus a touch toolbar (Home, Spotlight, App Switcher, keyboard)" width="320">
@@ -95,9 +101,9 @@ viewers keep their video stream.
 Build, bundle into a signed `.app`, and register the LaunchAgent:
 
 ```bash
-cargo build --release --bin iphone-remote
-./scripts/make-app.sh                 # → ./iPhoneRemote.app
-./install.sh ./iPhoneRemote.app       # signs, installs, writes the LaunchAgent
+cargo build --release --bin iphone-use
+./scripts/make-app.sh                 # → ./iPhoneUse.app
+./install.sh ./iPhoneUse.app       # signs, installs, writes the LaunchAgent
 ```
 
 `install.sh` binds `0.0.0.0`, generates a password (or uses `$PHONE_REMOTE_PASSWORD`),
@@ -117,7 +123,7 @@ unless the binary is notarized (optional secrets: `APPLE_SIGNING_CERTIFICATE` /
 
 ```bash
 PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
-  ./target/release/iphone-remote serve
+  ./target/release/iphone-use serve
 ```
 
 ## Configuration (environment)
@@ -155,7 +161,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 
 ## MCP server
 
-[`iphone-remote-mcp`](crates/mcp/README.md) is an MCP stdio server (`crates/mcp`) that
+[`iphone-use-mcp`](crates/mcp/README.md) is an MCP stdio server (`crates/mcp`) that
 bridges MCP clients — Claude Desktop, Claude Code — to the daemon's agent API. Seven
 tools: `phone_status`, `screenshot`, `tap`, `scroll`, `type`, `key`, `shortcut`. Two
 env vars: `PHONE_REMOTE_URL` (default `http://127.0.0.1:8787`) and `PHONE_REMOTE_TOKEN`
@@ -166,8 +172,8 @@ Add to your `claude_desktop_config.json` (or Claude Code MCP config):
 ```json
 {
   "mcpServers": {
-    "iphone-remote": {
-      "command": "/path/to/iphone-remote-mcp",
+    "iphone-use": {
+      "command": "/path/to/iphone-use-mcp",
       "env": {
         "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
         "PHONE_REMOTE_TOKEN": "<your-agent-token>"
@@ -242,7 +248,7 @@ Issues and PRs welcome.
 ## Layout
 
 - `crates/core` — capture, encode, coordinate/geometry, input injection, control lease.
-- `crates/server` — the `iphone-remote` daemon: HTTP/WS, WebRTC, signaling, agent API, TURN.
+- `crates/server` — the `iphone-use` daemon: HTTP/WS, WebRTC, signaling, agent API, TURN.
 - `web/index.html` — the iPhone Safari client (WebRTC viewer + touch).
 - `install.sh`, `scripts/make-app.sh`, `deploy/` — packaging + LaunchAgent.
 - `docs/` — design spec, runbooks, agent API reference, research notes.

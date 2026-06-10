@@ -51,7 +51,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"ho
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"longpress","x":0.4,"y":0.6}'   # release with {"type":"up",...}
 ```
 
-MCP alternative: the repo ships `iphone-remote-mcp` (crates/mcp) exposing the
+MCP alternative: the repo ships `iphone-use-mcp` (crates/mcp) exposing the
 same actions as native MCP tools (`phone_tap`, `phone_screenshot`, …).
 
 ## The loop: see → act → verify

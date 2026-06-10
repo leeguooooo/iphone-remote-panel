@@ -1,4 +1,4 @@
-//! HTTP client that talks to the iphone-remote daemon's agent API.
+//! HTTP client that talks to the iphone-use daemon's agent API.
 //!
 //! The public surface is intentionally small: `DaemonClient` holds the base
 //! URL and optional bearer token and exposes one async method per daemon

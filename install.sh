@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# install.sh — install iPhoneRemote.app and register the GUI-session LaunchAgent
+# install.sh — install iPhoneUse.app and register the GUI-session LaunchAgent
 #
 # USAGE (recommended — no auth required; GITHUB_TOKEN not needed for public releases):
 #   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 #
 # Local / dev usage (skip download; supply a pre-built .app):
-#   ./install.sh /path/to/iPhoneRemote.app
+#   ./install.sh /path/to/iPhoneUse.app
 #
 # Requirements:
 #   • Must run as the LOGGED-IN GUI user (not root, not over a bare SSH session).
@@ -27,20 +27,20 @@ set -eu
 # updates, ship a Developer-ID-signed + notarized release from CI instead.
 _inline_sign() {
     local app="$1"
-    codesign --force --sign - "$app/Contents/MacOS/iphone-remote"
+    codesign --force --sign - "$app/Contents/MacOS/iphone-use"
     codesign --force --sign - "$app"
     ok "Ad-hoc signed (no keychain prompt; re-grant TCC after an update)"
 }
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-BUNDLE_ID="work.pwtk.iphone-remote"
-APP_NAME="iPhoneRemote.app"
+BUNDLE_ID="com.leeguoo.iphone-use"
+APP_NAME="iPhoneUse.app"
 INSTALL_DIR="$HOME/Applications"
-PLIST_LABEL="work.pwtk.iphone-remote"
+PLIST_LABEL="com.leeguoo.iphone-use"
 PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
-LOG_DIR="$HOME/Library/Logs/iPhoneRemote"
+LOG_DIR="$HOME/Library/Logs/iPhoneUse"
 REPO="leeguooooo/iphone-use"
-BINARY_INSIDE_APP="Contents/MacOS/iphone-remote"
+BINARY_INSIDE_APP="Contents/MacOS/iphone-use"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -51,7 +51,7 @@ die()  { printf "${RED}✗ ERROR:${RESET} %s\n" "$*" >&2; exit 1; }
 info() { printf "  %s\n" "$*"; }
 
 echo ""
-printf "${BOLD}=== iPhone Remote — install.sh ===${RESET}\n"
+printf "${BOLD}=== iphone-use — install.sh ===${RESET}\n"
 echo ""
 
 # ── Guard: must be a GUI session ─────────────────────────────────────────────
@@ -234,9 +234,9 @@ cat > "$PLIST_DST" <<PLIST
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${LOG_DIR}/iphone-remote.log</string>
+    <string>${LOG_DIR}/iphone-use.log</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/iphone-remote.err</string>
+    <string>${LOG_DIR}/iphone-use.err</string>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>LimitLoadToSessionType</key>
@@ -291,8 +291,8 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibil
 
 echo ""
 printf "${YELLOW}ACTION REQUIRED:${RESET}\n"
-printf "  1. In ${BOLD}Screen Recording${RESET}: enable the toggle next to ${BOLD}iPhoneRemote${RESET}.\n"
-printf "  2. In ${BOLD}Accessibility${RESET}: enable the toggle next to ${BOLD}iPhoneRemote${RESET}.\n"
+printf "  1. In ${BOLD}Screen Recording${RESET}: enable the toggle next to ${BOLD}iPhoneUse${RESET}.\n"
+printf "  2. In ${BOLD}Accessibility${RESET}: enable the toggle next to ${BOLD}iPhoneUse${RESET}.\n"
 printf "  3. After granting both, restart the daemon:\n"
 printf "     ${BOLD}launchctl kickstart -k gui/%s/%s${RESET}\n" "$UID_NUM" "$PLIST_LABEL"
 printf "\n"
@@ -322,7 +322,7 @@ printf "${BOLD}━━━ Quick reference ━━━${RESET}\n"
 printf "  Status  : launchctl print gui/%s/%s\n"       "$UID_NUM" "$PLIST_LABEL"
 printf "  Restart : launchctl kickstart -k gui/%s/%s\n" "$UID_NUM" "$PLIST_LABEL"
 printf "  Stop    : launchctl bootout gui/%s/%s\n"      "$UID_NUM" "$PLIST_LABEL"
-printf "  Logs    : tail -f %s/iphone-remote.log\n"    "$LOG_DIR"
-printf "  Errors  : tail -f %s/iphone-remote.err\n"    "$LOG_DIR"
+printf "  Logs    : tail -f %s/iphone-use.log\n"    "$LOG_DIR"
+printf "  Errors  : tail -f %s/iphone-use.err\n"    "$LOG_DIR"
 echo ""
 ok "Install complete."

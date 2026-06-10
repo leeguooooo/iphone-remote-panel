@@ -1,11 +1,11 @@
 [package]
-name = "iphone-remote-mcp"
-version = "0.1.0"
+name = "iphone-use-mcp"
+version = "0.2.0"
 edition = "2021"
-description = "MCP stdio server that wraps the iphone-remote daemon's agent HTTP API"
+description = "MCP stdio server that wraps the iphone-use daemon's agent HTTP API"
 
 [[bin]]
-name = "iphone-remote-mcp"
+name = "iphone-use-mcp"
 path = "src/main.rs"
 
 [dependencies]

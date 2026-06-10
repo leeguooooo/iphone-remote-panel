@@ -210,7 +210,7 @@ mod imp {
             std::sync::atomic::AtomicU64::new(0);
         let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let out_path = std::env::temp_dir().join(format!(
-            "iphone-remote-shot-{}-{seq}.png",
+            "iphone-use-shot-{}-{seq}.png",
             std::process::id()
         ));
         let out_str = out_path
@@ -727,7 +727,7 @@ mod tests {
         let pid = std::process::id();
         let make = || {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            std::env::temp_dir().join(format!("iphone-remote-shot-{pid}-{seq}.png"))
+            std::env::temp_dir().join(format!("iphone-use-shot-{pid}-{seq}.png"))
         };
         let p1 = make();
         let p2 = make();
