@@ -180,6 +180,21 @@ Add to your `claude_desktop_config.json` (or Claude Code MCP config):
 See [`crates/mcp/README.md`](crates/mcp/README.md) for full tool schemas and build
 instructions.
 
+## Agent skill
+
+Teach any skills-capable agent (Claude Code, etc.) to drive your phone — including
+the **vision once → script forever** methodology (solve a phone task visually the
+first time, then freeze it into a repeatable one-command script):
+
+```bash
+npx skills add leeguooooo/iphone-use
+```
+
+The skill covers the agent API, the see→act→verify loop, hardware-validated input
+facts (scroll direction, the keycode/IME caveat), and a worked example — a full
+Apple Health export (no API exists; the agent taps through the Health app and the
+data lands on your Mac in ~3 minutes). See [`skills/iphone-use/SKILL.md`](skills/iphone-use/SKILL.md).
+
 ## Security notes
 
 This tool exposes live phone control over the network. Treat the URL and password like
