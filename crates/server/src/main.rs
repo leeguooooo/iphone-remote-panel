@@ -112,9 +112,12 @@ fn serve() -> Result<()> {
         let control = control.clone();
         let current_lease = current_lease.clone();
         server::input_bridge::spawn_injector(geometry, move || {
-            let lease = current_lease.lock().unwrap();
+            // Recover from a poisoned mutex rather than killing the injector
+            // thread permanently — the lease state is a small struct and stays
+            // consistent across a panic.
+            let lease = current_lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*lease {
-                Some(l) => control.lock().unwrap().is_current(l),
+                Some(l) => control.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_current(l),
                 None => false,
             }
         })

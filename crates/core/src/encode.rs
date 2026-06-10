@@ -261,7 +261,11 @@ mod imp {
 
         match build_encoded_frame(sample) {
             Ok(frame) => {
-                *ctx.last_emit.lock().unwrap() = Instant::now();
+                // Use poison-recovery: a panic across the C boundary is
+                // process-fatal, and a poisoned last_emit means the keepalive
+                // timer never fires (viewers see a frozen frame forever).
+                *ctx.last_emit.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Instant::now();
                 // broadcast::send only errors if there are no receivers — fine.
                 let _ = ctx.tx.send(frame);
             }
@@ -592,11 +596,12 @@ mod imp {
         let capture_cb = {
             let pending = pending.clone();
             Arc::new(move |frame: Frame<'_>| {
-                let guard = pending.lock().unwrap();
+                let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(shared) = guard.as_ref() {
                     // Stash the buffer for keepalive, then encode.
                     if let Some(retained) = retain_image_buffer(frame.image_buffer) {
-                        *shared.last_buffer.lock().unwrap() = Some(retained);
+                        *shared.last_buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(retained);
                     }
                     shared.encode(frame.image_buffer, frame.pts_micros, false);
                 }
@@ -645,12 +650,21 @@ mod imp {
                         }
                         // SAFETY: see above — ctx_ptr outlives this thread.
                         let ctx = unsafe { &*(ctx_ptr_usize as *const OutputContext) };
-                        let idle = ctx.last_emit.lock().unwrap().elapsed();
-                        let have_buffer = shared.last_buffer.lock().unwrap().is_some();
+                        let idle = ctx
+                            .last_emit
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .elapsed();
+                        let have_buffer = shared
+                            .last_buffer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some();
                         if keepalive_should_fire(idle, period, have_buffer) {
                             // Re-encode the last buffer as a fresh IDR. Synthesize
                             // a wall-clock-derived PTS so timestamps stay monotonic.
-                            let buf = shared.last_buffer.lock().unwrap();
+                            let buf =
+                                shared.last_buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(SendPixelBuffer(pb)) = buf.as_ref() {
                                 shared.encode(pb, now_micros(), true);
                             }

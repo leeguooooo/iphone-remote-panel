@@ -20,6 +20,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Recover a poisoned mutex guard instead of panicking. A panic inside a lock
+/// holder poisons the mutex; for the control-lease state that would permanently
+/// disable the lease subsystem. The data stays consistent, so unwrapping the
+/// poison error is safe here.
+#[inline]
+fn recover<T>(r: std::sync::LockResult<T>) -> T {
+    r.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, State},
@@ -353,12 +362,11 @@ async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         );
     }
-    let mut resp = Response::builder()
+    let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(state.ice.load().json.clone()))
-        .unwrap();
-    resp = with_security_headers(resp);
-    resp
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    with_security_headers(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +470,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
-        .unwrap();
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     with_security_headers(resp)
 }
 
@@ -505,9 +513,9 @@ async fn agent_input(
         .unwrap_or("agent")
         .to_string();
     {
-        let mut control = state.control.lock().unwrap();
+        let mut control = recover(state.control.lock());
         let lease = control.acquire(core::control::Holder::Agent(agent_id), now_secs());
-        *state.current_lease.lock().unwrap() = Some(lease);
+        *recover(state.current_lease.lock()) = Some(lease);
     }
     state.injector.send(event);
     with_security_headers((StatusCode::OK, "ok").into_response())
@@ -534,7 +542,7 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
             let resp = Response::builder()
                 .header(header::CONTENT_TYPE, "image/png")
                 .body(Body::from(bytes))
-                .unwrap();
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             with_security_headers(resp)
         }
         Ok(Err(e)) => {

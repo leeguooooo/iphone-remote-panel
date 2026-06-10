@@ -441,12 +441,16 @@ impl CgEventSink {
         }
     }
 
-    fn make_source() -> core_graphics::event_source::CGEventSource {
+    /// Create a CGEventSource, returning Err on failure. Per-event calls use
+    /// this non-panicking form so a transient window-server hiccup (display
+    /// sleep, fast user switch) doesn't kill the injector thread permanently.
+    fn make_source() -> Result<core_graphics::event_source::CGEventSource, String> {
         use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .expect("CGEventSource::new failed")
+            .map_err(|_| "CGEventSource::new failed".to_string())
     }
 
+    /// Post one mouse event. On failure, logs and drops the event; never panics.
     fn post_mouse(
         event_type: core_graphics::event::CGEventType,
         sx: f64,
@@ -454,11 +458,21 @@ impl CgEventSink {
     ) {
         use core_graphics::event::{CGEvent, CGEventTapLocation, CGMouseButton};
         use core_graphics::geometry::CGPoint;
-        let source = Self::make_source();
+        let source = match Self::make_source() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("post_mouse: {e}; dropping event");
+                return;
+            }
+        };
         let pt = CGPoint::new(sx, sy);
-        let evt = CGEvent::new_mouse_event(source, event_type, pt, CGMouseButton::Left)
-            .expect("CGEvent::new_mouse_event failed");
-        evt.post(CGEventTapLocation::HID);
+        if let Ok(evt) =
+            CGEvent::new_mouse_event(source, event_type, pt, CGMouseButton::Left)
+        {
+            evt.post(CGEventTapLocation::HID);
+        } else {
+            eprintln!("post_mouse: CGEvent::new_mouse_event failed; dropping event");
+        }
     }
 
 }
@@ -504,28 +518,36 @@ impl EventSink for CgEventSink {
         // location, and Mirroring scrolls the phone only when the cursor is
         // inside its window — so move the cursor to the gesture anchor first
         // (MouseMoved, no button held; this does not trigger a tap/long-press).
-        if let Ok(moved) = CGEvent::new_mouse_event(
-            Self::make_source(),
-            CGEventType::MouseMoved,
-            CGPoint::new(sx, sy),
-            CGMouseButton::Left,
-        ) {
-            moved.post(CGEventTapLocation::HID);
+        if let Ok(source) = Self::make_source() {
+            if let Ok(moved) = CGEvent::new_mouse_event(
+                source,
+                CGEventType::MouseMoved,
+                CGPoint::new(sx, sy),
+                CGMouseButton::Left,
+            ) {
+                moved.post(CGEventTapLocation::HID);
+            }
+        } else {
+            eprintln!("scroll: CGEventSource unavailable; dropping move-cursor step");
         }
         let wheel1 = (dy * SCROLL_SCALE * SCROLL_DIR_V) as i32; // vertical
         let wheel2 = (dx * SCROLL_SCALE * SCROLL_DIR_H) as i32; // horizontal
         if wheel1 == 0 && wheel2 == 0 {
             return;
         }
-        if let Ok(scroll) = CGEvent::new_scroll_event(
-            Self::make_source(),
-            ScrollEventUnit::PIXEL,
-            2, // wheel_count: vertical + horizontal
-            wheel1,
-            wheel2,
-            0,
-        ) {
-            scroll.post(CGEventTapLocation::HID);
+        if let Ok(source) = Self::make_source() {
+            if let Ok(scroll) = CGEvent::new_scroll_event(
+                source,
+                ScrollEventUnit::PIXEL,
+                2, // wheel_count: vertical + horizontal
+                wheel1,
+                wheel2,
+                0,
+            ) {
+                scroll.post(CGEventTapLocation::HID);
+            }
+        } else {
+            eprintln!("scroll: CGEventSource unavailable; dropping scroll event");
         }
     }
 
@@ -543,14 +565,23 @@ impl EventSink for CgEventSink {
             }
         };
         let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
-        if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), kc, true) {
-            down.set_flags(CGEventFlags::empty());
-            down.post(CGEventTapLocation::HID);
+        if let Ok(source) = Self::make_source() {
+            if let Ok(down) = CGEvent::new_keyboard_event(source, kc, true) {
+                down.set_flags(CGEventFlags::empty());
+                down.post(CGEventTapLocation::HID);
+            }
+        } else {
+            eprintln!("key {name:?}: CGEventSource unavailable; skipping");
+            return;
         }
         gap();
-        if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), kc, false) {
-            up.set_flags(CGEventFlags::empty());
-            up.post(CGEventTapLocation::HID);
+        if let Ok(source) = Self::make_source() {
+            if let Ok(up) = CGEvent::new_keyboard_event(source, kc, false) {
+                up.set_flags(CGEventFlags::empty());
+                up.post(CGEventTapLocation::HID);
+            }
+        } else {
+            eprintln!("key {name:?}: CGEventSource unavailable; skipping up");
         }
         gap();
     }
@@ -585,26 +616,46 @@ impl EventSink for CgEventSink {
             // Hold a real Shift key down for shifted chars — the flag alone is
             // dropped by Mirroring, so capitals/symbols need the physical key.
             if shift {
-                if let Ok(sd) = CGEvent::new_keyboard_event(Self::make_source(), KVK_SHIFT, true) {
-                    sd.set_flags(CGEventFlags::CGEventFlagShift);
-                    sd.post(CGEventTapLocation::HID);
+                match Self::make_source() {
+                    Ok(source) => {
+                        if let Ok(sd) = CGEvent::new_keyboard_event(source, KVK_SHIFT, true) {
+                            sd.set_flags(CGEventFlags::CGEventFlagShift);
+                            sd.post(CGEventTapLocation::HID);
+                        }
+                    }
+                    Err(e) => { eprintln!("text: {e}; skipping shift-down for {ch:?}"); continue; }
                 }
                 gap();
             }
-            if let Ok(down) = CGEvent::new_keyboard_event(Self::make_source(), kc, true) {
-                down.set_flags(flags);
-                down.post(CGEventTapLocation::HID);
+            match Self::make_source() {
+                Ok(source) => {
+                    if let Ok(down) = CGEvent::new_keyboard_event(source, kc, true) {
+                        down.set_flags(flags);
+                        down.post(CGEventTapLocation::HID);
+                    }
+                }
+                Err(e) => { eprintln!("text: {e}; skipping key-down for {ch:?}"); continue; }
             }
             gap();
-            if let Ok(up) = CGEvent::new_keyboard_event(Self::make_source(), kc, false) {
-                up.set_flags(flags);
-                up.post(CGEventTapLocation::HID);
+            match Self::make_source() {
+                Ok(source) => {
+                    if let Ok(up) = CGEvent::new_keyboard_event(source, kc, false) {
+                        up.set_flags(flags);
+                        up.post(CGEventTapLocation::HID);
+                    }
+                }
+                Err(e) => eprintln!("text: {e}; skipping key-up for {ch:?}"),
             }
             gap();
             if shift {
-                if let Ok(su) = CGEvent::new_keyboard_event(Self::make_source(), KVK_SHIFT, false) {
-                    su.set_flags(CGEventFlags::empty());
-                    su.post(CGEventTapLocation::HID);
+                match Self::make_source() {
+                    Ok(source) => {
+                        if let Ok(su) = CGEvent::new_keyboard_event(source, KVK_SHIFT, false) {
+                            su.set_flags(CGEventFlags::empty());
+                            su.post(CGEventTapLocation::HID);
+                        }
+                    }
+                    Err(e) => eprintln!("text: {e}; skipping shift-up for {ch:?}"),
                 }
                 gap();
             }
@@ -632,27 +683,47 @@ impl EventSink for CgEventSink {
         };
         let gap = || std::thread::sleep(std::time::Duration::from_millis(KEY_GAP_MS));
         // Command key down
-        if let Ok(cmd_down) = CGEvent::new_keyboard_event(Self::make_source(), KVK_COMMAND, true) {
-            cmd_down.set_flags(CGEventFlags::CGEventFlagCommand);
-            cmd_down.post(CGEventTapLocation::HID);
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(cmd_down) = CGEvent::new_keyboard_event(source, KVK_COMMAND, true) {
+                    cmd_down.set_flags(CGEventFlags::CGEventFlagCommand);
+                    cmd_down.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => { eprintln!("shortcut {name:?}: {e}; skipping"); return; }
         }
         gap();
         // Digit key down (⌘ held)
-        if let Ok(digit_down) = CGEvent::new_keyboard_event(Self::make_source(), digit_kc, true) {
-            digit_down.set_flags(CGEventFlags::CGEventFlagCommand);
-            digit_down.post(CGEventTapLocation::HID);
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(digit_down) = CGEvent::new_keyboard_event(source, digit_kc, true) {
+                    digit_down.set_flags(CGEventFlags::CGEventFlagCommand);
+                    digit_down.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("shortcut {name:?}: {e}; skipping digit-down"),
         }
         gap();
         // Digit key up (⌘ still held)
-        if let Ok(digit_up) = CGEvent::new_keyboard_event(Self::make_source(), digit_kc, false) {
-            digit_up.set_flags(CGEventFlags::CGEventFlagCommand);
-            digit_up.post(CGEventTapLocation::HID);
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(digit_up) = CGEvent::new_keyboard_event(source, digit_kc, false) {
+                    digit_up.set_flags(CGEventFlags::CGEventFlagCommand);
+                    digit_up.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("shortcut {name:?}: {e}; skipping digit-up"),
         }
         gap();
         // Command key up
-        if let Ok(cmd_up) = CGEvent::new_keyboard_event(Self::make_source(), KVK_COMMAND, false) {
-            cmd_up.set_flags(CGEventFlags::empty());
-            cmd_up.post(CGEventTapLocation::HID);
+        match Self::make_source() {
+            Ok(source) => {
+                if let Ok(cmd_up) = CGEvent::new_keyboard_event(source, KVK_COMMAND, false) {
+                    cmd_up.set_flags(CGEventFlags::empty());
+                    cmd_up.post(CGEventTapLocation::HID);
+                }
+            }
+            Err(e) => eprintln!("shortcut {name:?}: {e}; skipping cmd-up"),
         }
         gap();
     }

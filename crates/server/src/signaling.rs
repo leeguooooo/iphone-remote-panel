@@ -15,6 +15,15 @@
 
 use std::sync::Arc;
 
+/// Recover a poisoned mutex guard instead of panicking. A panic inside a lock
+/// holder would otherwise permanently disable the control-lease subsystem; the
+/// data is a small state struct that stays consistent, so unwrapping the poison
+/// error is safe here.
+#[inline]
+fn recover<T>(r: std::sync::LockResult<T>) -> T {
+    r.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use axum::extract::ws::{Message, WebSocket};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -47,9 +56,9 @@ pub enum SignalMsg {
 pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id: String) {
     // Acquire the human control lease for this viewer.
     {
-        let mut control = state.control.lock().unwrap();
+        let mut control = recover(state.control.lock());
         let lease = control.acquire(core::control::Holder::Human(session_id.clone()), now_secs());
-        *state.current_lease.lock().unwrap() = Some(lease);
+        *recover(state.current_lease.lock()) = Some(lease);
     }
 
     // Outbound queue: PC callbacks (ICE candidates) and the offer push here.
@@ -103,8 +112,8 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
 
     // Tear down: release the lease and close the PC.
     {
-        let mut control = state.control.lock().unwrap();
-        if let Some(lease) = state.current_lease.lock().unwrap().take() {
+        let mut control = recover(state.control.lock());
+        if let Some(lease) = recover(state.current_lease.lock()).take() {
             control.release(&lease);
         }
     }
