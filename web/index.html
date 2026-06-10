@@ -422,6 +422,12 @@
    ================================================================ */
 'use strict';
 
+/* ── URL flags ────────────────────────────────────────────────── */
+/* ?relay=1  →  force iceTransportPolicy:'relay' (TURN-only, no direct/srflx).
+   Use this from a LAN browser to exercise the Cloudflare TURN path without
+   leaving the network.  See GitHub issue #9. */
+const FORCE_RELAY = new URLSearchParams(location.search).has('relay');
+
 /* ── Constants ────────────────────────────────────────────────── */
 const TAP_MS       = 250;
 const TAP_SLOP     = 10;
@@ -504,8 +510,9 @@ function hideOverlay() {
 /* ── Status line ──────────────────────────────────────────────── */
 function setStatus(msg) { statusLine.textContent = msg; }
 function updateStatusLine() {
-  const rtt = lastRtt !== '--' ? ` · ${lastRtt}ms` : '';
-  setStatus(`${connState}${rtt}`);
+  const rtt   = lastRtt !== '--' ? ` · ${lastRtt}ms` : '';
+  const relay = FORCE_RELAY ? ' · relay' : '';
+  setStatus(`${connState}${rtt}${relay}`);
 }
 
 /* ── Wake Lock [iOS §Wake Lock] ───────────────────────────────── */
@@ -721,6 +728,7 @@ textInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); 
 document.getElementById('btnLogout').addEventListener('click', () => { location.href = '/logout'; });
 
 /* ── Stats: RTT from candidate-pair ───────────────────────────── */
+let _candidateTypeLogged = false; /* one-shot: log the active candidate type once per connection */
 async function pollStats() {
   if (!pc || pc.connectionState === 'closed') return;
   try {
@@ -730,6 +738,32 @@ async function pollStats() {
         lastRtt = Math.round(report.currentRoundTripTime * 1000);
       }
     });
+    /* One-shot: on first successful stats read after connection, log the active
+       candidate pair's local/remote candidateType.  A value of 'relay' on both
+       sides proves the Cloudflare TURN path is in use (?relay=1 test).
+       Runs unconditionally (not only in FORCE_RELAY mode) so normal LAN connections
+       show 'host'/'srflx' and relay mode clearly shows 'relay'/'relay'. */
+    if (!_candidateTypeLogged) {
+      const candidatesById = new Map();
+      stats.forEach(r => {
+        if (r.type === 'local-candidate' || r.type === 'remote-candidate') {
+          candidatesById.set(r.id, r);
+        }
+      });
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && !_candidateTypeLogged) {
+          const local  = candidatesById.get(r.localCandidateId);
+          const remote = candidatesById.get(r.remoteCandidateId);
+          const localType  = local  ? local.candidateType  : '?';
+          const remoteType = remote ? remote.candidateType : '?';
+          console.log(
+            `[iphone-remote] active candidate-pair: local=${localType} remote=${remoteType}` +
+            (FORCE_RELAY ? '  ← ?relay=1 mode (expect relay/relay)' : '')
+          );
+          _candidateTypeLogged = true;
+        }
+      });
+    }
   } catch (_) {}
   updateStatusLine();
 }
@@ -766,6 +800,7 @@ async function buildPeerConnectionRelayOnly(iceServers) {
 function wirePc(newPc) {
   if (pc) { try { pc.close(); } catch (_) {} }
   pc = newPc; controlCh = null; moveCh = null;
+  _candidateTypeLogged = false; /* reset so each new offer logs its candidate type */
   pc.ontrack = (e) => { video.srcObject = e.streams[0] ?? new MediaStream([e.track]); if (!frozen) tryPlay(); };
   pc.ondatachannel = (e) => {
     const ch = e.channel; ch.binaryType = 'arraybuffer';
@@ -829,7 +864,11 @@ async function connectWs() {
 }
 async function handleOffer(sdp) {
   const iceServers = await fetchIceServers();
-  const newPc = relayAttempt ? await buildPeerConnectionRelayOnly(iceServers) : await buildPeerConnection(iceServers);
+  /* FORCE_RELAY (?relay=1) always uses relay-only transport; otherwise fall back
+     to the relay path only after an SDP error (relayAttempt flag). */
+  const newPc = (FORCE_RELAY || relayAttempt)
+    ? await buildPeerConnectionRelayOnly(iceServers)
+    : await buildPeerConnection(iceServers);
   wirePc(newPc);
   try {
     await pc.setRemoteDescription({ type:'offer', sdp });
