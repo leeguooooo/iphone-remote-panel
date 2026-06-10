@@ -143,6 +143,7 @@ fn serve() -> Result<()> {
         injector,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: cfg.agent_token.clone(),
+        inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
     });
 
     run_server(cfg, state)

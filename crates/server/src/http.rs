@@ -163,7 +163,26 @@ pub struct AppState {
     /// When `None`, the existing behavior applies: the password (if set) is used as
     /// the bearer check, and open mode (no password) passes everything through.
     pub agent_token: Option<String>,
+    /// Inbox: structured results POSTed back BY the phone (e.g. an iOS Shortcut's
+    /// "Get Contents of URL" action returning Health / battery / location JSON),
+    /// for an agent to GET. This is the return path of the Shortcuts RPC bridge —
+    /// the daemon triggers a shortcut by name, the shortcut runs a native iOS
+    /// action and POSTs the result here. Bounded ring buffer; oldest dropped.
+    pub inbox: Arc<Mutex<std::collections::VecDeque<InboxItem>>>,
 }
+
+/// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
+/// plus when the daemon received it.
+#[derive(Clone, serde::Serialize)]
+pub struct InboxItem {
+    /// Unix seconds the daemon received this item.
+    pub received_at: u64,
+    /// The JSON body the phone (shortcut) sent.
+    pub body: serde_json::Value,
+}
+
+/// Max inbox items retained (oldest dropped past this).
+const INBOX_CAP: usize = 64;
 
 /// Build the axum router for the daemon.
 pub fn router(state: Arc<AppState>) -> Router {
@@ -179,6 +198,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/status", get(agent_status))
         .route("/agent/input", post(agent_input))
         .route("/agent/screenshot", get(agent_screenshot))
+        // Shortcuts RPC return path: the phone POSTs structured results here;
+        // an agent GETs (and drains) them. See `AppState::inbox`.
+        .route("/agent/inbox", get(agent_inbox_get).post(agent_inbox_post))
         .with_state(state)
 }
 
@@ -586,6 +608,86 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
             )
         }
     }
+}
+
+/// `POST /agent/inbox` — the phone (an iOS Shortcut) delivers a structured result.
+///
+/// Body is arbitrary JSON; it's stored with a receive timestamp for an agent to
+/// GET. Bearer-auth'd (the shortcut carries the token), so only the trusted phone
+/// can write. Returns 200 `accepted`. This is the return half of the Shortcuts
+/// RPC bridge — the daemon triggers a shortcut by name (Spotlight), the shortcut
+/// runs a native iOS action and POSTs its result here.
+async fn agent_inbox_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    // Accept any JSON; if the shortcut sent a bare string / non-JSON, wrap it.
+    let value: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| serde_json::Value::String(body.clone()));
+    {
+        let mut inbox = state.inbox.lock().unwrap_or_else(|e| e.into_inner());
+        inbox.push_back(InboxItem {
+            received_at: now_secs(),
+            body: value,
+        });
+        while inbox.len() > INBOX_CAP {
+            inbox.pop_front();
+        }
+    }
+    with_security_headers((StatusCode::OK, "accepted").into_response())
+}
+
+/// `GET /agent/inbox` — an agent retrieves and DRAINS pending phone results.
+///
+/// Returns `{"items":[{"received_at":..,"body":..}, ...]}` and empties the inbox
+/// (use `?peek=1` to read without draining). Bearer-auth'd.
+async fn agent_inbox_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    let peek = query.as_deref().is_some_and(|q| q.contains("peek=1"));
+    let items: Vec<InboxItem> = {
+        let mut inbox = state.inbox.lock().unwrap_or_else(|e| e.into_inner());
+        if peek {
+            inbox.iter().cloned().collect()
+        } else {
+            inbox.drain(..).collect()
+        }
+    };
+    let json = serde_json::json!({ "items": items }).to_string();
+    let resp = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    with_security_headers(resp)
 }
 
 async fn ws_upgrade(

@@ -80,6 +80,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         injector,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: None,
+        inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
     })
 }
 
@@ -121,6 +122,7 @@ fn build_state_with_agent_token(
         injector,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: agent_token.map(|s| s.to_string()),
+        inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
     })
 }
 
@@ -825,5 +827,114 @@ fn wrong_agent_token_counts_toward_rate_limit_lockout() {
             StatusCode::TOO_MANY_REQUESTS,
             "wrong agent_token failures must trigger rate-limit lockout"
         );
+    });
+}
+
+// ── Shortcuts RPC inbox (/agent/inbox) ───────────────────────────────────────
+
+#[test]
+fn inbox_post_then_get_drains_and_returns_json() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+
+        // Phone (shortcut) POSTs a result.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/inbox")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::from(r#"{"verb":"battery","level":0.87}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Agent GETs and drains.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/inbox")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = String::from_utf8_lossy(&body);
+        assert!(json.contains("\"verb\":\"battery\""), "{json}");
+        assert!(json.contains("\"level\":0.87"), "{json}");
+        assert!(json.contains("\"received_at\""), "{json}");
+
+        // Second GET is empty (drained).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/inbox")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8_lossy(&body), r#"{"items":[]}"#);
+    });
+}
+
+#[test]
+fn inbox_post_requires_auth() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/inbox")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+}
+
+#[test]
+fn inbox_peek_does_not_drain() {
+    block(async {
+        let app = http::router(build_state(Some("hunter2")));
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/inbox")
+                    .header(header::AUTHORIZATION, "Bearer hunter2")
+                    .body(Body::from(r#"{"k":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // peek twice — item must persist.
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/agent/inbox?peek=1")
+                        .header(header::AUTHORIZATION, "Bearer hunter2")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("\"k\":1"));
+        }
     });
 }

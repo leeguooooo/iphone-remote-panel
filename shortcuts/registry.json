@@ -1,0 +1,27 @@
+{
+  "$comment": "Single source of truth for the Shortcuts RPC bridge. Agents read THIS to know what native iPhone capabilities are reachable — never 'whatever shortcuts happen to be on the phone'. One bridge shortcut (iU Bridge) dispatches on `verb` and POSTs results to the daemon's /agent/inbox. Adding a capability = add a branch to the bridge + add an entry here. Keep it small and curated.",
+  "version": 1,
+  "bridge_shortcut": {
+    "name": "iU Bridge",
+    "install": "Add the one bridge shortcut (iCloud link in the README); it is the only shortcut you install. It reads a JSON request from the clipboard, dispatches on `verb`, runs the native action, and POSTs the result to http://<mac>:8787/agent/inbox with the Authorization: Bearer header.",
+    "request": "Daemon writes {\"verb\":\"...\",\"id\":\"<correlation>\",\"args\":{...}} to the Mac clipboard, then triggers 'iU Bridge' by name via Spotlight.",
+    "response": "POST {\"id\":\"<correlation>\",\"verb\":\"...\",\"ok\":true,\"data\":{...}} to /agent/inbox; the agent GETs /agent/inbox and matches on id."
+  },
+  "verbs": [
+    {
+      "verb": "battery",
+      "summary": "Current battery level + charging state",
+      "native_action": "Get Battery Level / Get Battery State",
+      "permission": "none",
+      "returns": "{\"level\": 0.0-1.0, \"charging\": bool}",
+      "status": "experiment"
+    }
+  ],
+  "planned": [
+    { "verb": "health_weight", "native_action": "Find Health Samples (Body Mass)", "permission": "Health read" },
+    { "verb": "health_steps", "native_action": "Find Health Samples (Steps)", "permission": "Health read" },
+    { "verb": "location", "native_action": "Get Current Location", "permission": "Location" },
+    { "verb": "send_message", "native_action": "Send Message", "permission": "Messages", "note": "side-effectful — confirm with the user first" },
+    { "verb": "create_reminder", "native_action": "Add New Reminder", "permission": "Reminders" }
+  ]
+}
