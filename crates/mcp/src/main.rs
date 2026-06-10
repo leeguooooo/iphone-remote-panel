@@ -4,7 +4,7 @@
 //! # Usage
 //!
 //! ```
-//! PHONE_REMOTE_URL=http://192.168.1.x:8787 \
+//! PHONE_REMOTE_URL=http://192.168.1.x:44321 \
 //! PHONE_REMOTE_TOKEN=your-password \
 //!   iphone-use-mcp
 //! ```

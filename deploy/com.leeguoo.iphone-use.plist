@@ -62,7 +62,7 @@
         <key>PHONE_REMOTE_HOST</key>
         <string>0.0.0.0</string>
         <key>PHONE_REMOTE_PORT</key>
-        <string>8787</string>
+        <string>44321</string>
         <key>PHONE_REMOTE_PASSWORD</key>
         <string>__PASSWORD__</string>
     </dict>

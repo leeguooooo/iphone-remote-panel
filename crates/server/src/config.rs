@@ -16,7 +16,7 @@ use std::path::PathBuf;
 pub struct Config {
     /// IP address / hostname to listen on. Default: `127.0.0.1`.
     pub host: String,
-    /// TCP port to listen on. Default: `8787`.
+    /// TCP port to listen on. Default: `44321`.
     pub port: u16,
     /// Optional shared password clients must supply.
     pub password: Option<String>,
@@ -42,7 +42,7 @@ pub struct Config {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_PORT: u16 = 44321;
 const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600; // 28 800
 
 // ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ mod tests {
     fn defaults_when_empty_env() {
         let cfg = map_cfg(&[]);
         assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, 44321);
         assert_eq!(cfg.password, None);
         assert_eq!(cfg.secret, None);
         assert_eq!(cfg.session_ttl_secs, 8 * 3600);
@@ -162,13 +162,13 @@ mod tests {
     #[test]
     fn bad_port_falls_back_to_default() {
         let cfg = map_cfg(&[("PHONE_REMOTE_PORT", "not-a-number")]);
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, 44321);
     }
 
     #[test]
     fn port_out_of_u16_range_falls_back_to_default() {
         let cfg = map_cfg(&[("PHONE_REMOTE_PORT", "99999")]);
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, 44321);
     }
 
     #[test]

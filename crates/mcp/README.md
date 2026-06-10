@@ -26,7 +26,7 @@ cargo build --release -p iphone-use-mcp
 
 | Env var | Default | Description |
 |---|---|---|
-| `PHONE_REMOTE_URL` | `http://127.0.0.1:8787` | Base URL of the daemon |
+| `PHONE_REMOTE_URL` | `http://127.0.0.1:44321` | Base URL of the daemon |
 | `PHONE_REMOTE_TOKEN` | _(none)_ | Bearer token / password (omit for open-mode daemons) |
 
 ## MCP client config
@@ -39,7 +39,7 @@ cargo build --release -p iphone-use-mcp
     "iphone-use": {
       "command": "/path/to/iphone-use-mcp",
       "env": {
-        "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
+        "PHONE_REMOTE_URL": "http://127.0.0.1:44321",
         "PHONE_REMOTE_TOKEN": "your-password"
       }
     }
@@ -55,7 +55,7 @@ cargo build --release -p iphone-use-mcp
     "iphone-use": {
       "command": "/path/to/iphone-use-mcp",
       "env": {
-        "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
+        "PHONE_REMOTE_URL": "http://127.0.0.1:44321",
         "PHONE_REMOTE_TOKEN": "your-password"
       }
     }
@@ -71,7 +71,7 @@ Remote Mac (daemon on a different machine on the LAN):
     "iphone-use": {
       "command": "/path/to/iphone-use-mcp",
       "env": {
-        "PHONE_REMOTE_URL": "http://192.168.1.50:8787",
+        "PHONE_REMOTE_URL": "http://192.168.1.50:44321",
         "PHONE_REMOTE_TOKEN": "your-password"
       }
     }

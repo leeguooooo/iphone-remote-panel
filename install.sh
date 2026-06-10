@@ -176,7 +176,7 @@ ok "Log directory: $LOG_DIR"
 # the LAN without a password would let anyone on the network drive the phone, so
 # a password is mandatory here — generated if the user didn't supply one.
 HOST="${PHONE_REMOTE_HOST:-0.0.0.0}"
-PORT="${PHONE_REMOTE_PORT:-8787}"
+PORT="${PHONE_REMOTE_PORT:-44321}"
 PASSWORD="${PHONE_REMOTE_PASSWORD:-}"
 GENERATED_PW=0
 if [ -z "$PASSWORD" ]; then

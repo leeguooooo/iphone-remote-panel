@@ -16,7 +16,7 @@ A Mac on your network running the daemon with iPhone Mirroring connected
 (setup: see the repo README; `install.sh` registers it as a LaunchAgent).
 
 ```bash
-HOST="${PHONE_REMOTE_URL:-http://127.0.0.1:8787}"
+HOST="${PHONE_REMOTE_URL:-http://127.0.0.1:44321}"
 AUTH="Authorization: Bearer $PHONE_REMOTE_TOKEN"   # daemon password or PHONE_REMOTE_AGENT_TOKEN
 ```
 

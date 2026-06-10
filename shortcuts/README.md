@@ -16,7 +16,7 @@ trigger:  daemon writes {"verb":"battery","id":"abc"} to the Mac clipboard
 execute:  the shortcut reads the clipboard, dispatches on `verb`, runs the
           native action (Get Battery Level, Find Health Samples, …)
 return:   the shortcut's "Get Contents of URL" POSTs the result to
-          http://<mac>:8787/agent/inbox  (Authorization: Bearer <token>)
+          http://<mac>:44321/agent/inbox  (Authorization: Bearer <token>)
 collect:  agent GETs /agent/inbox, matches on `id`
 ```
 

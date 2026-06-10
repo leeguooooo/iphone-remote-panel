@@ -8,7 +8,7 @@
 use crate::types::{InputMsg, StatusResponse};
 use reqwest::{header, Client, StatusCode};
 
-const DEFAULT_URL: &str = "http://127.0.0.1:8787";
+const DEFAULT_URL: &str = "http://127.0.0.1:44321";
 
 /// Thin async wrapper over the daemon's `GET /agent/*` and
 /// `POST /agent/input` endpoints.
@@ -22,7 +22,7 @@ pub struct DaemonClient {
 impl DaemonClient {
     /// Build a client from the two environment variables:
     ///
-    /// * `PHONE_REMOTE_URL`   — daemon base URL (default `http://127.0.0.1:8787`)
+    /// * `PHONE_REMOTE_URL`   — daemon base URL (default `http://127.0.0.1:44321`)
     /// * `PHONE_REMOTE_TOKEN` — bearer token / password (optional; omit for
     ///   open-mode daemons running on localhost)
     pub fn from_env() -> Self {
@@ -129,14 +129,14 @@ mod tests {
 
     #[test]
     fn default_url_trim() {
-        let c = DaemonClient::new("http://127.0.0.1:8787/", None);
-        assert_eq!(c.url("/agent/status"), "http://127.0.0.1:8787/agent/status");
+        let c = DaemonClient::new("http://127.0.0.1:44321/", None);
+        assert_eq!(c.url("/agent/status"), "http://127.0.0.1:44321/agent/status");
     }
 
     #[test]
     fn url_no_double_slash() {
-        let c = DaemonClient::new("http://192.168.1.50:8787", None);
-        assert_eq!(c.url("/agent/screenshot"), "http://192.168.1.50:8787/agent/screenshot");
+        let c = DaemonClient::new("http://192.168.1.50:44321", None);
+        assert_eq!(c.url("/agent/screenshot"), "http://192.168.1.50:44321/agent/screenshot");
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         //  directly and confirm the default string.)
         let c = DaemonClient::new(
             std::env::var("PHONE_REMOTE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
+                .unwrap_or_else(|_| "http://127.0.0.1:44321".to_string()),
             None,
         );
         assert!(c.base_url().starts_with("http"));

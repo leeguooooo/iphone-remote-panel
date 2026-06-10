@@ -3,7 +3,7 @@
   "version": 1,
   "bridge_shortcut": {
     "name": "iU Bridge",
-    "install": "Add the one bridge shortcut (iCloud link in the README); it is the only shortcut you install. It reads a JSON request from the clipboard, dispatches on `verb`, runs the native action, and POSTs the result to http://<mac>:8787/agent/inbox with the Authorization: Bearer header.",
+    "install": "Add the one bridge shortcut (iCloud link in the README); it is the only shortcut you install. It reads a JSON request from the clipboard, dispatches on `verb`, runs the native action, and POSTs the result to http://<mac>:44321/agent/inbox with the Authorization: Bearer header.",
     "request": "Daemon writes {\"verb\":\"...\",\"id\":\"<correlation>\",\"args\":{...}} to the Mac clipboard, then triggers 'iU Bridge' by name via Spotlight.",
     "response": "POST {\"id\":\"<correlation>\",\"verb\":\"...\",\"ok\":true,\"data\":{...}} to /agent/inbox; the agent GETs /agent/inbox and matches on id."
   },

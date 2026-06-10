@@ -113,7 +113,7 @@ cargo build --release --bin iphone-use
 
 `install.sh` binds `0.0.0.0`, generates a password (or uses `$PHONE_REMOTE_PASSWORD`),
 opens the Screen Recording + Accessibility panes to grant once, and prints the iPhone
-connect URL. On the iPhone (same Wi-Fi) open **`http://<mac-lan-ip>:8787/phone`** and
+connect URL. On the iPhone (same Wi-Fi) open **`http://<mac-lan-ip>:44321/phone`** and
 enter the password.
 
 **Pre-built binaries** are published from CI on every version tag — see the
@@ -136,7 +136,7 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | Variable | Default | Purpose |
 |---|---|---|
 | `PHONE_REMOTE_HOST` | `127.0.0.1` | Listen address (`0.0.0.0` for LAN). |
-| `PHONE_REMOTE_PORT` | `8787` | Listen port. |
+| `PHONE_REMOTE_PORT` | `44321` | Listen port. |
 | `PHONE_REMOTE_PASSWORD` | *(none)* | Shared password (cookie login + agent bearer fallback). |
 | `PHONE_REMOTE_AGENT_TOKEN` | *(none)* | Dedicated agent bearer token. When set, the agent API accepts **only** this token (the password is no longer valid as a bearer); unset = password doubles as the bearer (legacy). |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → ephemeral relay creds for cross-network. |
@@ -158,7 +158,7 @@ otherwise `PHONE_REMOTE_PASSWORD` (legacy fallback).
 Full reference: **[`docs/agent-api.html`](docs/agent-api.html)**.
 
 ```bash
-HOST=http://<mac-lan-ip>:8787; AUTH="Authorization: Bearer $PW"
+HOST=http://<mac-lan-ip>:44321; AUTH="Authorization: Bearer $PW"
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
@@ -169,7 +169,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 [`iphone-use-mcp`](crates/mcp/README.md) is an MCP stdio server (`crates/mcp`) that
 bridges MCP clients — Claude Desktop, Claude Code — to the daemon's agent API. Seven
 tools: `phone_status`, `screenshot`, `tap`, `scroll`, `type`, `key`, `shortcut`. Two
-env vars: `PHONE_REMOTE_URL` (default `http://127.0.0.1:8787`) and `PHONE_REMOTE_TOKEN`
+env vars: `PHONE_REMOTE_URL` (default `http://127.0.0.1:44321`) and `PHONE_REMOTE_TOKEN`
 (optional; maps to `PHONE_REMOTE_AGENT_TOKEN` on the daemon side).
 
 Add to your `claude_desktop_config.json` (or Claude Code MCP config):
@@ -180,7 +180,7 @@ Add to your `claude_desktop_config.json` (or Claude Code MCP config):
     "iphone-use": {
       "command": "/path/to/iphone-use-mcp",
       "env": {
-        "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
+        "PHONE_REMOTE_URL": "http://127.0.0.1:44321",
         "PHONE_REMOTE_TOKEN": "<your-agent-token>"
       }
     }

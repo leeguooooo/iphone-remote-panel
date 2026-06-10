@@ -98,7 +98,7 @@ cargo build --release --bin iphone-use
 
 `install.sh` 会绑定 `0.0.0.0`、生成一个密码（或使用 `$PHONE_REMOTE_PASSWORD`），
 打开「屏幕录制」+「辅助功能」面板让你授权一次，并打印出 iPhone 的连接地址。
-在 iPhone 上（同一 Wi-Fi）打开 **`http://<mac的局域网IP>:8787/phone`** 并输入密码即可。
+在 iPhone 上（同一 Wi-Fi）打开 **`http://<mac的局域网IP>:44321/phone`** 并输入密码即可。
 
 **预编译二进制**在每次打 version tag 时由 CI 发布 —— 见 [Releases 页面](../../releases)。
 `install.sh` 会用 `codesign -s -` 在本地做 ad-hoc 签名；除非做了公证，否则 Gatekeeper 会弹一次确认。
@@ -119,7 +119,7 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `PHONE_REMOTE_HOST` | `127.0.0.1` | 监听地址（局域网用 `0.0.0.0`）。 |
-| `PHONE_REMOTE_PORT` | `8787` | 监听端口。 |
+| `PHONE_REMOTE_PORT` | `44321` | 监听端口。 |
 | `PHONE_REMOTE_PASSWORD` | *(无)* | 共享密码（cookie 登录 + 智能体 bearer 兜底）。 |
 | `PHONE_REMOTE_AGENT_TOKEN` | *(无)* | 专用的智能体 bearer token。设置后，智能体 API **只**接受这个 token（密码不再能当 bearer）；不设置时密码兼作 bearer（兼容旧行为）。 |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → 临时中继凭证，用于跨网络。 |
@@ -140,7 +140,7 @@ Bearer 鉴权：`Authorization: Bearer <token>`，其中 token 在设置了 `PHO
 完整参考：**[`docs/agent-api.html`](docs/agent-api.html)**。
 
 ```bash
-HOST=http://<mac的局域网IP>:8787; AUTH="Authorization: Bearer $PW"
+HOST=http://<mac的局域网IP>:44321; AUTH="Authorization: Bearer $PW"
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
@@ -151,7 +151,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 [`iphone-use-mcp`](crates/mcp/README.md) 是一个 MCP stdio 服务器（`crates/mcp`），
 把 MCP 客户端（Claude Desktop、Claude Code）桥接到守护进程的智能体 API。七个工具：
 `phone_status`、`screenshot`、`tap`、`scroll`、`type`、`key`、`shortcut`。两个环境变量：
-`PHONE_REMOTE_URL`（默认 `http://127.0.0.1:8787`）和 `PHONE_REMOTE_TOKEN`（可选；对应守护进程侧的 `PHONE_REMOTE_AGENT_TOKEN`）。
+`PHONE_REMOTE_URL`（默认 `http://127.0.0.1:44321`）和 `PHONE_REMOTE_TOKEN`（可选；对应守护进程侧的 `PHONE_REMOTE_AGENT_TOKEN`）。
 
 加到你的 `claude_desktop_config.json`（或 Claude Code 的 MCP 配置）：
 
@@ -161,7 +161,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
     "iphone-use": {
       "command": "/path/to/iphone-use-mcp",
       "env": {
-        "PHONE_REMOTE_URL": "http://127.0.0.1:8787",
+        "PHONE_REMOTE_URL": "http://127.0.0.1:44321",
         "PHONE_REMOTE_TOKEN": "<你的-agent-token>"
       }
     }
