@@ -17,6 +17,12 @@ jobs:
   build-macos:
     name: Build macOS binary & create release
     runs-on: macos-14
+    # The `secrets` context is NOT available in step `if:` expressions (GitHub
+    # rejects the workflow at parse time). Map the gate secrets into job-level
+    # env (job env CAN reference secrets); steps gate on `env.*` instead.
+    env:
+      HAS_SIGNING: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
+      HAS_NOTARIZE: ${{ secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -61,7 +67,7 @@ jobs:
 
       # ── Sign (Developer ID path, only when secrets are present) ──────────────
       - name: Import Developer ID certificate
-        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
+        if: ${{ env.HAS_SIGNING == 'true' }}
         env:
           APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
           APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
@@ -82,7 +88,7 @@ jobs:
           rm -f /tmp/signing_cert.p12
 
       - name: Sign with Developer ID
-        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
+        if: ${{ env.HAS_SIGNING == 'true' }}
         env:
           SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
         run: bash scripts/sign.sh "$GITHUB_WORKSPACE/iPhoneRemote.app"
@@ -90,7 +96,7 @@ jobs:
       # ── Notarize (only when notarization secrets are present) ──────────────
       # Users get Gatekeeper-clean installs without the "damaged app" prompt.
       - name: Notarize
-        if: ${{ secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        if: ${{ env.HAS_NOTARIZE == 'true' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -110,7 +116,7 @@ jobs:
       # Note when shipping an unsigned build (no Developer ID secrets configured).
       # install.sh handles local re-signing on the user's machine.
       - name: Note (unsigned build)
-        if: ${{ secrets.APPLE_SIGNING_CERTIFICATE == '' || secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD == '' }}
+        if: ${{ env.HAS_SIGNING != 'true' }}
         run: |
           echo "No APPLE_SIGNING_CERTIFICATE secret — shipping unsigned .app."
           echo "install.sh will create a local self-signed cert on the user's machine."
