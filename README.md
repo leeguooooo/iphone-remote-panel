@@ -14,6 +14,11 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <img src="assets/hero.png" alt="Controlling an iPhone from a browser — live screen plus a touch toolbar (Home, Spotlight, App Switcher, keyboard)" width="320">
 </p>
 
