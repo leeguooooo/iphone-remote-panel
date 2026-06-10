@@ -77,12 +77,28 @@ fn is_phone_shaped(w: &WindowInfo) -> bool {
 /// 2. Among candidates, find those with `size_ok`.
 /// 3. If any `size_ok` candidates exist:
 ///    a. If there are also `size_ok` non-setup candidates, discard setup windows.
-///    b. Sort survivors by: (phone-shaped DESC, on_screen DESC, area DESC, lower id),
-///       pick first. Portrait shape leads so a spurious near-square SCK window
-///       can't win on raw area (a hardware test caught a hidden 500×500 window
-///       outscoring the real 312×694 phone).
+///    b. Sort survivors by the ranking below, pick first.
 /// 4. If no `size_ok` candidate: fall back to the same ranking over all candidates.
 /// 5. Return `None` if no candidates at all.
+///
+/// # Ranking (most significant first)
+///
+/// 1. **`on_screen` DESC** — primary discriminator.  A hardware test on macOS 15
+///    caught a hidden, off-screen 500×500 SCK window that outscored the real
+///    312×694 phone on raw area.  Checking `on_screen` first beats it without
+///    making any shape assumptions.
+///
+/// 2. **`is_phone_shaped` DESC** (tiebreak) — on macOS 15/26 where both the real
+///    phone window and a junk window happen to be on-screen, portrait shape
+///    (`h ≥ w * 1.5`) still gives the right answer.  This is deliberately a
+///    *tiebreak* rather than the primary key so that on macOS 27 "Golden Gate" —
+///    where iPhone Mirroring windows are resizable and may be landscape or
+///    square — a real, user-resized window is never rejected just because it is
+///    no longer portrait.
+///
+/// 3. **area DESC** — largest window wins among ties.
+///
+/// 4. **lower id** — stable, deterministic tiebreaker.
 pub fn select_mirroring(windows: &[WindowInfo]) -> Option<&WindowInfo> {
     let candidates: Vec<&WindowInfo> = windows.iter().filter(|w| is_candidate(w)).collect();
     if candidates.is_empty() {
@@ -109,16 +125,22 @@ pub fn select_mirroring(windows: &[WindowInfo]) -> Option<&WindowInfo> {
         candidates
     };
 
-    // Rank: phone-shaped (portrait) first so a near-square junk window can't win
-    // on raw area; then on_screen; then largest area; then lower id for stability.
+    // Rank: on_screen first (beats the hidden junk window without shape assumptions);
+    // then phone-shaped as a tiebreak (still helps on macOS 15/26 when both windows
+    // happen to be on-screen); then largest area; then lower id for stability.
+    // on_screen is PRIMARY so that on macOS 27 "Golden Gate" a real window that the
+    // user has resized to landscape/square is never demoted below an off-screen junk
+    // window just because it lost the portrait-shape test.
     use std::cmp::Ordering;
     pool.into_iter().max_by(|a, b| {
-        match (is_phone_shaped(a), is_phone_shaped(b)) {
+        match (a.on_screen, b.on_screen) {
             (true, false) => return Ordering::Greater,
             (false, true) => return Ordering::Less,
             _ => {}
         }
-        match (a.on_screen, b.on_screen) {
+        // Tiebreak: portrait shape still helps on macOS 15/26 where both windows
+        // may be on-screen; ignored on macOS 27 where real windows may be landscape.
+        match (is_phone_shaped(a), is_phone_shaped(b)) {
             (true, false) => return Ordering::Greater,
             (false, true) => return Ordering::Less,
             _ => {}
@@ -297,13 +319,29 @@ mod tests {
     fn rejects_square_window_outscoring_real_phone_on_area() {
         // Hardware-caught regression: a hidden 500×500 SCK window (area 250000)
         // outscored the real 312×694 phone (area 216528) under area-first ranking.
-        // Portrait shape must win regardless of the larger area.
+        // `on_screen` is the PRIMARY ranking key — the off-screen square must lose
+        // to the on-screen phone regardless of its larger area (shape is only a
+        // tiebreak now; see the macOS 27 rationale on select_mirroring).
         let mut square = phone_window(77, 500.0, 500.0);
         square.title = String::new(); // off-screen/empty-title junk window
         square.on_screen = false;
         let windows = vec![square, phone_window(10, 312.0, 694.0)];
         let sel = select_mirroring(&windows).unwrap();
-        assert_eq!(sel.id, 10, "must pick the portrait phone, not the bigger square");
+        assert_eq!(sel.id, 10, "must pick the on-screen phone, not the bigger off-screen square");
+    }
+
+    /// When BOTH windows are on-screen, `is_phone_shaped` is the tiebreak: on
+    /// macOS 15/26 (portrait-locked) an on-screen portrait phone beats an
+    /// on-screen square junk window even when the square has more area.  This
+    /// pins the tiebreak semantics — on macOS 27 a user-resized landscape real
+    /// window with an on-screen portrait junk sibling would lose this tiebreak,
+    /// a known limitation until hardware evidence says otherwise.
+    #[test]
+    fn onscreen_portrait_beats_onscreen_square_via_shape_tiebreak() {
+        let mut square = phone_window(77, 500.0, 500.0); // on_screen=true by default
+        square.title = String::new();
+        let windows = vec![square, phone_window(10, 312.0, 694.0)];
+        assert_eq!(select_mirroring(&windows).unwrap().id, 10);
     }
 
     #[test]
@@ -311,6 +349,45 @@ mod tests {
         // Shape tie → area still decides (no regression to picks_largest).
         let windows = vec![phone_window(1, 312.0, 694.0), phone_window(2, 390.0, 844.0)];
         assert_eq!(select_mirroring(&windows).unwrap().id, 2);
+    }
+
+    // --- macOS 27 "Golden Gate" compatibility ---
+
+    /// macOS 27 makes the Mirroring window resizable; the user may have dragged it
+    /// to a landscape 800×600 layout.  The real window (on_screen=true, landscape)
+    /// must beat an off-screen portrait window because `on_screen` is the primary
+    /// ranking key — portrait shape is only a tiebreak.
+    #[test]
+    fn macos27_landscape_on_screen_beats_offscreen_portrait() {
+        // Landscape "real" window the user resized on macOS 27.
+        let mut landscape = phone_window(20, 800.0, 600.0);
+        landscape.on_screen = true;
+
+        // Old portrait window that is now off-screen (minimised, wrong display, etc.).
+        let mut portrait_offscreen = phone_window(10, 312.0, 694.0);
+        portrait_offscreen.on_screen = false;
+
+        let windows = vec![portrait_offscreen, landscape];
+        let sel = select_mirroring(&windows).unwrap();
+        assert_eq!(
+            sel.id, 20,
+            "on-screen landscape window must win over off-screen portrait on macOS 27"
+        );
+    }
+
+    /// Single on-screen landscape window (macOS 27 resized) — no portrait competitor.
+    /// Must be selected without any rejection based on aspect ratio.
+    #[test]
+    fn macos27_landscape_only_candidate_is_selected() {
+        let mut landscape = phone_window(30, 800.0, 600.0);
+        landscape.on_screen = true;
+
+        let windows = vec![landscape];
+        let sel = select_mirroring(&windows).unwrap();
+        assert_eq!(
+            sel.id, 30,
+            "a lone on-screen landscape window must not be rejected on macOS 27"
+        );
     }
 
     // --- menubar (out-of-size) falls back ---
