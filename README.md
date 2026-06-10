@@ -180,6 +180,19 @@ Add to your `claude_desktop_config.json` (or Claude Code MCP config):
 See [`crates/mcp/README.md`](crates/mcp/README.md) for full tool schemas and build
 instructions.
 
+## Shortcuts bridge (experimental)
+
+![Shortcuts bridge](assets/shortcuts-bridge.png)
+
+Beyond tapping through the UI, an agent can reach **native iOS APIs** — battery,
+Apple Health, Location, Messages, HomeKit — through one curated bridge shortcut.
+The daemon triggers the **"iU Bridge"** Shortcut by name (clipboard verb + Spotlight),
+the shortcut dispatches on that verb to the matching native action and **POSTs
+structured JSON back to `/agent/inbox`** — deterministic data instead of screen-scraping.
+This is an *additive* fast path: UI automation (tap / scroll, any app) stays the
+universal fallback. See [`shortcuts/README.md`](shortcuts/README.md) and the verb map in
+[`shortcuts/registry.json`](shortcuts/registry.json).
+
 ## Agent skill
 
 Teach any skills-capable agent (Claude Code, etc.) to drive your phone — including
