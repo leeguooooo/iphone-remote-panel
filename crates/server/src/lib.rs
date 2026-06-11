@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod runtime_dir;
 pub mod signaling;
 pub mod turn;
+pub mod wda;
 pub mod webrtc;
 
 /// Re-export of the `core` crate under a non-`core` name.
