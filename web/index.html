@@ -267,6 +267,16 @@
       color: var(--muted); border-radius: 12px; padding: 12px 12px; font-size: 14px; cursor: pointer;
     }
 
+    /* ── L2 stills fallback (Mirroring gone but WDA alive) ───────── */
+    #stillFrame {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: contain;
+      display: none;
+      pointer-events: none;   /* taps still land on #videoArea */
+    }
+    #stillFrame.active { display: block; }
+
     /* ── Offline / stall overlay ────────────────────────────────── */
     #offlineOverlay {
       position: absolute;
@@ -335,6 +345,9 @@
   <div id="videoArea">
     <video id="screen" autoplay playsinline webkit-playsinline muted
            disablePictureInPicture disableRemotePlayback></video>
+    <!-- L2 stills fallback: shown when the Mirroring window is gone but the
+         daemon can still capture via WDA (GET /agent/screenshot, cookie-authed) -->
+    <img id="stillFrame" alt="">
     <canvas id="gridCanvas"></canvas>
     <div id="tapDot"></div>
 
@@ -496,6 +509,40 @@ function showOverlay(kind) {
   offlineOverlay.classList.add('visible');
   paintDot();
 }
+/* ── L2 stills fallback ──────────────────────────────────────────
+   When Mirroring dies (phone in use / disconnected) the WebRTC track has no
+   real pixels, but the daemon's /agent/screenshot can still capture via WDA
+   on the phone. Poll it as stills so the page never goes blank. The endpoint
+   accepts the login session cookie, so no extra credential is needed. */
+const stillFrame = document.getElementById('stillFrame');
+let stillsTimer = null, stillsUrl = null, stillsBusy = false;
+async function fetchStill() {
+  if (stillsBusy) return;
+  stillsBusy = true;
+  try {
+    const r = await fetch('/agent/screenshot?t=' + Date.now(), { cache: 'no-store' });
+    if (r.ok) {
+      const blob = await r.blob();
+      const next = URL.createObjectURL(blob);
+      stillFrame.src = next;
+      if (stillsUrl) URL.revokeObjectURL(stillsUrl);
+      stillsUrl = next;
+      stillFrame.classList.add('active');
+      olSub.textContent = '镜像离线 — 静帧模式(每 2.5 秒刷新,仍可点按操作)';
+    }
+  } catch (_) { /* offline poll is best-effort */ }
+  stillsBusy = false;
+}
+function startStills() {
+  if (stillsTimer) return;
+  fetchStill();
+  stillsTimer = setInterval(fetchStill, 2500);
+}
+function stopStills() {
+  if (stillsTimer) { clearInterval(stillsTimer); stillsTimer = null; }
+  stillFrame.classList.remove('active');
+}
+
 function hideOverlay() {
   if (overlayState === 'hidden') return;
   overlayState = 'hidden';
@@ -857,8 +904,8 @@ async function connectWs() {
       // Daemon-side truth about the Mirroring window. Keepalive frames keep
       // flowing when the window vanishes, so this signal (not frame flow)
       // drives the "phone gone" overlay.
-      if (msg.present === false) showOverlay('gone');
-      else if (overlayState === 'gone') hideOverlay();
+      if (msg.present === false) { showOverlay('gone'); startStills(); }
+      else { if (overlayState === 'gone') hideOverlay(); stopStills(); }
     }
   };
 }

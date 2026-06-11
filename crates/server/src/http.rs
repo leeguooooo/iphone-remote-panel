@@ -718,15 +718,27 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 /// Captures the Mirroring window via [`core::capture::screenshot_mirroring_png`]
 /// (uses `screencapture -l <window_id>` internally — no external cua-driver
 /// dependency).  503 if the Mirroring window is not currently found.
+///
+/// Auth: agent bearer **or** a valid session cookie. The cookie path exists for
+/// the web client's stills-fallback (when Mirroring dies the page polls this
+/// endpoint) — a logged-in viewer already sees these pixels as video, so the
+/// privilege is identical. The cookie is checked FIRST so browser polling never
+/// touches the bearer auth-limiter (5 misses there lock the agent API for 30s).
 async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => return with_security_headers(
-            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-        ),
-        AgentAuth::Denied => return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        ),
-        AgentAuth::Ok => {}
+    // Cookie counts only when a password is actually configured — in a
+    // token-only deployment `is_authed` would otherwise wave everyone through
+    // (it treats password=None as open mode).
+    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
+    if !cookie_ok {
+        match agent_auth(&state, &headers) {
+            AgentAuth::Locked => return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            ),
+            AgentAuth::Denied => return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            ),
+            AgentAuth::Ok => {}
+        }
     }
     let png = tokio::task::spawn_blocking(core::capture::screenshot_mirroring_png).await;
     match png {
