@@ -146,20 +146,39 @@ impl WdaClient {
         Ok(())
     }
 
-    /// Coordinate tap fallback via WDA's helper (`POST /wda/tap/0`, absolute
-    /// points). Useful when there's no addressable element; still synthesized on
-    /// the phone, so no host-cursor contention. Coords are WDA points (top-left
-    /// origin), NOT our normalized [0,1] — convert via window size first.
+    /// Coordinate tap via the W3C Actions API (`POST /session/<id>/actions`, a
+    /// touch down-up at the point). Useful when there's no addressable element;
+    /// still synthesized on the phone, so no host-cursor contention. Coords are
+    /// WDA points (top-left origin), NOT our normalized [0,1] — convert via
+    /// window size first.
+    ///
+    /// The older `/wda/tap/0` helper 404s on current WDA builds (verified on
+    /// 14.1.1 / iOS 27): the route was element-scoped (`/wda/tap/<element>`) and
+    /// element `0` no longer resolves. `/actions` is the W3C-standard path and is
+    /// present across builds, so a coordinate tap never silently falls through to
+    /// the Mirroring (L3) injector — which drops the event when the phone is in
+    /// hand and the Mirroring window isn't frontmost.
     pub async fn tap_point(&mut self, x: f64, y: f64) -> Result<()> {
         let sid = self.ensure_session().await?.to_string();
         self.http
-            .post(format!("{}/session/{}/wda/tap/0", self.base, sid))
-            .json(&serde_json::json!({ "x": x, "y": y }))
+            .post(format!("{}/session/{}/actions", self.base, sid))
+            .json(&serde_json::json!({
+                "actions": [{
+                    "type": "pointer",
+                    "id": "finger1",
+                    "parameters": { "pointerType": "touch" },
+                    "actions": [
+                        { "type": "pointerMove", "duration": 0, "x": x, "y": y },
+                        { "type": "pointerDown", "button": 0 },
+                        { "type": "pointerUp", "button": 0 }
+                    ]
+                }]
+            }))
             .send()
             .await
-            .context("POST /wda/tap")?
+            .context("POST /actions")?
             .error_for_status()
-            .context("/wda/tap status")?;
+            .context("/actions status")?;
         Ok(())
     }
 
@@ -197,6 +216,68 @@ impl WdaClient {
             .context("POST /wda/keys")?
             .error_for_status()
             .context("/wda/keys status")?;
+        Ok(())
+    }
+
+    /// Dismiss the on-screen keyboard so it stops covering a web page's own
+    /// submit/next buttons.
+    ///
+    /// For a web keyboard the dismiss affordance is the **form-assistant-bar
+    /// button** ("Hide keyboard" / CN "隐藏键盘"), which lives *outside* the
+    /// `XCUIElementTypeKeyboard` subtree — so WDA's own `POST
+    /// /wda/keyboard/dismiss` (it only taps keyboard *keys*) is a no-op here.
+    /// Hardware-verified: tapping that accessory button is what actually works.
+    /// So we find a Button whose name/label is one of the locale-specific
+    /// dismiss labels and tap it; if none is present we fall back to the native
+    /// `/wda/keyboard/dismiss` (covers system keyboards that do have a Done key).
+    /// Best-effort throughout — no keyboard up is success, not an error.
+    pub async fn dismiss_keyboard(&mut self) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        const LABELS: &[&str] = &[
+            "Hide keyboard", "隐藏键盘", "キーボードを閉じる", "閉じる", "完了",
+            "Done", "收起键盘", "關閉鍵盤",
+        ];
+        // NSPredicate: match the accessory dismiss button by name OR label.
+        let quoted = LABELS
+            .iter()
+            .map(|l| format!("'{}'", l.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let predicate = format!(
+            "type == 'XCUIElementTypeButton' AND (name IN {{{quoted}}} OR label IN {{{quoted}}})"
+        );
+        if let Ok(resp) = self
+            .http
+            .post(format!("{}/session/{}/element", self.base, sid))
+            .json(&serde_json::json!({ "using": "predicate string", "value": predicate }))
+            .send()
+            .await
+        {
+            if let Ok(env) = resp.json::<Envelope<serde_json::Value>>().await {
+                if let Some(eid) = env
+                    .value
+                    .get("ELEMENT")
+                    .or_else(|| env.value.get("element-6066-11e4-a52e-4f735466cecf"))
+                    .and_then(|v| v.as_str())
+                {
+                    let _ = self
+                        .http
+                        .post(format!("{}/session/{}/element/{}/click", self.base, sid, eid))
+                        .json(&serde_json::json!({}))
+                        .send()
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+        // No accessory button (native keyboard or already gone) — try the
+        // built-in dismiss with a key list, then give up silently.
+        let _ = self
+            .http
+            .post(format!("{}/session/{}/wda/keyboard/dismiss", self.base, sid))
+            .json(&serde_json::json!({ "keyNames": ["Done", "完了", "return", "前往", "search"] }))
+            .send()
+            .await;
         Ok(())
     }
 

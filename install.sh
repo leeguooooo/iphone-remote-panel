@@ -177,22 +177,56 @@ ok "Log directory: $LOG_DIR"
 # a password is mandatory here — generated if the user didn't supply one.
 HOST="${PHONE_REMOTE_HOST:-0.0.0.0}"
 PORT="${PHONE_REMOTE_PORT:-44321}"
+
+# Read a single EnvironmentVariables key out of the existing plist (if any), so a
+# re-install preserves values the user set on a prior run instead of silently
+# dropping them. Empty string when the plist or key is absent.
+plist_env_get() {
+    [ -f "$PLIST_DST" ] || { printf ''; return; }
+    /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$PLIST_DST" 2>/dev/null || printf ''
+}
+
+# Password precedence: explicit env > existing plist > freshly generated.
+# Re-running install must NOT rotate a working password (it would break every
+# saved client/bookmark) — only mint one when there genuinely isn't one yet.
 PASSWORD="${PHONE_REMOTE_PASSWORD:-}"
-GENERATED_PW=0
+PW_SOURCE="env"
+if [ -z "$PASSWORD" ]; then
+    PASSWORD="$(plist_env_get PHONE_REMOTE_PASSWORD)"
+    PW_SOURCE="existing"
+fi
 if [ -z "$PASSWORD" ]; then
     PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
     [ -n "$PASSWORD" ] || PASSWORD="$(date +%s | shasum | head -c 16)"
-    GENERATED_PW=1
+    PW_SOURCE="generated"
 fi
-if [ "$GENERATED_PW" = "1" ]; then
-    ok "Generated a random access password (shown at the end)"
-else
-    ok "Using password from \$PHONE_REMOTE_PASSWORD"
-fi
+case "$PW_SOURCE" in
+    env)      ok "Using password from \$PHONE_REMOTE_PASSWORD" ;;
+    existing) ok "Reusing the password from the existing install" ;;
+    generated) ok "Generated a random access password (shown at the end)" ;;
+esac
 
 # Best-effort LAN IP for the final connect instructions.
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 [ -n "$LAN_IP" ] || LAN_IP="<this-mac-LAN-ip>"
+
+# Optional L2 element layer (WebDriverAgent on the phone). Precedence mirrors the
+# password: explicit env > existing plist > absent. Without this the daemon runs
+# L3-only (CGEvent against the Mirroring window), which silently drops input when
+# the phone is in hand / Mirroring isn't frontmost — so a re-install must carry a
+# previously-set URL forward, not wipe it.
+WDA_URL="${PHONE_REMOTE_WDA_URL:-}"
+[ -n "$WDA_URL" ] || WDA_URL="$(plist_env_get PHONE_REMOTE_WDA_URL)"
+WDA_PLIST_BLOCK=""
+if [ -n "$WDA_URL" ]; then
+    WDA_PLIST_BLOCK="        <key>PHONE_REMOTE_WDA_URL</key>
+        <string>${WDA_URL}</string>
+"
+    ok "L2 element layer (WDA) wired: $WDA_URL"
+else
+    info "L2 element layer not set (L3 input only). For on-device taps + element"
+    info "  tree, run scripts/setup-wda.sh, then export PHONE_REMOTE_WDA_URL and re-run."
+fi
 
 # Optional Cloudflare TURN (cross-network access). If both are exported, embed
 # them so the daemon mints ephemeral relay credentials. Absent → STUN-only
@@ -251,7 +285,7 @@ cat > "$PLIST_DST" <<PLIST
         <string>${PORT}</string>
         <key>PHONE_REMOTE_PASSWORD</key>
         <string>${PASSWORD}</string>
-${CF_PLIST_BLOCK}    </dict>
+${WDA_PLIST_BLOCK}${CF_PLIST_BLOCK}    </dict>
 </dict>
 </plist>
 PLIST

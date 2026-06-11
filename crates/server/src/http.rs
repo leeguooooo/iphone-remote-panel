@@ -573,6 +573,22 @@ async fn agent_input(
             let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let label = v.get("label").and_then(|l| l.as_str());
             match (typ, label) {
+                // Dismiss the on-screen keyboard so it stops covering a page's
+                // own submit/next buttons. `{"type":"keyboard"}` or
+                // `{"type":"key","name":"dismiss"|"hide"}`. WDA-only — there is
+                // no L3 equivalent, and a missing keyboard is a no-op, so this
+                // always reports ok.
+                ("keyboard", _) | ("key", _)
+                    if typ == "keyboard"
+                        || v.get("name")
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|n| matches!(n, "dismiss" | "hide")) =>
+                {
+                    let _ = wda.lock().await.dismiss_keyboard().await;
+                    return with_security_headers(
+                        (StatusCode::OK, "ok (wda keyboard dismiss)").into_response(),
+                    );
+                }
                 ("tap", Some(label)) => {
                     let r = wda.lock().await.click_label(label).await;
                     return match r {
