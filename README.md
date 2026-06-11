@@ -245,14 +245,16 @@ LaunchAgent install. Next:
   `tap` / `type` / `scroll` / `screenshot` as native tools.
 - [ ] **Cross-network validation** of the Cloudflare dynamic TURN path with a real key
   (the minting + refresh code already ships; needs an end-to-end run off-LAN).
-- [ ] **Element-tree control via WebDriverAgent (the "L2" layer).** Today's input is
-  pixel-level (vision → coordinates → a synthetic click on the host Mac's one shared
-  cursor): slow, drift-prone, and it fights a human using the same Mac. WDA runs *on the
-  phone* and drives iOS's own accessibility tree — no cursor contention, no coordinate
-  drift, and **CJK text input goes straight through** (bypassing the keycode/IME caveat).
-  It becomes the default path; mirroring + CGEvent stays as the universal pixel fallback.
-  Setup + every hardware-validated pitfall (incl. *iOS version must not outrun Xcode's
-  DDI*) is in **[`docs/wda-setup.html`](docs/wda-setup.html)**.
+- [~] **Element-tree control via WebDriverAgent (the "L2" layer)** — *spike validated on
+  hardware (iPhone 17 / iOS 27); daemon integration pending.* Today's input is pixel-level
+  (vision → coordinates → a synthetic click on the host Mac's one shared cursor): slow,
+  drift-prone, and it fights a human using the same Mac. WDA runs *on the phone* and drives
+  iOS's own accessibility tree. Proven on real hardware: read the element tree (Chinese
+  labels included), tap by label (no cursor contention), and **CJK text goes straight in
+  cleanly** (where the L3 keycode path produces Pinyin-IME garbage). Remaining: wire the
+  [`wda` client](crates/server/src/wda.rs) into the agent routing (L1 verb → L2 element →
+  L3 pixel) and a `setup-wda.sh`. Setup + every hardware-validated pitfall is in
+  **[`docs/wda-setup.html`](docs/wda-setup.html)**.
 - [x] **Release binaries** in CI + a one-line `curl … install.sh | sh` install.
 - [ ] A short **demo** (GIF / video) of an AI agent driving the phone through the API.
 

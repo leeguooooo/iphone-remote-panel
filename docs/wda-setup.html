@@ -78,21 +78,22 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 <h2>踩坑清单(真机验证)</h2>
 
 <div class="pit">
-  <h3>① iOS 版本不能超前于 Xcode 的 DDI <span class="tag block">头号硬坑</span></h3>
-  <p>Xcode 自带的 Developer Disk Image(DDI)必须 <strong>≥ 设备 iOS 版本</strong>才能挂载。装了 iOS beta 的手机配旧 Xcode,开发服务永远起不来 —— <code>devicectl</code> 显示 <code>ddiServicesAvailable: false</code>,xcodebuild 报 <code>"Developer Disk Image is not mounted… Ensure that the device is unlocked"</code>。<strong>注意这句和「锁屏」报错文案一模一样,极易误判成锁屏问题。</strong></p>
-  <p>排查:<code>plutil -p /Library/Developer/DeveloperDiskImages/iOS_DDI/version.plist</code> 看 <code>ProductBuildVersion</code>(如 <code>17A400</code>=iOS 26.0),对比手机 <em>设置→通用→关于本机</em> 的版本。</p>
-  <p>修复:升级 Xcode 到能覆盖该 iOS 的版本(iOS beta 用户要装对应 Xcode beta);或别在 beta 系统的设备上跑 WDA。<strong>结论:WDA 路线要求「设备 iOS ≤ Xcode 支持的最高 iOS」。</strong></p>
-  <p><strong>易错点:点版本不跨大版本。</strong> 设备是 iOS 27.0(大版本)时,Xcode 26.5(DDI build 17F42 = iOS 26.5)再新也不行 —— 必须装 <strong>Xcode 27.x beta</strong>(release notes 写 "iOS 27 SDK")。Apple 年份命名下 26→27 是跨大版本。iOS 17+ 的 DDI 是设备个性化的 cryptex,由对应 Xcode 现场拉取,<strong>手动塞 DDI 的老办法对 iOS 17+ 不再适用</strong>,所以只能装对的 Xcode。</p>
+  <h3>① 让 DDI 挂载:手机必须解锁 + 保持连接 <span class="tag block">真·头号坑</span></h3>
+  <p>开发服务起不来时报 <code>"Developer Disk Image is not mounted… Ensure that the device is unlocked"</code>,<code>devicectl</code> 显示 <code>ddiServicesAvailable: false</code>。**最常见的真实原因是手机锁屏 / 刚连上还没握手完**,不是版本问题。修复:**解锁手机、保持亮屏不锁、保持连接(USB 最稳)**,等 <code>ddiServicesAvailable</code> 翻成 true 再 build。可以轮询等:</p>
+  <pre><code>until xcrun devicectl device info details --device &lt;UUID&gt; \
+  | grep -q "ddiServicesAvailable: true"; do sleep 4; done</code></pre>
+  <aside><strong>更正一个曾经的误判:</strong> 一度以为「设备 iOS 大版本必须 ≤ Xcode 的 DDI」是硬性卡点(iOS 27 设备 + Xcode 26.5)。真机验证<strong>推翻了它</strong> —— Xcode 26.5(DDI build 17F42 = iOS 26.5)成功把 WDA 装上了 <strong>iOS 27.0</strong> 的设备并尝试启动。所以「版本差一截」往往能用,真正卡住的是<strong>解锁/连接</strong>(本坑)和<strong>证书信任</strong>(见「手机上要信任开发者证书」一节)。只有当 DDI 比设备老很多、确实拒绝挂载时才需要升 Xcode。</aside>
 </div>
 
 <div class="pit">
-  <h3>② 手机锁屏 → 开发服务起不来(另一个独立原因,文案相同)</h3>
-  <p>首次挂载 DDI 必须保持手机<strong>解锁</strong>。报错与坑①完全一样,所以先排除版本不匹配,再确认是否锁屏。建议跑 WDA 期间把自动锁定调长。</p>
+  <h3>② 手机上要信任开发者证书 <span class="tag block">必撞</span></h3>
+  <p>编译/签名/装机都成功后,启动 runner 报 <code>"The application could not be launched because the Developer App Certificate is not trusted."</code>(或更隐晦的 <code>"Lost pending connection to the test runner before launch"</code>)。这不是构建失败,是 iOS 拒绝启动未受信任的开发者 app。</p>
+  <p>修复:手机上 <em>设置 → 通用 → VPN 与设备管理 → 「开发者 App」下选你的 Apple Development 证书 → 信任</em>。<strong>注意找的是「Apple Development: &lt;Apple ID&gt;」证书,不是 app 名(app 显示为 WebDriverAgentRunner)。</strong> 换 bundle id 重装后要重新信任一次。</p>
 </div>
 
 <div class="pit">
   <h3>③ 两套设备 ID,别搞混</h3>
-  <p><code>xcrun devicectl list devices</code> 显示的是 CoreDevice UUID(如 <code>98E449E4-…</code>);xcodebuild <code>-destination "id=…"</code> 要的是<strong>老式 UDID</strong>(如 <code>00008110-001C…</code>)。用错直接报 <code>"Unable to find a device matching the provided destination specifier"</code>。查正确 UDID:<code>xcodebuild -showdestinations</code> 或 <code>devicectl device info details</code> 里的 <code>udid</code> 字段。</p>
+  <p><code>xcrun devicectl list devices</code> 显示的是 CoreDevice UUID(如 <code>96ECE27A-…</code>);xcodebuild <code>-destination "id=…"</code> 要的是<strong>老式 UDID</strong>(如 <code>00008150-000A…</code>)。用错直接报 <code>"Unable to find a device matching the provided destination specifier"</code>。查正确 UDID:<code>xcodebuild -showdestinations</code> 或 <code>devicectl device info details</code> 里的 <code>udid</code> 字段。</p>
 </div>
 
 <div class="pit">
@@ -101,8 +102,8 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 </div>
 
 <div class="pit">
-  <h3>⑤ 手机上要信任开发者证书</h3>
-  <p>装上后首次启动若被拒,去 <em>设置 → 通用 → VPN 与设备管理</em> 信任你的开发者证书。</p>
+  <h3>⑤ 不能用 <code>PRODUCT_NAME</code> 改显示名(会搞坏构建)</h3>
+  <p>想把手机上的 app 名从 WebDriverAgentRunner 换成自己的品牌,<strong>千万别在命令行传 <code>PRODUCT_NAME=…</code></strong> —— 它是<strong>全局</strong>覆盖,会把 WDA 的内部框架 <code>WebDriverAgentLib</code> 也改名,导致它自身的 <code>#import &lt;WebDriverAgentLib/FBElement.h&gt;</code> 全部找不到、编译失败。<strong>安全的只有 <code>PRODUCT_BUNDLE_IDENTIFIER</code></strong>(全局覆盖无害)。干净改显示名要改单个 target 的设置(放进 setup 脚本),不能粗暴全局覆盖。</p>
 </div>
 
 <div class="pit">
@@ -110,22 +111,27 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   <p>免费 Personal Team 签出来的 WDA 7 天失效,要每周重装;付费开发者账号(¥688/年)签名一年有效。长期部署建议付费账号。</p>
 </div>
 
-<h2>跑通之后(验证清单)</h2>
-<p>WDA 起来后(<code>http://&lt;phone-ip&gt;:8100</code>),下列能力是这条路线相对镜像+CGEvent 的核心优势:</p>
+<div class="pit">
+  <h3>⑦ 跨子网也能直连;手机频繁锁屏挡操作</h3>
+  <p>WDA 监听手机的 <code>0.0.0.0:8100</code>,日志打印 <code>ServerURLHere-&gt;http://&lt;phone-ip&gt;:8100&lt;-ServerURLHere</code>。实测<strong>手机和 Mac 不在同一 /24 子网也能直连</strong>(只要可路由);否则用 <code>iproxy 8100 8100</code> 走 USB 转发。<br>另:很多操作(启动 app、输入)要求手机解锁,默认「自动锁定 30 秒」会反复打断 —— 把它设成<strong>永不</strong>。讽刺的是 <strong>agent 自己就能用 WDA 设</strong>:按标签点 <em>设置 → 显示与亮度 → 自动锁定 → 永不</em>(本项目已这么验证过)。但首次解锁仍需真人(Face ID/密码),WDA 不能解锁。</p>
+</div>
+
+<h2>已验证(iPhone 17 / iOS 27 真机,2026-06-11)</h2>
+<p>整条 L2 链路在真机跑通,以下能力是相对镜像+CGEvent(L3)的核心优势,<strong>均已实测</strong>:</p>
 <ul>
-  <li><code>GET /source</code> — 拿到元素树(含中文 App 的 label)。</li>
-  <li>按元素点击 / <code>POST …/value</code> 写值 — <strong>不碰 Mac 光标</strong>,人可同时正常用电脑。</li>
-  <li>type 直接送字符串 — <strong>绕过 keycode / 拼音 IME 整个坑,中文直通</strong>。</li>
-  <li>按元素 label 定位 — 无坐标漂移。</li>
+  <li><code>GET /source</code> — 元素树<strong>直接读到中文 UI</strong>(设置项、日期标签)。</li>
+  <li>按元素 label 定位 + 点击 — <strong>无坐标漂移、不碰 Mac 光标</strong>(用它驱动设置把自动锁定设成「永不」,人没动电脑)。</li>
+  <li><code>POST /wda/keys</code> 送字符串 — <strong>中文一次到位</strong>:在备忘录里干净打出整段中文,而同机 L3 像素路径打出的是 <code>我爱上…AI阿根廷鸥鸟啊</code> 这种被拼音 IME 吃 keycode 的乱码。WDA 直接把 Unicode 送进文本框,绕开键盘/IME。</li>
 </ul>
 
 <aside>
   <strong>这一层不取代镜像。</strong> 镜像 + WebRTC 仍是人类远程桌面、视觉兜底、以及 WDA 覆盖不到时的保险。
-  agent 的默认路径优先 L1 动词 → L2 元素 → L3 像素兜底。
+  agent 的默认路径优先 L1 动词 → L2 元素 → L3 像素兜底。<br>
+  <strong>定位:</strong> L2 需要用户装 Xcode 自己编 WDA,与「一行 curl 安装」冲突 —— 所以 L3(像素,零 setup)是默认,L2(WDA)是高级/power-user 路径。
 </aside>
 
 <footer>
-  iphone-use · WDA 接入与踩坑 · 真机验证环境:macOS 26 / Xcode 26.0.1 / iPhone 14 (iOS 27.0 beta)。
+  iphone-use · WDA 接入与踩坑 · L2 真机验证:macOS 26 / Xcode 26.5(DDI 17F42=iOS 26.5)/ iPhone 17 (iOS 27.0)。
   本页随路线推进持续更新。
 </footer>
 </body>
