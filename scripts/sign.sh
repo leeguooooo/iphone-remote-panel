@@ -25,50 +25,73 @@ APP="${1:-"$(pwd)/iPhoneUse.app"}"
 CERT_NAME="iPhoneUse Local Signing"
 BUNDLE_ID="com.leeguoo.iphone-use"
 
-# ── Helper: openssl fallback for self-signed cert import ─────────────────────
-# Must be defined before any code path that calls it.
-# Only called when 'security create-keychain-cert' is unavailable.
-_create_selfsigned_cert_via_openssl() {
-    local name="$1"
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    local key="$tmpdir/key.pem"
-    local cert="$tmpdir/cert.pem"
-    local p12="$tmpdir/cert.p12"
-    local pass="iphone-use-local-only"
+# Dedicated signing keychain. We own its password, so partition-list setup is
+# fully non-interactive — no GUI "Always Allow" prompt, no login password.
+SIGN_KEYCHAIN="$HOME/Library/Keychains/iphone-use-signing.keychain-db"
+SIGN_KC_PASS="iphone-use-local-only"
 
-    # Generate key + self-signed cert
-    openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
-        -keyout "$key" -out "$cert" \
-        -subj "/CN=$name/O=iPhoneUse/OU=Code Signing" \
-        -extensions v3_ca \
-        2>/dev/null
+# ── Create (once) a self-signed Code Signing identity in a dedicated keychain ─
+# A STABLE signing identity keeps the Designated Requirement constant across
+# rebuilds, so TCC grants (Screen Recording, Accessibility) survive — unlike
+# ad-hoc signing, whose cdhash changes every build and drops the grants.
+_ensure_local_signing_cert() {
+    # Already present? Use `find-certificate`, NOT `find-identity`. A self-signed
+    # cert isn't *trusted*, so BOTH `find-identity -v` and `-p codesigning` hide
+    # it (they apply a trust/validity policy) even though codesign signs with it
+    # fine. Using find-identity here made the check always fail → a NEW cert (new
+    # hash → new DR) every run, defeating the whole point. find-certificate looks
+    # it up by name regardless of trust.
+    if security find-certificate -c "$CERT_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1; then
+        return 0
+    fi
 
-    # Pack into PKCS#12 for Keychain import
-    openssl pkcs12 -export \
-        -in "$cert" -inkey "$key" \
-        -out "$p12" \
-        -passout "pass:$pass" \
-        -name "$name" \
-        2>/dev/null
+    echo "Creating self-signed Code Signing identity '$CERT_NAME' (one-time) ..." >&2
+    local tmpdir; tmpdir="$(mktemp -d)"
+    local key="$tmpdir/key.pem" cert="$tmpdir/cert.pem" p12="$tmpdir/cert.p12"
+    local ext="$tmpdir/ext.cnf" p12pass="pw"
 
-    # Import into login keychain; mark as trusted for Code Signing
-    security import "$p12" \
-        -k ~/Library/Keychains/login.keychain-db \
-        -P "$pass" \
-        -T /usr/bin/codesign \
-        -f pkcs12
+    # A code-signing LEAF cert: CA:false + the codeSigning EKU is what codesign
+    # requires (the old v3_ca extension produced a CA cert codesign rejects).
+    cat > "$ext" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = $CERT_NAME
+[v3]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+EOF
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+        -keyout "$key" -out "$cert" -config "$ext" 2>/dev/null
+    # -legacy: macOS `security import` can't read OpenSSL 3's default PKCS#12 AES.
+    openssl pkcs12 -export -legacy -in "$cert" -inkey "$key" -out "$p12" \
+        -passout "pass:$p12pass" -name "$CERT_NAME" 2>/dev/null
 
-    # Trust the cert for Code Signing
-    local cert_sha256
-    cert_sha256="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 \
-                   | sed 's/.*=//;s/://g')"
-    security set-key-partition-list \
-        -S apple-tool:,apple: \
-        -k "" \
-        ~/Library/Keychains/login.keychain-db 2>/dev/null || true
-
+    # Dedicated keychain whose password we know → no prompts, no login keychain.
+    security create-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
+    security set-keychain-settings "$SIGN_KEYCHAIN"          # no auto-lock timeout
+    security unlock-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN"
+    security import "$p12" -k "$SIGN_KEYCHAIN" -P "$p12pass" \
+        -T /usr/bin/codesign -A
+    # Authorize codesign to use the private key without a GUI prompt.
+    security set-key-partition-list -S apple-tool:,apple: -s \
+        -k "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" >/dev/null 2>&1
     rm -rf "$tmpdir"
+    echo "Created '$CERT_NAME' in $SIGN_KEYCHAIN" >&2
+}
+
+# Make the dedicated keychain visible to codesign's identity search.
+_add_signing_keychain_to_search() {
+    local cur
+    cur="$(security list-keychains -d user | sed 's/[" ]//g' | tr '\n' ' ')"
+    case " $cur " in
+        *" $SIGN_KEYCHAIN "*) : ;;  # already in the list
+        *) security list-keychains -d user -s "$SIGN_KEYCHAIN" $cur ;;
+    esac
+    security unlock-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
 }
 
 # ── Resolve signing identity ─────────────────────────────────────────────────
@@ -76,7 +99,7 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     IDENTITY="$SIGN_IDENTITY"
     echo "Using provided SIGN_IDENTITY: $IDENTITY"
 else
-    # Look for Developer ID first
+    # Prefer a real Developer ID if the user has one.
     DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null \
               | grep 'Developer ID Application' \
               | head -1 \
@@ -86,30 +109,11 @@ else
         IDENTITY="$DEV_ID"
         echo "Found Developer ID: $IDENTITY"
     else
-        # Fall back to self-signed cert; create it if missing
-        EXISTING="$(security find-certificate -c "$CERT_NAME" \
-                    ~/Library/Keychains/login.keychain-db 2>/dev/null || true)"
-        if [ -z "$EXISTING" ]; then
-            echo "Creating self-signed Code Signing cert: '$CERT_NAME' ..."
-            # Use the system Certificate Assistant CLI.
-            # Generates a 4096-bit RSA cert valid for 3650 days in the login keychain.
-            security create-keychain-cert \
-                -k ~/Library/Keychains/login.keychain-db \
-                -c "$CERT_NAME" \
-                -t "Code Signing" \
-                -s "$CERT_NAME" \
-                -Z \
-                2>/dev/null || {
-                # Fallback: use the older Keychain Assistant approach via
-                # a temporary self-signed cert config (macOS 12–15 compatible).
-                echo "security create-keychain-cert unavailable; using openssl fallback ..."
-                _create_selfsigned_cert_via_openssl "$CERT_NAME"
-            }
-            echo "Cert created: $CERT_NAME"
-        else
-            echo "Reusing existing self-signed cert: $CERT_NAME"
-        fi
+        # Stable self-signed identity in our dedicated keychain.
+        _ensure_local_signing_cert
+        _add_signing_keychain_to_search
         IDENTITY="$CERT_NAME"
+        echo "Using stable self-signed identity: $CERT_NAME"
     fi
 fi
 
@@ -130,7 +134,6 @@ fi
 echo "Signing binary: $BINARY ..."
 codesign \
     --force \
-    --options runtime \
     --sign "$IDENTITY" \
     --timestamp=none \
     "$BINARY"
@@ -138,7 +141,6 @@ codesign \
 echo "Signing bundle: $APP ..."
 codesign \
     --force \
-    --options runtime \
     --sign "$IDENTITY" \
     --timestamp=none \
     "$APP"

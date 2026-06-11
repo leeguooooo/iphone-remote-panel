@@ -264,7 +264,22 @@ ok "LaunchAgent plist written: $PLIST_DST"
 # ── Step 8 — Load / restart the LaunchAgent (no sudo; gui/$UID) ──────────────
 info "Loading LaunchAgent (gui/$UID_NUM) ..."
 
-# Unload if already running (idempotent)
+# Evict any PRIOR-label daemon first. Before v0.2.0 the label/app/bundle-id were
+# work.pwtk.iphone-remote / iPhoneRemote.app. A label change means the OLD
+# LaunchAgent is NOT superseded by ours — it keeps respawning and squats the
+# port, so the new daemon can't bind and the two race (flaky, served the wrong
+# build). Boot it out, disable its plist, and kill the old app.
+for OLD_LABEL in work.pwtk.iphone-remote; do
+    if launchctl print "gui/$UID_NUM/$OLD_LABEL" >/dev/null 2>&1; then
+        warn "Evicting old daemon: $OLD_LABEL (port-squat from a pre-rename install)"
+        launchctl bootout "gui/$UID_NUM/$OLD_LABEL" 2>/dev/null || true
+    fi
+    OLD_PLIST="$HOME/Library/LaunchAgents/$OLD_LABEL.plist"
+    [ -f "$OLD_PLIST" ] && mv "$OLD_PLIST" "$OLD_PLIST.disabled" 2>/dev/null || true
+done
+pkill -f "iPhoneRemote.app/Contents/MacOS" 2>/dev/null || true
+
+# Unload OUR label if already running (idempotent)
 launchctl bootout "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || true
 
 # Bootstrap from the new plist
