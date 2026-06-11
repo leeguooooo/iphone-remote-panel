@@ -169,25 +169,30 @@ fn serve() -> Result<()> {
     run_server(cfg, state)
 }
 
-/// Normalized center of the "Resume" button on the Mirroring "Connection
-/// Paused" screen (hardware-measured from a 708×1562 capture: ≈354/708,
-/// 980/1562). Stable relative to the window content rect.
-const RESUME_BUTTON: (f64, f64) = (0.5, 0.63);
+/// Normalized center of the recovery button on the Mirroring interstitials —
+/// "Resume" on "Connection Paused" (≈980/1562 = 0.627) and "Connect" on "iPhone
+/// in Use" (≈1014/1562 = 0.649). 0.64 sits in both buttons' overlap; x is dead
+/// center. Hardware-measured from 708×1562 captures; stable vs the content rect.
+const RECOVERY_BUTTON: (f64, f64) = (0.5, 0.64);
 
-/// Auto-recover the "Connection Paused" interstitial (issue #3). When the
-/// Mirroring window sits on the paused screen, click its Resume button to
-/// re-establish the session unattended.
+/// Auto-recover the Mirroring interstitials by clicking their recovery button
+/// (issue #3). **Opt-in / experimental — default OFF.**
 ///
-/// Guards against fighting the user / focus-stealing spam: skips while WDA is
-/// active (Mirroring can't be connected then), and rate-limits attempts — a
-/// still-locked phone won't accept Resume, and each attempt momentarily brings
-/// Mirroring frontmost. Default on; set `PHONE_REMOTE_NO_AUTO_RESUME=1` to
-/// disable (e.g. if a human wants the phone to stay yielded).
+/// Why off by default: macOS will NOT let a background LaunchAgent bring the
+/// iPhone Mirroring window frontmost while the phone is in active use ("iPhone
+/// in Use" — the screen literally says "Lock your iPhone to connect"), so the
+/// synthetic click is dropped (`could not be brought frontmost`). It can work
+/// for "Connection Paused" (phone locked, human idle), but not reliably enough
+/// to enable unattended. The honest signal — `mirror_state` + `drivable` in
+/// `/agent/status` — tells a human/agent WHEN to click Resume/Connect manually.
+///
+/// Set `PHONE_REMOTE_AUTO_RESUME=1` to try it anyway (rate-limited; clicks via
+/// the injector thread; skipped while WDA is active).
 fn spawn_pause_watchdog(state: Arc<AppState>) {
-    if std::env::var("PHONE_REMOTE_NO_AUTO_RESUME").is_ok_and(|v| !v.is_empty() && v != "0") {
-        tracing::info!("auto-resume watchdog disabled (PHONE_REMOTE_NO_AUTO_RESUME)");
-        return;
+    if !std::env::var("PHONE_REMOTE_AUTO_RESUME").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return; // disabled by default — see doc comment
     }
+    tracing::info!("auto-resume watchdog enabled (PHONE_REMOTE_AUTO_RESUME)");
     tokio::spawn(async move {
         use std::time::{Duration, Instant};
         const POLL: Duration = Duration::from_secs(5);
@@ -206,49 +211,43 @@ fn spawn_pause_watchdog(state: Arc<AppState>) {
             })
             .await
             .unwrap_or(core::capture::MirrorState::Active);
-            // Only the "Connection Paused" screen has a Resume button. "iPhone
-            // in Use" means a human is on the phone — don't fight them; wait.
-            if mstate != core::capture::MirrorState::Paused {
+            // Recover either interstitial — both carry a recovery button at the
+            // same spot. (Active = live, offline = no window: nothing to do.)
+            use core::capture::MirrorState;
+            if !matches!(mstate, MirrorState::Paused | MirrorState::InUse) {
                 continue;
             }
             if last_attempt.is_some_and(|t| t.elapsed() < COOLDOWN) {
                 continue; // still cooling down from the last click
             }
             last_attempt = Some(Instant::now());
-            tracing::info!("Mirroring paused — attempting auto-resume (issue #3)");
-            let posted = tokio::task::spawn_blocking(attempt_resume_click)
-                .await
-                .unwrap_or(false);
-            tracing::info!("auto-resume click posted={posted}");
+            tracing::info!("Mirroring {} — auto-recover: tapping recovery button (issue #3)", mstate.as_str());
+            // Enqueue the click on the INJECTOR thread (the same path agent taps
+            // use): it reliably brings Mirroring frontmost, whereas a direct
+            // CGEvent from this tokio blocking thread does not (NSWorkspace /
+            // app activation misbehaves off the injector thread). Take a short
+            // Agent lease first so the injector's gate permits the event.
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut control = state
+                    .control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let lease =
+                    control.acquire(core::control::Holder::Agent("auto-recover".into()), now);
+                *state
+                    .current_lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+            }
+            state
+                .injector
+                .send(core::input::InputEvent::Tap { x: RECOVERY_BUTTON.0, y: RECOVERY_BUTTON.1 });
         }
     });
-}
-
-/// Blocking: bring Mirroring frontmost and click the Resume button. Returns
-/// whether the click was posted (not whether Resume succeeded — a locked phone
-/// shows "unlock to continue"; the next poll re-checks).
-fn attempt_resume_click() -> bool {
-    use core::input::{inject, CgEventSink, InputEvent};
-    let geo = match core::capture::find_mirroring_geometry() {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!("auto-resume: no Mirroring geometry: {e:#}");
-            return false;
-        }
-    };
-    if !server::macos::ensure_mirroring_frontmost(std::time::Duration::from_millis(4000)) {
-        tracing::warn!("auto-resume: could not bring Mirroring frontmost");
-        return false;
-    }
-    let mut sink = CgEventSink::new();
-    let (x, y) = RESUME_BUTTON;
-    match inject(&InputEvent::Tap { x, y }, &geo, &mut sink) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!("auto-resume click failed: {e}");
-            false
-        }
-    }
 }
 
 /// Background update check: resolve the repo's latest release tag every 24h
