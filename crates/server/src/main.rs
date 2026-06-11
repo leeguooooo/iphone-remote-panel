@@ -162,6 +162,7 @@ fn serve() -> Result<()> {
                 }
             }),
         latest_release: Arc::new(Mutex::new(None)),
+        viewers: Arc::new(Mutex::new(server::signaling::ViewerRegistry::default())),
     });
 
     run_server(cfg, state)

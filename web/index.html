@@ -495,6 +495,7 @@ let lastRtt = '--', connState = 'new';
 
 /* ── Overlay state: 'hidden' | 'stalled' | 'disconnected' ────── */
 let overlayState = 'hidden';
+let queuedAhead = 0; /* issue #8: viewers ahead of us in the single-viewer queue */
 
 /* ── Toast ────────────────────────────────────────────────────── */
 let toastTimer = null;
@@ -520,6 +521,14 @@ function showOverlay(kind) {
   } else if (kind === 'gone') {
     olTitle.textContent = '手机已断开';
     olSub.textContent   = 'iPhone 镜像窗口已消失 — 检查手机与 Mac 的连接';
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'queued') {
+    /* issue #8: another viewer holds the live session — we wait in line and the
+       daemon promotes us (sends an offer) when they disconnect. */
+    olTitle.textContent = '会话占用中';
+    olSub.textContent   = (queuedAhead > 1)
+      ? `另一个观看者正在使用 — 已排队(前面还有 ${queuedAhead} 位)，对方断开后自动接入`
+      : '另一个观看者正在使用 — 已排队，对方断开后将自动接入';
     offlineOverlay.classList.add('disconnected');
   } else {
     olTitle.textContent = '画面已停止';
@@ -945,6 +954,11 @@ async function connectWs() {
       // drives the "phone gone" overlay.
       if (msg.present === false) { showOverlay('gone'); startStills(); }
       else { if (overlayState === 'gone') hideOverlay(); stopStills(); }
+    }
+    else if (msg.type === 'session_status') {
+      // issue #8 (queue + notify): another viewer holds the live session.
+      if (msg.state === 'queued') { queuedAhead = msg.ahead || 0; showOverlay('queued'); }
+      else if (msg.state === 'active') { if (overlayState === 'queued') hideOverlay(); }
     }
   };
 }

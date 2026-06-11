@@ -83,6 +83,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         wda: None,
         latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
     })
 }
 
@@ -127,6 +128,7 @@ fn build_state_with_agent_token(
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         wda: None,
         latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
     })
 }
 

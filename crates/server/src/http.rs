@@ -182,6 +182,10 @@ pub struct AppState {
     /// the first successful fetch (or when offline). Read by `agent_status`
     /// to surface `update_available` to agents and the web client.
     pub latest_release: Arc<Mutex<Option<String>>>,
+    /// Single-active-viewer arbitration for `/ws` (issue #8: queue + notify).
+    /// One viewer streams at a time; others wait in line and are promoted when
+    /// the active one disconnects. Read by `/agent/status` as `viewer_count`.
+    pub viewers: Arc<Mutex<crate::signaling::ViewerRegistry>>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -565,8 +569,10 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         ),
         None => ("null".to_string(), false),
     };
+    // Connected `/ws` viewers (active + queued) — issue #8.
+    let viewer_count = recover(state.viewers.lock()).count();
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}","version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")

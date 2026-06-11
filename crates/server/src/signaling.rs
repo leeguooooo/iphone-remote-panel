@@ -54,6 +54,91 @@ pub enum SignalMsg {
     /// the client cannot infer "phone offline" from frame flow alone.
     #[serde(rename = "phone_status")]
     PhoneStatus { present: bool },
+    /// Daemon → client: this viewer's place in the single-viewer queue (issue #8).
+    ///
+    /// `state` is `"queued"` when another viewer holds the live session — the
+    /// client should show a "session in use" overlay and wait (no offer comes
+    /// yet) — or `"active"` the moment this viewer is promoted (an offer follows
+    /// immediately). `ahead` is how many viewers are in front (0 when active).
+    #[serde(rename = "session_status")]
+    SessionStatus { state: String, ahead: usize },
+}
+
+/// Single-active-viewer arbitration for `/ws` (issue #8: "queue + notify").
+///
+/// One viewer streams at a time; the rest wait in FIFO order and are told
+/// `session_status: queued`. When the active viewer disconnects the front of
+/// the queue is promoted and its [`Notify`] is woken so its session can build a
+/// PeerConnection and send the offer. This avoids two PeerConnections racing
+/// over the one capture pipeline (the previously-undefined behavior).
+///
+/// [`Notify`]: tokio::sync::Notify
+#[derive(Default)]
+pub struct ViewerRegistry {
+    /// Session id of the viewer currently allowed to stream (`None` = idle).
+    active: Option<String>,
+    /// Waiting viewers in arrival order, each with the notifier that promotes it.
+    queue: std::collections::VecDeque<Waiter>,
+}
+
+struct Waiter {
+    id: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+/// Outcome of [`ViewerRegistry::join`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum JoinOutcome {
+    /// No one was streaming — this viewer is active immediately.
+    Active,
+    /// Someone else is active — this viewer waits; `ahead` are in front of it.
+    Queued { ahead: usize },
+}
+
+impl ViewerRegistry {
+    /// Register `id`. Becomes active if the session is idle, else is queued
+    /// (its `notify` is stored so [`Self::leave`] can promote it later).
+    pub fn join(&mut self, id: String, notify: Arc<tokio::sync::Notify>) -> JoinOutcome {
+        if self.active.is_none() {
+            self.active = Some(id);
+            JoinOutcome::Active
+        } else {
+            let ahead = self.queue.len() + 1; // +1 for the active viewer ahead
+            self.queue.push_back(Waiter { id, notify });
+            JoinOutcome::Queued { ahead }
+        }
+    }
+
+    /// Remove `id`. If it was the active viewer, promote the front of the queue
+    /// and return its notifier (the caller wakes it). Removing a still-queued
+    /// viewer just drops it from the line and returns `None`.
+    pub fn leave(&mut self, id: &str) -> Option<Arc<tokio::sync::Notify>> {
+        if self.active.as_deref() == Some(id) {
+            self.active = None;
+            if let Some(next) = self.queue.pop_front() {
+                self.active = Some(next.id);
+                return Some(next.notify);
+            }
+            return None;
+        }
+        // Not active — drop it from the queue if present.
+        if let Some(pos) = self.queue.iter().position(|w| w.id == id) {
+            self.queue.remove(pos);
+        }
+        None
+    }
+
+    /// Total connected viewers (active + waiting). Surfaced as `viewer_count`.
+    pub fn count(&self) -> usize {
+        self.active.is_some() as usize + self.queue.len()
+    }
+
+    /// 1-based position of `id` in the queue (number of viewers ahead), or
+    /// `None` if it isn't waiting. Used to refresh a viewer's `ahead` after the
+    /// line shrinks.
+    pub fn ahead_of(&self, id: &str) -> Option<usize> {
+        self.queue.iter().position(|w| w.id == id).map(|i| i + 1)
+    }
 }
 
 /// Drive one viewer WebSocket session to completion.
@@ -61,12 +146,39 @@ pub enum SignalMsg {
 /// Acquires the control lease for `session_id`, builds the PeerConnection, sends
 /// the offer, and pumps signaling messages until the socket closes.
 pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id: String) {
-    // Acquire the human control lease for this viewer. Keep OUR lease handle
-    // locally: with two concurrent viewers, the newer acquire() supersedes the
-    // older one (last-connected-wins), and teardown must only release/clear the
-    // shared slot if WE are still the current holder — a blind take() would rip
-    // the newer viewer's lease out of the slot when the older session closes
-    // first, silently killing the newer viewer's input (issue #8).
+    // Single-active-viewer policy (issue #8: queue + notify). Join the registry;
+    // if another viewer is live we wait in line instead of opening a second
+    // PeerConnection that would race over the one capture pipeline.
+    let promote = Arc::new(tokio::sync::Notify::new());
+    let outcome = {
+        let mut reg = recover(state.viewers.lock());
+        reg.join(session_id.clone(), promote.clone())
+    };
+    if let JoinOutcome::Queued { ahead } = outcome {
+        let _ = send_json(
+            &mut socket,
+            &SignalMsg::SessionStatus { state: "queued".into(), ahead },
+        )
+        .await;
+        // Wait until promoted (active viewer left → our Notify fires) or the
+        // client gives up (socket closes). Returns false on disconnect.
+        if !wait_for_promotion(&mut socket, &promote).await {
+            leave_and_promote(&state, &session_id);
+            return;
+        }
+        // Promoted: an offer follows immediately; tell the client to drop the
+        // "session in use" overlay.
+        let _ = send_json(
+            &mut socket,
+            &SignalMsg::SessionStatus { state: "active".into(), ahead: 0 },
+        )
+        .await;
+    }
+
+    // --- We are now the single active viewer. ---
+    // Acquire the human control lease. Keep OUR lease handle locally so teardown
+    // only releases/clears the shared slot if WE still hold it (an agent's input
+    // lease can supersede ours mid-session; a blind take() would rip theirs out).
     let my_lease = {
         let mut control = recover(state.control.lock());
         let lease = control.acquire(core::control::Holder::Human(session_id.clone()), now_secs());
@@ -139,8 +251,8 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
     }
 
     // Tear down: release OUR lease only if we are still the current holder.
-    // If a newer viewer (or an agent) superseded us, the slot holds THEIR lease —
-    // taking/clearing it would silently gate out their input (issue #8).
+    // If an agent superseded us, the slot holds THEIR lease — taking/clearing it
+    // would silently gate out their input.
     {
         let mut control = recover(state.control.lock());
         if control.is_current(&my_lease) {
@@ -149,7 +261,45 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
         }
     }
     let _ = pc.close().await;
+    // Hand the live slot to the next viewer in line (issue #8).
+    leave_and_promote(&state, &session_id);
     tracing::debug!("viewer session {session_id} ended");
+}
+
+/// Serialize and send one signaling message straight to the socket (used outside
+/// the main pump, for queue-status pushes). Best-effort.
+async fn send_json(socket: &mut WebSocket, msg: &SignalMsg) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(json) => socket.send(Message::Text(json)).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Block a queued viewer until it is promoted (`promote` fires) or its socket
+/// closes. Returns `true` if promoted, `false` if the client disconnected while
+/// waiting. Inbound frames from a waiting client are ignored (no PC yet).
+async fn wait_for_promotion(socket: &mut WebSocket, promote: &Arc<tokio::sync::Notify>) -> bool {
+    loop {
+        tokio::select! {
+            _ = promote.notified() => return true,
+            maybe_in = socket.recv() => match maybe_in {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return false,
+                _ => continue, // ignore anything a waiting client sends
+            }
+        }
+    }
+}
+
+/// Remove this viewer from the registry; if it was active, wake the newly
+/// promoted front-of-queue viewer so its session can start streaming.
+fn leave_and_promote(state: &Arc<AppState>, session_id: &str) {
+    let next = {
+        let mut reg = recover(state.viewers.lock());
+        reg.leave(session_id)
+    };
+    if let Some(notify) = next {
+        notify.notify_one();
+    }
 }
 
 /// Build the PeerConnection and wire its ICE-candidate callback to `out_tx`.
@@ -253,7 +403,7 @@ async fn handle_inbound(
             }
             true
         }
-        SignalMsg::Offer { .. } | SignalMsg::PhoneStatus { .. } => {
+        SignalMsg::Offer { .. } | SignalMsg::PhoneStatus { .. } | SignalMsg::SessionStatus { .. } => {
             // Daemon-to-client-only messages; inbound copies are protocol errors.
             tracing::debug!("unexpected inbound daemon-only message; ignoring");
             false
@@ -316,6 +466,65 @@ mod tests {
     fn phone_status_serializes_with_snake_case_tag() {
         let json = serde_json::to_string(&SignalMsg::PhoneStatus { present: false }).unwrap();
         assert_eq!(json, r#"{"type":"phone_status","present":false}"#);
+    }
+
+    #[test]
+    fn session_status_serializes_with_snake_case_tag() {
+        let json = serde_json::to_string(&SignalMsg::SessionStatus {
+            state: "queued".into(),
+            ahead: 2,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"session_status","state":"queued","ahead":2}"#);
+    }
+
+    fn notify() -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
+
+    #[test]
+    fn registry_first_viewer_is_active_rest_queue() {
+        let mut reg = ViewerRegistry::default();
+        assert_eq!(reg.join("a".into(), notify()), JoinOutcome::Active);
+        assert_eq!(reg.join("b".into(), notify()), JoinOutcome::Queued { ahead: 1 });
+        assert_eq!(reg.join("c".into(), notify()), JoinOutcome::Queued { ahead: 2 });
+        assert_eq!(reg.count(), 3);
+        assert_eq!(reg.ahead_of("b"), Some(1));
+        assert_eq!(reg.ahead_of("c"), Some(2));
+        assert_eq!(reg.ahead_of("a"), None); // active, not queued
+    }
+
+    #[test]
+    fn registry_active_leaving_promotes_front_of_queue() {
+        let mut reg = ViewerRegistry::default();
+        reg.join("a".into(), notify());
+        reg.join("b".into(), notify());
+        reg.join("c".into(), notify());
+        // Active 'a' leaves → 'b' promoted, its notifier returned.
+        assert!(reg.leave("a").is_some());
+        assert_eq!(reg.count(), 2);
+        assert_eq!(reg.ahead_of("c"), Some(1)); // 'c' moved up
+        // 'b' is now active; its departure promotes 'c'.
+        assert!(reg.leave("b").is_some());
+        assert_eq!(reg.ahead_of("c"), None); // 'c' is active now
+        // Last viewer leaves → nobody to promote.
+        assert!(reg.leave("c").is_none());
+        assert_eq!(reg.count(), 0);
+    }
+
+    #[test]
+    fn registry_queued_viewer_leaving_does_not_promote() {
+        let mut reg = ViewerRegistry::default();
+        reg.join("a".into(), notify());
+        reg.join("b".into(), notify());
+        reg.join("c".into(), notify());
+        // A waiting viewer bails — no promotion (active 'a' keeps streaming).
+        assert!(reg.leave("b").is_none());
+        assert_eq!(reg.count(), 2);
+        assert_eq!(reg.ahead_of("c"), Some(1)); // 'c' moved up from 2 to 1
+        // 'a' (still active) leaves → 'c' promoted.
+        assert!(reg.leave("a").is_some());
+        assert_eq!(reg.ahead_of("c"), None);
     }
 
     #[test]
