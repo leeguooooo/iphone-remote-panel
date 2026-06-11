@@ -162,6 +162,156 @@ impl WdaClient {
             .context("/wda/tap status")?;
         Ok(())
     }
+
+    /// Window (screen) size in WDA points — needed to map our normalized
+    /// `[0,1]` agent coordinates onto [`Self::tap_point`]'s absolute points.
+    pub async fn window_size(&mut self) -> Result<(f64, f64)> {
+        let sid = self.ensure_session().await?.to_string();
+        let v: Envelope<serde_json::Value> = self
+            .http
+            .get(format!("{}/session/{}/window/size", self.base, sid))
+            .send()
+            .await
+            .context("GET /window/size")?
+            .json()
+            .await
+            .context("parse /window/size")?;
+        let w = v.value.get("width").and_then(|x| x.as_f64());
+        let h = v.value.get("height").and_then(|x| x.as_f64());
+        match (w, h) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Ok((w, h)),
+            _ => Err(anyhow!("bad window size: {}", v.value)),
+        }
+    }
+
+    /// Type a string into whatever currently has keyboard focus
+    /// (`POST /wda/keys`). The string goes in as Unicode — CJK lands cleanly
+    /// even with a Pinyin keyboard active (hardware-validated).
+    pub async fn keys(&mut self, text: &str) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/wda/keys", self.base, sid))
+            .json(&serde_json::json!({ "value": [text] }))
+            .send()
+            .await
+            .context("POST /wda/keys")?
+            .error_for_status()
+            .context("/wda/keys status")?;
+        Ok(())
+    }
+
+    /// Current phone screen as PNG bytes (`GET /screenshot`, base64 in the
+    /// envelope). Works with no Mirroring window at all — the capture happens
+    /// on the phone — so it's the L2 fallback when the L3 capture is gone.
+    pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
+        // Session-less endpoint; no ensure_session needed.
+        let v: Envelope<String> = self
+            .http
+            .get(format!("{}/screenshot", self.base))
+            .send()
+            .await
+            .context("GET /screenshot")?
+            .json()
+            .await
+            .context("parse /screenshot")?;
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(v.value.trim())
+            .context("decode screenshot base64")
+    }
+
+    /// The element tree flattened to agent-friendly rows (type, label, rect).
+    /// An agent reasons over this the way it reasons over a screenshot, but
+    /// it's text — an order of magnitude cheaper, and it carries the labels
+    /// needed for [`Self::find_element`]/[`Self::click_element`].
+    pub async fn elements(&mut self) -> Result<Vec<ElementRow>> {
+        let tree = self.source().await?;
+        let mut rows = Vec::new();
+        flatten_tree(&tree, 0, &mut rows);
+        Ok(rows)
+    }
+
+    /// Find an element by its visible label and tap it. Tries the
+    /// "accessibility id" strategy first (exact accessibility label), then a
+    /// predicate on `name`/`label`. This is the primary L2 action: no
+    /// coordinates, no host cursor, immune to layout drift.
+    pub async fn click_label(&mut self, label: &str) -> Result<()> {
+        // Escape single quotes for the NSPredicate string literal.
+        let esc = label.replace('\'', "\\'");
+        let attempts = [
+            ("accessibility id", label.to_string()),
+            (
+                "predicate string",
+                format!("name == '{esc}' OR label == '{esc}' OR value == '{esc}'"),
+            ),
+        ];
+        let mut last_err = None;
+        for (using, value) in attempts {
+            match self.find_element(using, &value).await {
+                Ok(eid) => return self.click_element(&eid).await,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("element not found: {label}")))
+    }
+
+    /// Drop the cached session (e.g. after an error that suggests it went
+    /// stale); the next call re-creates one via [`Self::ensure_session`].
+    pub fn invalidate_session(&mut self) {
+        self.session = None;
+    }
+}
+
+/// One row of the flattened element tree.
+#[derive(Debug, serde::Serialize, PartialEq)]
+pub struct ElementRow {
+    /// Element type without the `XCUIElementType` prefix (e.g. `Button`).
+    pub kind: String,
+    /// The accessibility label/name — what `find_element("accessibility id", …)`
+    /// matches on. Empty-label rows are skipped during flattening.
+    pub label: String,
+    /// Position + size in WDA points: `[x, y, w, h]`.
+    pub rect: [f64; 4],
+    /// Tree depth (purely presentational).
+    pub depth: u32,
+}
+
+/// Recursively flatten a WDA `/source?format=json` tree, keeping only rows an
+/// agent can act on or learn from: anything with a non-empty label, or an
+/// interactive type. Order is document order (roughly top-to-bottom).
+fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>) {
+    const INTERACTIVE: [&str; 8] = [
+        "Button", "Cell", "TextField", "SecureTextField", "SearchField", "Switch", "Slider",
+        "TextView",
+    ];
+    let kind = node
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim_start_matches("XCUIElementType")
+        .to_string();
+    let label = node
+        .get("label")
+        .and_then(|l| l.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| node.get("name").and_then(|l| l.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if !label.is_empty() || INTERACTIVE.contains(&kind.as_str()) {
+        let r = node.get("rect").cloned().unwrap_or_default();
+        let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        out.push(ElementRow {
+            kind,
+            label,
+            rect: [g("x"), g("y"), g("width"), g("height")],
+            depth,
+        });
+    }
+    if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+        for c in children {
+            flatten_tree(c, depth + 1, out);
+        }
+    }
 }
 
 /// `{ "value": T, ... }` — WDA wraps successful payloads in a `value` envelope.
@@ -242,5 +392,33 @@ mod tests {
         // A W3C "no such element" error payload has no element key.
         let body = r#"{"value":{"error":"no such element","message":"unable to find"}}"#;
         assert!(parse_element_id(body).is_err());
+    }
+
+    #[test]
+    fn flatten_keeps_labels_and_interactive_skips_noise() {
+        let tree: serde_json::Value = serde_json::from_str(
+            r#"{
+              "type":"XCUIElementTypeApplication","label":"",
+              "rect":{"x":0,"y":0,"width":440,"height":956},
+              "children":[
+                {"type":"XCUIElementTypeOther","label":"","children":[
+                  {"type":"XCUIElementTypeButton","label":"新备忘录",
+                   "rect":{"x":369,"y":885,"width":38,"height":38}},
+                  {"type":"XCUIElementTypeStaticText","label":"你好世界",
+                   "rect":{"x":10,"y":20,"width":100,"height":20}},
+                  {"type":"XCUIElementTypeImage","label":""}
+                ]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        flatten_tree(&tree, 0, &mut rows);
+        // unlabeled Application/Other/Image dropped; Button + labeled text kept
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "Button");
+        assert_eq!(rows[0].label, "新备忘录");
+        assert_eq!(rows[0].rect, [369.0, 885.0, 38.0, 38.0]);
+        assert_eq!(rows[1].label, "你好世界");
     }
 }

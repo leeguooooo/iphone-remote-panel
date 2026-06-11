@@ -81,6 +81,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: None,
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        wda: None,
     })
 }
 
@@ -123,6 +124,7 @@ fn build_state_with_agent_token(
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: agent_token.map(|s| s.to_string()),
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        wda: None,
     })
 }
 

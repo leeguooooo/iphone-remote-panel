@@ -169,6 +169,14 @@ pub struct AppState {
     /// the daemon triggers a shortcut by name, the shortcut runs a native iOS
     /// action and POSTs the result here. Bounded ring buffer; oldest dropped.
     pub inbox: Arc<Mutex<std::collections::VecDeque<InboxItem>>>,
+    /// Optional L2 element-tree control via WebDriverAgent on the phone
+    /// (`PHONE_REMOTE_WDA_URL`, e.g. `http://<phone-ip>:8100`). When present,
+    /// agent input auto-routes through it (see [`agent_input`]): text goes in
+    /// as Unicode (CJK lands cleanly), taps are synthesized on-device (no host
+    /// cursor), with the L3 pixel path as fallback on any WDA error.
+    /// `tokio::sync::Mutex` because the client mutates its cached session and
+    /// handlers hold the lock across awaits.
+    pub wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -198,6 +206,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/status", get(agent_status))
         .route("/agent/input", post(agent_input))
         .route("/agent/screenshot", get(agent_screenshot))
+        .route("/agent/elements", get(agent_elements))
         // Shortcuts RPC return path: the phone POSTs structured results here;
         // an agent GETs (and drains) them. See `AppState::inbox`.
         .route("/agent/inbox", get(agent_inbox_get).post(agent_inbox_post))
@@ -516,7 +525,12 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     let phone_target = core::capture::find_mirroring_geometry().is_ok();
     #[cfg(not(target_os = "macos"))]
     let phone_target = false;
-    let body = format!(r#"{{"ok":true,"phone_target":{phone_target}}}"#);
+    // L2 liveness: configured AND answering /status right now.
+    let wda = match &state.wda {
+        Some(w) => w.lock().await.is_up().await,
+        None => false,
+    };
+    let body = format!(r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda}}}"#);
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
@@ -547,6 +561,85 @@ async fn agent_input(
         ),
         AgentAuth::Ok => {}
     }
+    // ── L2 auto-routing (WebDriverAgent) ──────────────────────────────────
+    // When WDA is configured, prefer it for the actions where it is strictly
+    // better: text goes in as Unicode (CJK lands cleanly instead of being
+    // eaten by the on-phone IME), label-taps address elements directly, and
+    // coordinate taps are synthesized on-device (no host-cursor contention,
+    // no frontmost requirement). Any WDA failure falls back to the L3 pixel
+    // path below — except label-taps, which L3 cannot express.
+    if let Some(wda) = &state.wda {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let label = v.get("label").and_then(|l| l.as_str());
+            match (typ, label) {
+                ("tap", Some(label)) => {
+                    let r = wda.lock().await.click_label(label).await;
+                    return match r {
+                        Ok(()) => with_security_headers(
+                            (StatusCode::OK, "ok (wda element)").into_response(),
+                        ),
+                        Err(e) => {
+                            tracing::warn!("wda label tap '{label}' failed: {e:#}");
+                            with_security_headers(
+                                (StatusCode::BAD_GATEWAY, "wda: element not found")
+                                    .into_response(),
+                            )
+                        }
+                    };
+                }
+                ("text", None) => {
+                    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                        let mut w = wda.lock().await;
+                        match w.keys(text).await {
+                            Ok(()) => {
+                                return with_security_headers(
+                                    (StatusCode::OK, "ok (wda keys)").into_response(),
+                                );
+                            }
+                            Err(e) => {
+                                // One stale-session retry, then fall through to L3.
+                                w.invalidate_session();
+                                if w.keys(text).await.is_ok() {
+                                    return with_security_headers(
+                                        (StatusCode::OK, "ok (wda keys)").into_response(),
+                                    );
+                                }
+                                tracing::warn!("wda keys failed, falling back to L3: {e:#}");
+                            }
+                        }
+                    }
+                }
+                ("tap", None) => {
+                    let (x, y) = (
+                        v.get("x").and_then(|x| x.as_f64()),
+                        v.get("y").and_then(|y| y.as_f64()),
+                    );
+                    if let (Some(x), Some(y)) = (x, y) {
+                        let mut w = wda.lock().await;
+                        let r = async {
+                            let (sw, sh) = w.window_size().await?;
+                            w.tap_point(x * sw, y * sh).await
+                        }
+                        .await;
+                        match r {
+                            Ok(()) => {
+                                return with_security_headers(
+                                    (StatusCode::OK, "ok (wda tap)").into_response(),
+                                );
+                            }
+                            Err(e) => {
+                                w.invalidate_session();
+                                tracing::warn!("wda tap failed, falling back to L3: {e:#}");
+                            }
+                        }
+                    }
+                }
+                _ => {} // scroll/key/shortcut/down/up → L3 (mirroring) below
+            }
+        }
+    }
+
     let event = match crate::input_bridge::decode_control(&body) {
         Some(ev) => ev,
         None => {
@@ -569,6 +662,55 @@ async fn agent_input(
     }
     state.injector.send(event);
     with_security_headers((StatusCode::OK, "ok").into_response())
+}
+
+/// `GET /agent/elements` — the phone's element tree, flattened to
+/// agent-friendly rows `{kind, label, rect:[x,y,w,h], depth}` (L2 / WDA).
+///
+/// An agent reasons over this the way it reasons over a screenshot, but it's
+/// text — an order of magnitude cheaper — and the labels feed straight back
+/// into `POST /agent/input {"type":"tap","label":"…"}`. 503 when WDA is not
+/// configured; 502 when it's configured but unreachable.
+async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => return with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        ),
+        AgentAuth::Denied => return with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        ),
+        AgentAuth::Ok => {}
+    }
+    let Some(wda) = &state.wda else {
+        return with_security_headers(
+            (StatusCode::SERVICE_UNAVAILABLE, "wda not configured (PHONE_REMOTE_WDA_URL)")
+                .into_response(),
+        );
+    };
+    let mut w = wda.lock().await;
+    let rows = match w.elements().await {
+        Ok(rows) => rows,
+        Err(_) => {
+            // One stale-session retry.
+            w.invalidate_session();
+            match w.elements().await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("wda elements failed: {e:#}");
+                    return with_security_headers(
+                        (StatusCode::BAD_GATEWAY, "wda unreachable").into_response(),
+                    );
+                }
+            }
+        }
+    };
+    let body = serde_json::to_string(&serde_json::json!({ "elements": rows }))
+        .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string());
+    let resp = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    with_security_headers(resp)
 }
 
 /// `GET /agent/screenshot` — current phone screen as a PNG.
@@ -596,6 +738,19 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
             with_security_headers(resp)
         }
         Ok(Err(e)) => {
+            // L3 capture has no Mirroring window — fall back to WDA's
+            // on-device screenshot when configured (works with no Mac-side
+            // window at all; this keeps the agent's eyes open even when the
+            // phone isn't mirrored anywhere).
+            if let Some(wda) = &state.wda {
+                if let Ok(bytes) = wda.lock().await.screenshot_png().await {
+                    let resp = Response::builder()
+                        .header(header::CONTENT_TYPE, "image/png")
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    return with_security_headers(resp);
+                }
+            }
             tracing::warn!("agent screenshot: no Mirroring window: {e:#}");
             with_security_headers(
                 (StatusCode::SERVICE_UNAVAILABLE, "Mirroring window not found").into_response(),

@@ -144,6 +144,23 @@ fn serve() -> Result<()> {
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: cfg.agent_token.clone(),
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        // L2 element-tree control: point PHONE_REMOTE_WDA_URL at a running
+        // WebDriverAgent on the phone (e.g. http://<phone-ip>:8100) and agent
+        // text/taps auto-route through it (CJK direct, no host cursor); unset
+        // = pure L3 pixel path, exactly as before.
+        wda: std::env::var("PHONE_REMOTE_WDA_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|url| match server::wda::WdaClient::new(&url) {
+                Ok(c) => {
+                    tracing::info!("L2 element control enabled via WDA at {url}");
+                    Some(Arc::new(tokio::sync::Mutex::new(c)))
+                }
+                Err(e) => {
+                    tracing::warn!("PHONE_REMOTE_WDA_URL set but client failed: {e:#}");
+                    None
+                }
+            }),
     });
 
     run_server(cfg, state)
