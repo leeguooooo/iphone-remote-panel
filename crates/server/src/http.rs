@@ -186,10 +186,10 @@ pub struct AppState {
     /// One viewer streams at a time; others wait in line and are promoted when
     /// the active one disconnects. Read by `/agent/status` as `viewer_count`.
     pub viewers: Arc<Mutex<crate::signaling::ViewerRegistry>>,
-    /// Memoized Mirroring paused-screen check (issue #14/#3): `(checked_at,
-    /// paused)`. Detection runs `screencapture`, so `/agent/status` reuses a
+    /// Memoized Mirroring window classification (issue #14/#3): `(checked_at,
+    /// state)`. Detection runs `screencapture`, so `/agent/status` reuses a
     /// recent result instead of re-capturing on every poll.
-    pub mirror_paused_cache: Arc<Mutex<Option<(Instant, bool)>>>,
+    pub mirror_paused_cache: Arc<Mutex<Option<(Instant, core::capture::MirrorState)>>>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -516,24 +516,24 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
     }
 }
 
-/// Is the Mirroring window currently showing the "Connection Paused" screen?
-/// Memoized for [`MIRROR_PAUSE_CACHE_TTL`] so `/agent/status` polling doesn't
-/// run a `screencapture` on every request. The detection itself is blocking
-/// (spawns `screencapture` + decodes), so it runs on a blocking thread.
-async fn mirror_paused_cached(state: &Arc<AppState>) -> bool {
-    const MIRROR_PAUSE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
-    if let Some((at, paused)) = *recover(state.mirror_paused_cache.lock()) {
-        if at.elapsed() < MIRROR_PAUSE_CACHE_TTL {
-            return paused;
+/// What the Mirroring window is showing (active / paused / in_use). Memoized for
+/// [`MIRROR_STATE_CACHE_TTL`] so `/agent/status` polling doesn't run a
+/// `screencapture` on every request. Detection is blocking (spawns
+/// `screencapture` + decodes), so it runs on a blocking thread.
+async fn mirror_state_cached(state: &Arc<AppState>) -> core::capture::MirrorState {
+    const MIRROR_STATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+    if let Some((at, s)) = *recover(state.mirror_paused_cache.lock()) {
+        if at.elapsed() < MIRROR_STATE_CACHE_TTL {
+            return s;
         }
     }
-    let paused = tokio::task::spawn_blocking(|| {
-        core::capture::mirroring_appears_paused().unwrap_or(false)
+    let s = tokio::task::spawn_blocking(|| {
+        core::capture::mirroring_state().unwrap_or(core::capture::MirrorState::Active)
     })
     .await
-    .unwrap_or(false);
-    *recover(state.mirror_paused_cache.lock()) = Some((Instant::now(), paused));
-    paused
+    .unwrap_or(core::capture::MirrorState::Active);
+    *recover(state.mirror_paused_cache.lock()) = Some((Instant::now(), s));
+    s
 }
 
 /// `GET /agent/status` — auth/health probe. `{"ok":true,"phone_target":bool}`.
@@ -587,13 +587,10 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // honest "can an agent act right now" signal: WDA always can (on-device);
     // the mirror path can only when the window isn't paused.
     let (mirror_state, drivable) = if wda {
-        ("active", true)
+        ("active", true) // WDA injects on-device regardless of the mirror window
     } else if phone_target {
-        if mirror_paused_cached(&state).await {
-            ("paused", false)
-        } else {
-            ("active", true)
-        }
+        let s = mirror_state_cached(&state).await;
+        (s.as_str(), s.drivable())
     } else {
         ("offline", false)
     };

@@ -250,21 +250,17 @@ mod imp {
         Ok(bytes)
     }
 
-    /// Detect the iPhone Mirroring **"Connection Paused"** interstitial — the
-    /// screen (phone glyph + "Connection Paused" + a "Resume" button) shown when
-    /// the phone locks, leaves range, or a human picks it up. Critically, the
-    /// Mirroring *window still exists* in this state, so `find_mirroring_geometry`
-    /// reports it as present even though no input lands on the phone (issue #14:
-    /// the false-positive `phone_target:true`). iPhone Mirroring is AX-hardened
-    /// (0 accessibility windows), so we can't read its UI tree — we classify by
-    /// pixels: the paused screen is ~uniform dark gray (≈RGB 46,50,52), which a
-    /// live mirror never is.
-    ///
-    /// Returns `true` when the captured frame's gray fraction crosses the
-    /// hardware-calibrated threshold (paused ≈ 0.87; live content ≪ 0.70).
-    pub fn mirroring_appears_paused() -> anyhow::Result<bool> {
+    /// Classify what the iPhone Mirroring window is currently showing. The
+    /// window *still exists* on both interstitials, so `find_mirroring_geometry`
+    /// reports it present even when no input lands on the phone (issue #14: the
+    /// false-positive `phone_target:true`). iPhone Mirroring is AX-hardened (0
+    /// accessibility windows), so we classify by pixels — both interstitials are
+    /// ~uniform dark gray (≈RGB 46,50,52, hardware-sampled ≈0.87), which a live
+    /// mirror never is; the **"iPhone in Use"** screen is told apart from
+    /// **"Connection Paused"** by its blue phone glyph (≈0.9% blue vs ~0%).
+    pub fn mirroring_state() -> anyhow::Result<super::MirrorState> {
         let png_bytes = screenshot_mirroring_png()?;
-        Ok(super::gray_fraction_from_png(&png_bytes)? >= super::PAUSED_GRAY_THRESHOLD)
+        Ok(super::classify_mirror_png(&png_bytes)?)
     }
 
     /// Find the iPhone Mirroring window and build a [`crate::coords::SessionGeometry`]
@@ -530,31 +526,74 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    find_mirroring_geometry, mirroring_appears_paused, screenshot_mirroring_png, CaptureStream,
+    find_mirroring_geometry, mirroring_state, screenshot_mirroring_png, CaptureStream,
     FrameCallback,
 };
 
-/// `mirroring_appears_paused` stub off-macOS (no Mirroring window exists).
-#[cfg(not(target_os = "macos"))]
-pub fn mirroring_appears_paused() -> anyhow::Result<bool> {
-    Ok(false)
+/// What the iPhone Mirroring window is showing (issue #14/#3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorState {
+    /// Live phone content — agent input via the mirror path lands.
+    Active,
+    /// "Connection Paused" (phone locked / out of range): a Resume button is
+    /// present, so this is auto-recoverable by clicking it (issue #3).
+    Paused,
+    /// "iPhone in Use" (a human is on the phone): no Resume button — Mirroring
+    /// reconnects only when the human stops. Do NOT auto-click; wait it out.
+    InUse,
 }
 
-/// Color of the iPhone Mirroring "Connection Paused" background, and how close a
-/// pixel must be (per channel) to count as that gray. Hardware-sampled.
+impl MirrorState {
+    /// The `mirror_state` string in `/agent/status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MirrorState::Active => "active",
+            MirrorState::Paused => "paused",
+            MirrorState::InUse => "in_use",
+        }
+    }
+    /// Can an agent drive the phone through the mirror right now?
+    pub fn drivable(self) -> bool {
+        matches!(self, MirrorState::Active)
+    }
+}
+
+/// `mirroring_state` stub off-macOS (no Mirroring window exists).
+#[cfg(not(target_os = "macos"))]
+pub fn mirroring_state() -> anyhow::Result<MirrorState> {
+    Ok(MirrorState::Active)
+}
+
+/// Color of the iPhone Mirroring interstitial background + per-channel match
+/// tolerance. Hardware-sampled from both "Connection Paused" and "iPhone in Use".
 const PAUSED_GRAY: [i32; 3] = [46, 50, 52];
 const PAUSED_GRAY_TOL: i32 = 16;
-/// Fraction of grid-sampled pixels that must match [`PAUSED_GRAY`] to call the
-/// frame "paused". The paused interstitial samples ≈0.87; live content is far
-/// below, so 0.70 leaves wide margin on both sides.
-const PAUSED_GRAY_THRESHOLD: f32 = 0.70;
+/// Min gray fraction to treat a frame as an interstitial (not live). Both paused
+/// and in-use sample ≈0.87; live content is far below, so 0.70 has wide margin.
+const INTERSTITIAL_GRAY_THRESHOLD: f32 = 0.70;
+/// Min blue-glyph fraction that distinguishes "iPhone in Use" (≈0.9% blue) from
+/// "Connection Paused" (~0% blue). 0.3% sits cleanly between them.
+const IN_USE_BLUE_THRESHOLD: f32 = 0.003;
 
-/// Fraction `[0,1]` of grid-sampled pixels within tolerance of the paused-screen
-/// gray. Pure (no capture) so it unit-tests cross-platform. Samples every 6th
-/// pixel in both axes — enough signal for a whole-screen uniformity check at a
-/// fraction of the cost. Only RGB/RGBA 8-bit inputs (what `screencapture`
-/// emits) are supported; anything else errors rather than guessing.
-fn gray_fraction_from_png(bytes: &[u8]) -> anyhow::Result<f32> {
+/// Classify a captured Mirroring frame. Pure (no capture) so it unit-tests
+/// cross-platform. Samples every 6th pixel in both axes — enough for a
+/// whole-screen uniformity check at a fraction of the cost. Only RGB/RGBA 8-bit
+/// (what `screencapture` emits) is supported; anything else errors.
+fn classify_mirror_png(bytes: &[u8]) -> anyhow::Result<MirrorState> {
+    let (gray, blue) = sample_fractions(bytes)?;
+    Ok(if gray < INTERSTITIAL_GRAY_THRESHOLD {
+        MirrorState::Active
+    } else if blue >= IN_USE_BLUE_THRESHOLD {
+        MirrorState::InUse
+    } else {
+        MirrorState::Paused
+    })
+}
+
+/// `(gray_fraction, blue_fraction)` over grid-sampled pixels: gray = within
+/// tolerance of the interstitial background; blue = the "iPhone in Use" glyph
+/// color (markedly blue: `b>120 && b-r>40 && b-g>20`).
+fn sample_fractions(bytes: &[u8]) -> anyhow::Result<(f32, f32)> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -572,27 +611,32 @@ fn gray_fraction_from_png(bytes: &[u8]) -> anyhow::Result<f32> {
     let (w, h) = (info.width as usize, info.height as usize);
     let data = &buf[..info.buffer_size()];
     let stride = w * channels;
-    let (mut hit, mut total) = (0u64, 0u64);
+    let (mut gray, mut blue, mut total) = (0u64, 0u64, 0u64);
     let mut y = 0;
     while y < h {
         let row = &data[y * stride..];
         let mut x = 0;
         while x < w {
             let p = &row[x * channels..];
-            let (dr, dg, db) = (
-                (p[0] as i32 - PAUSED_GRAY[0]).abs(),
-                (p[1] as i32 - PAUSED_GRAY[1]).abs(),
-                (p[2] as i32 - PAUSED_GRAY[2]).abs(),
-            );
-            if dr <= PAUSED_GRAY_TOL && dg <= PAUSED_GRAY_TOL && db <= PAUSED_GRAY_TOL {
-                hit += 1;
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            if (r - PAUSED_GRAY[0]).abs() <= PAUSED_GRAY_TOL
+                && (g - PAUSED_GRAY[1]).abs() <= PAUSED_GRAY_TOL
+                && (b - PAUSED_GRAY[2]).abs() <= PAUSED_GRAY_TOL
+            {
+                gray += 1;
+            }
+            if b > 120 && b - r > 40 && b - g > 20 {
+                blue += 1;
             }
             total += 1;
             x += 6;
         }
         y += 6;
     }
-    Ok(if total == 0 { 0.0 } else { hit as f32 / total as f32 })
+    if total == 0 {
+        return Ok((0.0, 0.0));
+    }
+    Ok((gray as f32 / total as f32, blue as f32 / total as f32))
 }
 
 // ---------------------------------------------------------------------------
@@ -820,39 +864,51 @@ mod tests {
         assert_eq!(p2.extension().and_then(|e| e.to_str()), Some("png"));
     }
 
-    /// Encode a solid-color RGBA PNG for the paused-detection tests.
-    fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    /// Encode an RGBA PNG: a solid `bg` with a centered rectangular `glyph`
+    /// patch covering `glyph_frac` of the area (used to fake the in-use blue glyph).
+    fn png_with_glyph(w: u32, h: u32, bg: [u8; 3], glyph: [u8; 3], glyph_frac: f32) -> Vec<u8> {
         let mut out = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut out, w, h);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             let mut writer = enc.write_header().unwrap();
+            // Centered square patch of the requested area fraction.
+            let side = ((w as f32 * h as f32 * glyph_frac).sqrt()) as u32;
+            let (x0, y0) = ((w.saturating_sub(side)) / 2, (h.saturating_sub(side)) / 2);
             let mut data = Vec::with_capacity((w * h * 4) as usize);
-            for _ in 0..(w * h) {
-                data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            for y in 0..h {
+                for x in 0..w {
+                    let c = if side > 0 && x >= x0 && x < x0 + side && y >= y0 && y < y0 + side {
+                        glyph
+                    } else {
+                        bg
+                    };
+                    data.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                }
             }
             writer.write_image_data(&data).unwrap();
         }
         out
     }
 
+    fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        png_with_glyph(w, h, rgb, rgb, 0.0)
+    }
+
     #[test]
-    fn gray_fraction_flags_paused_screen_and_clears_live() {
-        // A frame filled with the paused-screen gray reads ≈1.0 (≥ threshold).
-        let paused = solid_png(120, 200, [46, 50, 52]);
-        let f_paused = gray_fraction_from_png(&paused).unwrap();
-        assert!(f_paused > 0.95, "paused gray fraction {f_paused} should be ~1.0");
-        assert!(f_paused >= PAUSED_GRAY_THRESHOLD);
-
-        // A white (live-content-ish) frame reads ≈0.0 (well below threshold).
-        let live = solid_png(120, 200, [255, 255, 255]);
-        let f_live = gray_fraction_from_png(&live).unwrap();
-        assert!(f_live < 0.05, "white fraction {f_live} should be ~0.0");
-        assert!(f_live < PAUSED_GRAY_THRESHOLD);
-
-        // A near-gray within tolerance still counts; a clearly different gray does not.
-        assert!(gray_fraction_from_png(&solid_png(60, 60, [55, 58, 60])).unwrap() > 0.95);
-        assert!(gray_fraction_from_png(&solid_png(60, 60, [90, 94, 96])).unwrap() < 0.05);
+    fn classify_distinguishes_active_paused_in_use() {
+        // Live content (white): below the gray threshold → Active.
+        assert_eq!(classify_mirror_png(&solid_png(120, 200, [255, 255, 255])).unwrap(), MirrorState::Active);
+        // Uniform interstitial gray, no blue glyph → Connection Paused.
+        assert_eq!(classify_mirror_png(&solid_png(120, 200, [46, 50, 52])).unwrap(), MirrorState::Paused);
+        // Same gray plus a blue phone glyph (~1% area) → iPhone in Use.
+        let in_use = png_with_glyph(160, 280, [46, 50, 52], [90, 150, 235], 0.01);
+        assert_eq!(classify_mirror_png(&in_use).unwrap(), MirrorState::InUse);
+        // State helpers.
+        assert!(MirrorState::Active.drivable());
+        assert!(!MirrorState::Paused.drivable());
+        assert!(!MirrorState::InUse.drivable());
+        assert_eq!(MirrorState::InUse.as_str(), "in_use");
     }
 }
