@@ -216,6 +216,12 @@ first time, then freeze it into a repeatable one-command script):
 npx skills add leeguooooo/iphone-use
 ```
 
+> Installing globally with `-g`? If the `skills` CLI prints
+> `PromptScript does not support global skill installation`, that's a harmless
+> partial failure — PromptScript only supports project-level skills, so its
+> target is skipped while every other agent (Claude Code, etc.) still installs.
+> Add `-a claude` to target a specific agent and silence the warning.
+
 The skill covers the agent API, the see→act→verify loop, hardware-validated input
 facts (scroll direction, the keycode/IME caveat), and a worked example — a full
 Apple Health export (no API exists; the agent taps through the Health app and the

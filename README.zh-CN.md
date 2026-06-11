@@ -192,6 +192,11 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 npx skills add leeguooooo/iphone-use
 ```
 
+> 用 `-g` 全局安装时,若 `skills` CLI 报
+> `PromptScript does not support global skill installation`,这是无害的部分失败 ——
+> PromptScript 只支持项目级 skill,所以它那一个目标被跳过,其余 agent(Claude Code 等)
+> 照常安装成功。加 `-a claude` 指定单个 agent 即可消除该警告。
+
 技能内容涵盖智能体 API、「看 → 操作 → 验证」循环、经真机验证的输入经验（滚动方向、keycode/输入法坑），
 以及一个完整范例 —— 导出 Apple 健康全量数据（它没有 API；智能体在「健康」App 里点按操作，约 3 分钟后数据落到你的 Mac 上）。
 见 [`skills/iphone-use/SKILL.md`](skills/iphone-use/SKILL.md)。
