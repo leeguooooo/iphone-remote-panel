@@ -1,0 +1,308 @@
+<!--
+---
+locale: en
+slug: iphone-use
+title: iphone-use — Computer-use, but for the iPhone
+summary: An open-source agent control layer for a real iPhone: live browser remote + a see/act HTTP API for AI agents. Three input layers (Shortcut verbs / element tree / pixel fallback), clean CJK input, hardware-validated.
+renderMode: raw
+tags: [iphone-use, agent, computer-use, ios, open-source]
+treePath: projects
+treeLabel: iphone-use
+repoUrl: https://github.com/leeguooooo/iphone-use
+---
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iphone-use — Computer-use, but for the iPhone</title>
+<meta name="description" content="An open-source agent control layer for a real iPhone: live browser remote + a see/act HTTP API for AI agents. Three input layers, clean CJK input, hardware-validated.">
+<link rel="icon" href="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/icon-1024.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #1c1b33;
+    --ink-soft: #56547a;
+    --accent: #4f46e5;
+    --accent-soft: #eef0ff;
+    --paper: #f7f6ff;
+    --card: rgba(255, 255, 255, 0.72);
+    --border: rgba(79, 70, 229, 0.14);
+    --good: #0f766e;
+    --bad: #b91c1c;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --disp: "Unbounded", -apple-system, sans-serif;
+    --body: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--body);
+    color: var(--ink);
+    background:
+      radial-gradient(1200px 800px at 85% -10%, #dfe5ff 0%, transparent 60%),
+      radial-gradient(1000px 700px at -10% 30%, #f3e3ff 0%, transparent 55%),
+      radial-gradient(900px 700px at 70% 110%, #dff3ff 0%, transparent 55%),
+      var(--paper);
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 1.4rem; }
+
+  /* ── header ── */
+  header.site {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.4rem 0;
+  }
+  .brand { display: flex; align-items: center; gap: .7rem; font-family: var(--disp); font-weight: 600; font-size: 1.02rem; letter-spacing: .02em; color: var(--ink); }
+  .brand img { width: 38px; height: 38px; border-radius: 9px; box-shadow: 0 4px 14px rgba(79,70,229,.18); }
+  nav.top { display: flex; gap: 1.4rem; font-size: .92rem; }
+  nav.top a { color: var(--ink-soft); }
+
+  /* ── hero ── */
+  .hero { display: grid; grid-template-columns: 1.15fr .85fr; gap: 3rem; align-items: center; padding: 3.5rem 0 4rem; }
+  .kicker { font-family: var(--mono); font-size: .8rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin-bottom: 1.1rem; }
+  h1 {
+    font-family: var(--disp); font-weight: 800;
+    font-size: clamp(2rem, 4.6vw, 3.4rem);
+    line-height: 1.16; letter-spacing: -0.01em; margin-bottom: 1.2rem;
+  }
+  h1 .en { display: block; font-size: .42em; font-weight: 600; color: var(--ink-soft); letter-spacing: .04em; margin-top: .9rem; }
+  .lede { font-size: 1.08rem; color: var(--ink-soft); max-width: 34em; margin-bottom: 1.8rem; }
+  .lede strong { color: var(--ink); }
+  .cta-row { display: flex; flex-wrap: wrap; gap: .8rem; align-items: center; }
+  .btn {
+    display: inline-block; padding: .72rem 1.5rem; border-radius: 12px;
+    font-weight: 600; font-size: .95rem; transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .btn.primary { background: var(--accent); color: #fff; box-shadow: 0 8px 24px rgba(79,70,229,.32); }
+  .btn.primary:hover { transform: translateY(-2px); text-decoration: none; box-shadow: 0 12px 30px rgba(79,70,229,.4); }
+  .btn.ghost { border: 1.5px solid var(--border); background: var(--card); color: var(--ink); }
+  .btn.ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+  /* CSS phone frame holding the real demo screenshot */
+  .phone-stage { position: relative; display: flex; justify-content: center; }
+  .phone {
+    width: min(280px, 70vw); border-radius: 44px; padding: 11px;
+    background: linear-gradient(160deg, #ffffff, #dcd9f2);
+    box-shadow: 0 30px 70px rgba(60, 50, 140, .28), 0 4px 16px rgba(60,50,140,.14);
+    transform: rotate(2.5deg);
+  }
+  .phone img { display: block; width: 100%; border-radius: 34px; }
+  .phone-note {
+    position: absolute; bottom: -.6rem; right: 4%;
+    background: var(--ink); color: #fff; font-size: .78rem; line-height: 1.5;
+    padding: .55rem .9rem; border-radius: 10px; transform: rotate(-1.5deg);
+    box-shadow: 0 10px 24px rgba(28,27,51,.3);
+  }
+  .phone-note b { color: #b8f5d8; }
+
+  /* ── install strip ── */
+  .term {
+    background: #16152b; color: #e6e4ff; border-radius: 16px;
+    font-family: var(--mono); font-size: .86rem; line-height: 1.9;
+    padding: 1.2rem 1.4rem; overflow-x: auto;
+    box-shadow: 0 18px 44px rgba(22,21,43,.35);
+  }
+  .term .c { color: #6f6da0; }
+  .term .p { color: #8be9c3; user-select: none; }
+
+  /* ── sections ── */
+  section { padding: 3.2rem 0; }
+  h2 {
+    font-family: var(--disp); font-weight: 600; font-size: 1.5rem;
+    margin-bottom: .6rem; letter-spacing: .01em;
+  }
+  .sec-lede { color: var(--ink-soft); max-width: 44em; margin-bottom: 2rem; }
+
+  /* layers */
+  .layers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; }
+  .layer {
+    background: var(--card); border: 1px solid var(--border); border-radius: 18px;
+    padding: 1.5rem 1.4rem; backdrop-filter: blur(8px);
+  }
+  .layer .tag { font-family: var(--mono); font-size: .74rem; color: var(--accent); letter-spacing: .1em; }
+  .layer h3 { font-size: 1.08rem; margin: .45rem 0 .55rem; }
+  .layer p { font-size: .92rem; color: var(--ink-soft); }
+  .layer.hot { border-color: rgba(79,70,229,.4); box-shadow: 0 14px 36px rgba(79,70,229,.14); }
+
+  /* CJK comparison */
+  .versus { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; }
+  .vs-card { border-radius: 16px; padding: 1.3rem 1.4rem; font-family: var(--mono); font-size: .9rem; }
+  .vs-card .lbl { font-family: var(--body); font-size: .82rem; font-weight: 600; margin-bottom: .6rem; display: block; }
+  .vs-bad  { background: #fdf0ef; border: 1px solid #f3d1ce; color: var(--bad); }
+  .vs-good { background: #eefaf5; border: 1px solid #cdeede; color: var(--good); }
+
+  /* feature grid */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; }
+  .cell {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 1.3rem 1.3rem;
+  }
+  .cell h3 { font-size: 1rem; margin-bottom: .4rem; }
+  .cell p { font-size: .9rem; color: var(--ink-soft); }
+  .cell code { font-family: var(--mono); font-size: .82em; background: var(--accent-soft); padding: .1em .4em; border-radius: 5px; color: var(--accent); }
+
+  /* api sample */
+  .api-two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; align-items: start; }
+
+  footer.site {
+    margin-top: 2rem; padding: 2.4rem 0 3.2rem; border-top: 1px solid var(--border);
+    color: var(--ink-soft); font-size: .9rem;
+    display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between;
+  }
+
+  @media (max-width: 820px) {
+    .hero { grid-template-columns: 1fr; padding-top: 2rem; }
+    .phone { transform: rotate(0deg); }
+    .layers, .grid, .versus, .api-two { grid-template-columns: 1fr; }
+    nav.top { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="site">
+    <div class="brand">
+      <img src="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/icon-1024.png" alt="iphone-use icon">
+      iphone-use
+    </div>
+    <nav class="top">
+      <a href="#install">Install</a>
+      <a href="#layers">Three layers</a>
+      <a href="#api">Agent API</a>
+      <a href="https://github.com/leeguooooo/iphone-use">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <div>
+      <div class="kicker">Open source · macOS + iPhone Mirroring · Rust</div>
+      <h1>
+        Computer-use,<br>but for the iPhone
+        <span class="en">Let AI agents see and drive a real phone.</span>
+      </h1>
+      <p class="lede">
+        Give AI agents (and your browser) <strong>eyes and hands on a real iPhone</strong>.
+        Live WebRTC remote control in the browser; agents use one HTTP API to screenshot,
+        read the UI element tree, tap and type — <strong>CJK text lands in one shot</strong>.
+        Runs entirely on your own Mac, no third-party cloud.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="https://github.com/leeguooooo/iphone-use">GitHub ↗</a>
+        <a class="btn ghost" href="#install">Install in 60s</a>
+      </div>
+    </div>
+    <div class="phone-stage">
+      <div class="phone">
+        <img src="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/demo-l2-cjk.png"
+             alt="Real-device demo: the agent types a whole CJK paragraph into Notes via the element layer">
+      </div>
+      <div class="phone-note">Real device · agent typed<br><b>a full CJK paragraph, zero mojibake</b></div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install in 60 seconds</h2>
+    <p class="sec-lede">One command installs the daemon; one more teaches your agent to drive the phone.</p>
+    <div class="term">
+<span class="c"># 1) Install the daemon on the Mac (auto-signed LaunchAgent; grant permissions once, keep them forever)</span>
+<span class="p">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+
+<span class="c"># 2) Teach any skills-capable agent (Claude Code, etc.) to drive your phone</span>
+<span class="p">$</span> npx skills add leeguooooo/iphone-use
+
+<span class="c"># 3) (optional) Add the L2 element layer — element tree + tap-by-label + clean CJK</span>
+<span class="p">$</span> ./scripts/setup-wda.sh
+    </div>
+  </section>
+
+  <section id="layers">
+    <h2>Three input layers</h2>
+    <p class="sec-lede">
+      One agent API; the daemon auto-routes to the best path — fast paths get faster, the fallback never goes away.
+    </p>
+    <div class="layers">
+      <div class="layer">
+        <div class="tag">L1 · VERBS</div>
+        <h3>Shortcuts / App Intents</h3>
+        <p>One curated bridge shortcut reaches native iOS APIs — battery, Health, location… Structured JSON comes back: fastest, deterministic, no vision needed.</p>
+      </div>
+      <div class="layer hot">
+        <div class="tag">L2 · ELEMENTS</div>
+        <h3>Element tree (WebDriverAgent)</h3>
+        <p>Reads iOS's own accessibility tree: tap <b>by element label</b>, send Unicode straight into fields — no host-cursor contention, no coordinate drift, <b>CJK lands clean</b>. The agent keeps seeing and acting even while a human holds the phone.</p>
+      </div>
+      <div class="layer">
+        <div class="tag">L3 · PIXELS</div>
+        <h3>Mirroring + CGEvent</h3>
+        <p>Screen stream + system-level input over iPhone Mirroring — the universal fallback that can see and tap anything. Also the human's low-latency WebRTC remote desktop.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>CJK input: clean vs mangled</h2>
+    <p class="sec-lede">Same phone, same Pinyin keyboard — the real recorded results of both paths:</p>
+    <div class="versus">
+      <div class="vs-card vs-bad">
+        <span class="lbl">❌ Traditional pixel path (keycodes eaten by the Pinyin IME)</span>
+        我爱上 typed 不要按 AI阿根廷鸥鸟啊 real iPh…
+      </div>
+      <div class="vs-card vs-good">
+        <span class="lbl">✅ iphone-use L2 element layer (Unicode straight into the field)</span>
+        你好世界!This note was typed by the L2 layer — the whole CJK string landed in one shot.
+      </div>
+    </div>
+  </section>
+
+  <section id="api">
+    <h2>The agent API</h2>
+    <p class="sec-lede">Three moves: see (elements or screenshot) → act → verify. A ready-made <a href="https://github.com/leeguooooo/iphone-use/tree/main/crates/mcp">MCP server</a> (9 tools) plugs straight into Claude.</p>
+    <div class="api-two">
+      <div class="term">
+<span class="c"># See — the UI as text, an order of magnitude cheaper than vision</span>
+<span class="p">$</span> curl -H "$AUTH" $HOST/agent/elements
+{"elements":[{"kind":"Button",
+  "label":"新备忘录","rect":[369,885,38,38]}…]}
+      </div>
+      <div class="term">
+<span class="c"># Act — tap by label / type Unicode directly</span>
+<span class="p">$</span> curl -X POST $HOST/agent/input \
+   -d '{"type":"tap","label":"新备忘录"}'
+<span class="p">$</span> curl -X POST $HOST/agent/input \
+   -d '{"type":"text","text":"你好世界"}'
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why it isn't yet another screenshot poller</h2>
+    <div class="grid">
+      <div class="cell"><h3>🔒 Fully self-hosted</h3><p>The daemon runs on your Mac; your screen never leaves home. Password + bearer auth, login rate-limiting.</p></div>
+      <div class="cell"><h3>⚡ Hardware-encoded WebRTC</h3><p>VideoToolbox H.264 over WebRTC — near-native latency in the browser; Cloudflare TURN for cross-network.</p></div>
+      <div class="cell"><h3>🤖 MCP + Skill</h3><p>One config line for Claude Desktop / Claude Code; <code>npx skills add</code> teaches agents the “vision once → script forever” method.</p></div>
+      <div class="cell"><h3>🧠 The UI as text</h3><p><code>/agent/elements</code> turns the screen into an element list — reasoning gets drastically cheaper, labels feed straight into taps.</p></div>
+      <div class="cell"><h3>🛠 Hardware-validated engineering</h3><p>Scroll must be a wheel event, Mirroring only takes keycodes, focus races, TCC signing… every pitfall is in <a href="https://github.com/leeguooooo/iphone-use/tree/main/docs">the docs</a>.</p></div>
+      <div class="cell"><h3>📦 Grant once, keep forever</h3><p>A stable local signing identity — upgrades and reinstalls never re-prompt Screen Recording / Accessibility.</p></div>
+    </div>
+  </section>
+
+  <footer class="site">
+    <div>iphone-use · MIT License · written in Rust</div>
+    <div>
+      <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> ·
+      <a href="https://github.com/leeguooooo/iphone-use/blob/main/README.md">README</a> ·
+      <a href="https://github.com/leeguooooo/iphone-use/issues">Issues welcome</a>
+    </div>
+  </footer>
+</div>
+
+</body>
+</html>
