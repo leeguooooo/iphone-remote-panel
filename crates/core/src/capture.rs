@@ -250,6 +250,23 @@ mod imp {
         Ok(bytes)
     }
 
+    /// Detect the iPhone Mirroring **"Connection Paused"** interstitial — the
+    /// screen (phone glyph + "Connection Paused" + a "Resume" button) shown when
+    /// the phone locks, leaves range, or a human picks it up. Critically, the
+    /// Mirroring *window still exists* in this state, so `find_mirroring_geometry`
+    /// reports it as present even though no input lands on the phone (issue #14:
+    /// the false-positive `phone_target:true`). iPhone Mirroring is AX-hardened
+    /// (0 accessibility windows), so we can't read its UI tree — we classify by
+    /// pixels: the paused screen is ~uniform dark gray (≈RGB 46,50,52), which a
+    /// live mirror never is.
+    ///
+    /// Returns `true` when the captured frame's gray fraction crosses the
+    /// hardware-calibrated threshold (paused ≈ 0.87; live content ≪ 0.70).
+    pub fn mirroring_appears_paused() -> anyhow::Result<bool> {
+        let png_bytes = screenshot_mirroring_png()?;
+        Ok(super::gray_fraction_from_png(&png_bytes)? >= super::PAUSED_GRAY_THRESHOLD)
+    }
+
     /// Find the iPhone Mirroring window and build a [`crate::coords::SessionGeometry`]
     /// describing its on-screen content rect, for mapping normalized input
     /// coordinates back to absolute screen points.
@@ -512,7 +529,71 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{find_mirroring_geometry, screenshot_mirroring_png, CaptureStream, FrameCallback};
+pub use imp::{
+    find_mirroring_geometry, mirroring_appears_paused, screenshot_mirroring_png, CaptureStream,
+    FrameCallback,
+};
+
+/// `mirroring_appears_paused` stub off-macOS (no Mirroring window exists).
+#[cfg(not(target_os = "macos"))]
+pub fn mirroring_appears_paused() -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// Color of the iPhone Mirroring "Connection Paused" background, and how close a
+/// pixel must be (per channel) to count as that gray. Hardware-sampled.
+const PAUSED_GRAY: [i32; 3] = [46, 50, 52];
+const PAUSED_GRAY_TOL: i32 = 16;
+/// Fraction of grid-sampled pixels that must match [`PAUSED_GRAY`] to call the
+/// frame "paused". The paused interstitial samples ≈0.87; live content is far
+/// below, so 0.70 leaves wide margin on both sides.
+const PAUSED_GRAY_THRESHOLD: f32 = 0.70;
+
+/// Fraction `[0,1]` of grid-sampled pixels within tolerance of the paused-screen
+/// gray. Pure (no capture) so it unit-tests cross-platform. Samples every 6th
+/// pixel in both axes — enough signal for a whole-screen uniformity check at a
+/// fraction of the cost. Only RGB/RGBA 8-bit inputs (what `screencapture`
+/// emits) are supported; anything else errors rather than guessing.
+fn gray_fraction_from_png(bytes: &[u8]) -> anyhow::Result<f32> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| anyhow::anyhow!("png decode: {e}"))?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(anyhow::anyhow!("unsupported PNG bit depth {:?}", info.bit_depth));
+    }
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3usize,
+        png::ColorType::Rgba => 4usize,
+        other => return Err(anyhow::anyhow!("unsupported PNG color type {other:?}")),
+    };
+    let (w, h) = (info.width as usize, info.height as usize);
+    let data = &buf[..info.buffer_size()];
+    let stride = w * channels;
+    let (mut hit, mut total) = (0u64, 0u64);
+    let mut y = 0;
+    while y < h {
+        let row = &data[y * stride..];
+        let mut x = 0;
+        while x < w {
+            let p = &row[x * channels..];
+            let (dr, dg, db) = (
+                (p[0] as i32 - PAUSED_GRAY[0]).abs(),
+                (p[1] as i32 - PAUSED_GRAY[1]).abs(),
+                (p[2] as i32 - PAUSED_GRAY[2]).abs(),
+            );
+            if dr <= PAUSED_GRAY_TOL && dg <= PAUSED_GRAY_TOL && db <= PAUSED_GRAY_TOL {
+                hit += 1;
+            }
+            total += 1;
+            x += 6;
+        }
+        y += 6;
+    }
+    Ok(if total == 0 { 0.0 } else { hit as f32 / total as f32 })
+}
 
 // ---------------------------------------------------------------------------
 // Pure geometry construction (testable on every platform).
@@ -737,5 +818,41 @@ mod tests {
         // Both must end with .png.
         assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("png"));
         assert_eq!(p2.extension().and_then(|e| e.to_str()), Some("png"));
+    }
+
+    /// Encode a solid-color RGBA PNG for the paused-detection tests.
+    fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            let mut data = Vec::with_capacity((w * h * 4) as usize);
+            for _ in 0..(w * h) {
+                data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            writer.write_image_data(&data).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn gray_fraction_flags_paused_screen_and_clears_live() {
+        // A frame filled with the paused-screen gray reads ≈1.0 (≥ threshold).
+        let paused = solid_png(120, 200, [46, 50, 52]);
+        let f_paused = gray_fraction_from_png(&paused).unwrap();
+        assert!(f_paused > 0.95, "paused gray fraction {f_paused} should be ~1.0");
+        assert!(f_paused >= PAUSED_GRAY_THRESHOLD);
+
+        // A white (live-content-ish) frame reads ≈0.0 (well below threshold).
+        let live = solid_png(120, 200, [255, 255, 255]);
+        let f_live = gray_fraction_from_png(&live).unwrap();
+        assert!(f_live < 0.05, "white fraction {f_live} should be ~0.0");
+        assert!(f_live < PAUSED_GRAY_THRESHOLD);
+
+        // A near-gray within tolerance still counts; a clearly different gray does not.
+        assert!(gray_fraction_from_png(&solid_png(60, 60, [55, 58, 60])).unwrap() > 0.95);
+        assert!(gray_fraction_from_png(&solid_png(60, 60, [90, 94, 96])).unwrap() < 0.05);
     }
 }

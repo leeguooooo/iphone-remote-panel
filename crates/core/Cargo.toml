@@ -18,6 +18,10 @@ serde_json = "1"
 # Only used on macOS; the CgEventSink impl is #[cfg(target_os = "macos")].
 core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"] }
 
+# capture.rs paused-screen detection: decode the screencapture PNG to sample the
+# "Connection Paused" interstitial's uniform-gray signature (issue #14/#3).
+png = "0.17"
+
 # capture.rs / encode.rs video pipeline — cross-platform deps.
 # anyhow: error type for the public pipeline API.
 # bytes: zero-copy Annex-B buffers handed to the WebRTC payloader.

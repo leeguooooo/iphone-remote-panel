@@ -186,6 +186,10 @@ pub struct AppState {
     /// One viewer streams at a time; others wait in line and are promoted when
     /// the active one disconnects. Read by `/agent/status` as `viewer_count`.
     pub viewers: Arc<Mutex<crate::signaling::ViewerRegistry>>,
+    /// Memoized Mirroring paused-screen check (issue #14/#3): `(checked_at,
+    /// paused)`. Detection runs `screencapture`, so `/agent/status` reuses a
+    /// recent result instead of re-capturing on every poll.
+    pub mirror_paused_cache: Arc<Mutex<Option<(Instant, bool)>>>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -512,6 +516,26 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
     }
 }
 
+/// Is the Mirroring window currently showing the "Connection Paused" screen?
+/// Memoized for [`MIRROR_PAUSE_CACHE_TTL`] so `/agent/status` polling doesn't
+/// run a `screencapture` on every request. The detection itself is blocking
+/// (spawns `screencapture` + decodes), so it runs on a blocking thread.
+async fn mirror_paused_cached(state: &Arc<AppState>) -> bool {
+    const MIRROR_PAUSE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+    if let Some((at, paused)) = *recover(state.mirror_paused_cache.lock()) {
+        if at.elapsed() < MIRROR_PAUSE_CACHE_TTL {
+            return paused;
+        }
+    }
+    let paused = tokio::task::spawn_blocking(|| {
+        core::capture::mirroring_appears_paused().unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    *recover(state.mirror_paused_cache.lock()) = Some((Instant::now(), paused));
+    paused
+}
+
 /// `GET /agent/status` — auth/health probe. `{"ok":true,"phone_target":bool}`.
 ///
 /// `phone_target` is `true` when an iPhone Mirroring window is currently
@@ -557,6 +581,22 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     } else {
         "offline"
     };
+    // mirror_state + drivable (issue #14 §1): `phone_target` only says the
+    // Mirroring *window* exists — it stays true on the "Connection Paused" /
+    // "in use" interstitial, where L3 taps land in the void. `drivable` is the
+    // honest "can an agent act right now" signal: WDA always can (on-device);
+    // the mirror path can only when the window isn't paused.
+    let (mirror_state, drivable) = if wda {
+        ("active", true)
+    } else if phone_target {
+        if mirror_paused_cached(&state).await {
+            ("paused", false)
+        } else {
+            ("active", true)
+        }
+    } else {
+        ("offline", false)
+    };
     // Version + update hint. `latest_release` is fetched by a background
     // task (24h cadence); compare as plain tags — any mismatch with the
     // running version means a release the binary doesn't match.
@@ -572,7 +612,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // Connected `/ws` viewers (active + queued) — issue #8.
     let viewer_count = recover(state.viewers.lock()).count();
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"mode":"{mode}","mirror_state":"{mirror_state}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")

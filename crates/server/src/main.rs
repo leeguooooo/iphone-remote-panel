@@ -163,6 +163,7 @@ fn serve() -> Result<()> {
             }),
         latest_release: Arc::new(Mutex::new(None)),
         viewers: Arc::new(Mutex::new(server::signaling::ViewerRegistry::default())),
+        mirror_paused_cache: Arc::new(Mutex::new(None)),
     });
 
     run_server(cfg, state)
