@@ -114,6 +114,26 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
   ./target/release/iphone-use serve
 ```
 
+### 升级
+
+daemon 每天检查一次 GitHub Release,结果体现在 `GET /agent/status`
+(`version` / `latest` / `update_available`),落后时网页端会显示升级提示条。
+升级命令与安装相同(bundle id 不变,TCC 授权保留):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh   # daemon
+npx skills update -g                                                                      # agent skill
+```
+
+离线/隐私环境可用 `PHONE_REMOTE_NO_UPDATE_CHECK=1` 关闭检查。
+
+### 反馈 —— 欢迎人类,更欢迎 agent
+
+用着别扭?[提个 issue](https://github.com/leeguooooo/iphone-use/issues)。
+**明确鼓励 AI agent 来提**:自带的 skill 会指导 agent 在使用 API 受阻时
+(报错误导、能力缺失、文档与实际不符)征得用户同意后提交结构化 issue。
+最重度的用户的吐槽,才是产品进化的燃料。
+
 ## 配置（环境变量）
 
 | 变量 | 默认值 | 用途 |

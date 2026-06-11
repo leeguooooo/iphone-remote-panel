@@ -128,6 +128,51 @@ as XML to the Mac, end-to-end ~2–4 min:
 First run: vision at every step. Second run onward: a one-command script that
 only screenshots at steps 2, 5 and 6 as checkpoints.
 
+## Stay current
+
+`GET /agent/status` reports `version`, `latest` and `update_available` (the
+daemon checks GitHub releases daily). When `update_available` is true, tell
+the user once per session — don't upgrade anything yourself (the daemon
+restart would kill your own session):
+
+```
+iphone-use 有新版本(latest,当前 version)。升级:
+  daemon: curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+  skill : npx skills update -g
+```
+
+If this skill's instructions ever disagree with the live API (an endpoint 404s
+or a field is missing), the skill copy is probably stale — suggest
+`npx skills update -g` before working around it.
+
+## Found a rough edge? File an issue
+
+You are this product's heaviest user — your friction reports are how it
+improves. When something about **iphone-use itself** is broken, confusing, or
+needlessly slow (NOT a task-level failure like a mistyped label):
+
+1. Tell the user what you hit and that you'd like to file an issue.
+2. With their OK, file it (the `gh` CLI is usually available):
+
+```bash
+gh issue create -R leeguooooo/iphone-use \
+  -t "agent feedback: <one-line symptom>" \
+  -b "$(cat <<'EOF'
+**What I was doing**: <task context, 1-2 lines>
+**What happened**: <actual behavior, exact error/output>
+**Expected**: <what would have been better>
+**Env**: daemon <version from /agent/status>, mode <mirror|agent>, <macOS/iOS if known>
+**Repro**: <the exact curl/API calls, if reproducible>
+
+*filed by an AI agent via the iphone-use skill, with user consent*
+EOF
+)"
+```
+
+Good candidates: misleading error messages, missing API capabilities you had
+to work around, docs that lied, flaky behaviors with repro steps. Complaints
+welcome — concrete beats polite.
+
 ## Safety
 
 - The phone is REAL: taps have consequences. Verify the screen before tapping

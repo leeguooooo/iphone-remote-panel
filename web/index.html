@@ -277,6 +277,19 @@
     }
     #stillFrame.active { display: block; }
 
+    /* ── Update banner (new release available) ───────────────────── */
+    #updateBanner {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      display: none; align-items: center; gap: .5rem;
+      background: rgba(20, 24, 38, .92); border: 1px solid rgba(99,102,241,.5);
+      color: #c7d2fe; font-size: 12px; padding: .35rem .8rem; border-radius: 99px;
+      z-index: 30; backdrop-filter: blur(6px); cursor: default;
+    }
+    #updateBanner.visible { display: flex; }
+    #updateBanner code { font-size: 11px; background: rgba(99,102,241,.18); padding: .1em .4em; border-radius: 4px; }
+    #updateBanner .x { cursor: pointer; opacity: .6; padding: 0 .2rem; }
+    #updateBanner .x:hover { opacity: 1; }
+
     /* ── Offline / stall overlay ────────────────────────────────── */
     #offlineOverlay {
       position: absolute;
@@ -350,6 +363,12 @@
     <img id="stillFrame" alt="">
     <canvas id="gridCanvas"></canvas>
     <div id="tapDot"></div>
+
+    <!-- update-available banner (populated from /agent/status) -->
+    <div id="updateBanner" role="status">
+      <span id="updateText"></span>
+      <span class="x" id="updateDismiss" title="本次会话不再提示">✕</span>
+    </div>
 
     <!-- offline / stall overlay (pointer-events:none so taps still reach videoArea) -->
     <div id="offlineOverlay" aria-live="polite" aria-atomic="true">
@@ -509,6 +528,26 @@ function showOverlay(kind) {
   offlineOverlay.classList.add('visible');
   paintDot();
 }
+/* ── Update check (once per page load) ───────────────────────────
+   /agent/status accepts the session cookie; the daemon refreshes its view of
+   the latest GitHub release daily. Show a dismissible pill when behind. */
+(async () => {
+  try {
+    const r = await fetch('/agent/status', { cache: 'no-store' });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.update_available && s.latest && !sessionStorage.getItem('updateDismissed')) {
+      document.getElementById('updateText').innerHTML =
+        `新版本 <b>${s.latest}</b> 可用(当前 v${s.version})— 升级:<code>curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code>`;
+      document.getElementById('updateBanner').classList.add('visible');
+      document.getElementById('updateDismiss').onclick = () => {
+        sessionStorage.setItem('updateDismissed', '1');
+        document.getElementById('updateBanner').classList.remove('visible');
+      };
+    }
+  } catch (_) { /* best-effort */ }
+})();
+
 /* ── L2 stills fallback ──────────────────────────────────────────
    When Mirroring dies (phone in use / disconnected) the WebRTC track has no
    real pixels, but the daemon's /agent/screenshot can still capture via WDA

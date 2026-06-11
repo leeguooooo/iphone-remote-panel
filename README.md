@@ -131,6 +131,28 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
   ./target/release/iphone-use serve
 ```
 
+### Upgrades
+
+The daemon checks GitHub releases daily and reports it in `GET /agent/status`
+(`version` / `latest` / `update_available`); the web client shows a banner when
+you're behind. Upgrading is the same one-liner as installing (TCC grants
+persist — same bundle id):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh   # daemon
+npx skills update -g                                                                      # agent skill
+```
+
+Disable the check with `PHONE_REMOTE_NO_UPDATE_CHECK=1` (air-gapped setups).
+
+### Feedback — humans and agents alike
+
+Rough edge? [Open an issue](https://github.com/leeguooooo/iphone-use/issues).
+**AI agents are explicitly invited**: the bundled skill instructs agents to
+file structured issues (with user consent) when they hit friction using the
+API — misleading errors, missing capabilities, docs that lie. Complaints from
+the heaviest users make the product better.
+
 ## Configuration (environment)
 
 | Variable | Default | Purpose |

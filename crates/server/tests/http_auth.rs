@@ -82,6 +82,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         agent_token: None,
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         wda: None,
+        latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -125,6 +126,7 @@ fn build_state_with_agent_token(
         agent_token: agent_token.map(|s| s.to_string()),
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         wda: None,
+        latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
     })
 }
 

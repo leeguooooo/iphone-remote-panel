@@ -177,6 +177,11 @@ pub struct AppState {
     /// `tokio::sync::Mutex` because the client mutates its cached session and
     /// handlers hold the lock across awaits.
     pub wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    /// Latest released tag on GitHub (e.g. `"v0.3.0"`), refreshed by a
+    /// background task every 24h (`main::spawn_update_check`). `None` until
+    /// the first successful fetch (or when offline). Read by `agent_status`
+    /// to surface `update_available` to agents and the web client.
+    pub latest_release: Arc<Mutex<Option<String>>>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -512,14 +517,21 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
 /// external binary is needed for key/text/shortcut — `phone_target` simply
 /// tells the agent whether the Mirroring window is up right now.
 async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => return with_security_headers(
-            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-        ),
-        AgentAuth::Denied => return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        ),
-        AgentAuth::Ok => {}
+    // Same cookie-or-bearer rule as `agent_screenshot`: a logged-in browser
+    // viewer may read the health/version probe (the web client uses it for
+    // the update banner). Cookie first so polling never trips the limiter;
+    // only honored when a password is configured (see agent_screenshot).
+    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
+    if !cookie_ok {
+        match agent_auth(&state, &headers) {
+            AgentAuth::Locked => return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            ),
+            AgentAuth::Denied => return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            ),
+            AgentAuth::Ok => {}
+        }
     }
     // Cheap probe: returns Ok if ScreenCaptureKit can see the window.
     #[cfg(target_os = "macos")]
@@ -541,8 +553,20 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     } else {
         "offline"
     };
+    // Version + update hint. `latest_release` is fetched by a background
+    // task (24h cadence); compare as plain tags — any mismatch with the
+    // running version means a release the binary doesn't match.
+    let version = env!("CARGO_PKG_VERSION");
+    let latest = recover(state.latest_release.lock()).clone();
+    let (latest_json, update_available) = match &latest {
+        Some(tag) => (
+            format!(r#""{tag}""#),
+            tag.trim_start_matches('v') != version,
+        ),
+        None => ("null".to_string(), false),
+    };
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}"}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}","version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -923,40 +947,63 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
         }
     }
     let png = tokio::task::spawn_blocking(core::capture::screenshot_mirroring_png).await;
-    match png {
-        Ok(Ok(bytes)) if !bytes.is_empty() => {
+    // A valid L3 capture short-circuits. Otherwise — capture error, empty, OR a
+    // runt/garbage frame (issue #14: ~26-byte non-PNG bodies came back during the
+    // post-Resume screen transition and crashed the agent's decoder) — fall
+    // through to the WDA on-device screenshot, then to a clear 503. Never hand
+    // the agent half a frame with an image/png content-type.
+    match &png {
+        Ok(Ok(bytes)) if is_valid_png(bytes) => {
             let resp = Response::builder()
                 .header(header::CONTENT_TYPE, "image/png")
-                .body(Body::from(bytes))
+                .body(Body::from(bytes.clone()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-            with_security_headers(resp)
+            return with_security_headers(resp);
+        }
+        Ok(Ok(bytes)) => {
+            // Non-empty but not a decodable PNG, or empty.
+            tracing::warn!(
+                "agent screenshot: L3 capture returned {} bytes, not a valid PNG — trying WDA",
+                bytes.len()
+            );
         }
         Ok(Err(e)) => {
-            // L3 capture has no Mirroring window — fall back to WDA's
-            // on-device screenshot when configured (works with no Mac-side
-            // window at all; this keeps the agent's eyes open even when the
-            // phone isn't mirrored anywhere).
-            if let Some(wda) = &state.wda {
-                if let Ok(bytes) = wda.lock().await.screenshot_png().await {
-                    let resp = Response::builder()
-                        .header(header::CONTENT_TYPE, "image/png")
-                        .body(Body::from(bytes))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-                    return with_security_headers(resp);
-                }
-            }
-            tracing::warn!("agent screenshot: no Mirroring window: {e:#}");
-            with_security_headers(
-                (StatusCode::SERVICE_UNAVAILABLE, "Mirroring window not found").into_response(),
-            )
+            tracing::warn!("agent screenshot: no Mirroring window: {e:#} — trying WDA");
         }
-        other => {
-            tracing::warn!("agent screenshot failed: {other:?}");
-            with_security_headers(
-                (StatusCode::BAD_GATEWAY, "screenshot capture failed").into_response(),
-            )
+        Err(e) => {
+            tracing::warn!("agent screenshot: capture task panicked: {e:?} — trying WDA");
         }
     }
+    // On-device fallback: works with no Mac-side window at all, and its bytes
+    // come straight from WDA so they're a complete frame.
+    if let Some(wda) = &state.wda {
+        match wda.lock().await.screenshot_png().await {
+            Ok(bytes) if is_valid_png(&bytes) => {
+                let resp = Response::builder()
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return with_security_headers(resp);
+            }
+            Ok(bytes) => tracing::warn!(
+                "agent screenshot: WDA returned {} bytes, not a valid PNG",
+                bytes.len()
+            ),
+            Err(e) => tracing::warn!("agent screenshot: WDA screenshot failed: {e:#}"),
+        }
+    }
+    with_security_headers(
+        (StatusCode::SERVICE_UNAVAILABLE, "no valid screenshot frame available").into_response(),
+    )
+}
+
+/// True when `bytes` is a plausibly-decodable PNG: the 8-byte signature plus
+/// enough length to carry an IHDR. Guards the agent's decoder against the
+/// runt/garbage frames the Mirroring capture can emit mid-transition (issue #14).
+fn is_valid_png(bytes: &[u8]) -> bool {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    // 8 sig + 4 len + 4 "IHDR" + 13 IHDR data + 4 CRC = 33 minimum.
+    bytes.len() >= 33 && bytes.starts_with(&PNG_SIG)
 }
 
 /// `POST /agent/inbox` — the phone (an iOS Shortcut) delivers a structured result.
@@ -1264,5 +1311,21 @@ mod tests {
         assert!(INDEX_HTML.contains("iphone-use"));
         assert!(INDEX_HTML.contains("/ws"));
         assert!(INDEX_HTML.contains("turn-creds"));
+    }
+
+    #[test]
+    fn png_validation_rejects_runt_and_garbage_frames() {
+        let sig = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        // The issue-#14 failure mode: a short non-PNG body.
+        assert!(!is_valid_png(&[0u8; 26]));
+        assert!(!is_valid_png(&[]));
+        // Right signature but too short to hold an IHDR.
+        assert!(!is_valid_png(&sig));
+        // Right length but wrong magic (e.g. a JPEG or HTML error page).
+        assert!(!is_valid_png(&[0xffu8; 64]));
+        // A minimal well-formed-enough PNG header passes.
+        let mut ok = sig.to_vec();
+        ok.extend_from_slice(&[0u8; 25]); // pad past the 33-byte floor
+        assert!(is_valid_png(&ok));
     }
 }

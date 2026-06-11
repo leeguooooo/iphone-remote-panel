@@ -161,9 +161,69 @@ fn serve() -> Result<()> {
                     None
                 }
             }),
+        latest_release: Arc::new(Mutex::new(None)),
     });
 
     run_server(cfg, state)
+}
+
+/// Background update check: resolve the repo's latest release tag every 24h
+/// and stash it in `AppState.latest_release` for `/agent/status` to report.
+///
+/// Uses the `releases/latest` REDIRECT (no api.github.com): the web tier has
+/// no anonymous rate limit (the API caps at 60 req/h per IP — a hardware-
+/// tested failure mode, see install.sh), and the Location header carries the
+/// tag: `https://github.com/<repo>/releases/tag/v0.2.0`. Set
+/// `PHONE_REMOTE_NO_UPDATE_CHECK=1` to disable (air-gapped / privacy).
+fn spawn_update_check(state: Arc<AppState>) {
+    if std::env::var("PHONE_REMOTE_NO_UPDATE_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
+        tracing::info!("update check disabled (PHONE_REMOTE_NO_UPDATE_CHECK)");
+        return;
+    }
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("update check disabled (client build failed): {e:#}");
+                return;
+            }
+        };
+        loop {
+            match client
+                .get("https://github.com/leeguooooo/iphone-use/releases/latest")
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let tag = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|l| l.to_str().ok())
+                        .and_then(|l| l.rsplit("/tag/").next().map(str::to_string))
+                        .filter(|t| t.starts_with('v'));
+                    if let Some(tag) = tag {
+                        let current = env!("CARGO_PKG_VERSION");
+                        if tag.trim_start_matches('v') != current {
+                            tracing::info!(
+                                "update available: {tag} (running v{current}) — \
+                                 curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh"
+                            );
+                        }
+                        *state
+                            .latest_release
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(tag);
+                    }
+                }
+                Err(e) => tracing::debug!("update check fetch failed (will retry): {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
 }
 
 /// Build the tokio runtime and serve.
@@ -188,6 +248,9 @@ fn run_server(cfg: Config, state: Arc<AppState>) -> Result<()> {
         if let Some(cf) = server::turn::CfTurnConfig::from_env() {
             spawn_cloudflare_turn_refresh(cf, state.ice.clone());
         }
+
+        // Daily release check → /agent/status {version, latest, update_available}.
+        spawn_update_check(state.clone());
 
         let app = http::router(state);
         axum::serve(listener, app)
