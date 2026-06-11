@@ -245,6 +245,14 @@ LaunchAgent install. Next:
   `tap` / `type` / `scroll` / `screenshot` as native tools.
 - [ ] **Cross-network validation** of the Cloudflare dynamic TURN path with a real key
   (the minting + refresh code already ships; needs an end-to-end run off-LAN).
+- [ ] **Element-tree control via WebDriverAgent (the "L2" layer).** Today's input is
+  pixel-level (vision → coordinates → a synthetic click on the host Mac's one shared
+  cursor): slow, drift-prone, and it fights a human using the same Mac. WDA runs *on the
+  phone* and drives iOS's own accessibility tree — no cursor contention, no coordinate
+  drift, and **CJK text input goes straight through** (bypassing the keycode/IME caveat).
+  It becomes the default path; mirroring + CGEvent stays as the universal pixel fallback.
+  Setup + every hardware-validated pitfall (incl. *iOS version must not outrun Xcode's
+  DDI*) is in **[`docs/wda-setup.html`](docs/wda-setup.html)**.
 - [x] **Release binaries** in CI + a one-line `curl … install.sh | sh` install.
 - [ ] A short **demo** (GIF / video) of an AI agent driving the phone through the API.
 

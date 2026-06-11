@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebDriverAgent (元素树控制) 接入与踩坑 · iphone-use</title>
+<style>
+  :root {
+    --fg: #1a1a1a; --muted: #6b6b6b; --bg: #fbfbfa; --card: #ffffff;
+    --border: #e6e4df; --accent: #c0392b; --code-bg: #f4f2ee; --ok: #2e7d32; --warn: #b7791f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 1.25rem 5rem; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.65; max-width: 860px; margin-inline: auto;
+  }
+  header { padding: 2.5rem 0 1rem; border-bottom: 1px solid var(--border); }
+  h1 { font-size: 1.75rem; margin: 0 0 .4rem; }
+  h2 { font-size: 1.25rem; margin: 2.4rem 0 .8rem; padding-top: .6rem; border-top: 1px solid var(--border); }
+  h3 { font-size: 1.05rem; margin: 1.6rem 0 .5rem; }
+  .lede { color: var(--muted); font-size: 1.02rem; }
+  code { background: var(--code-bg); padding: .12em .4em; border-radius: 4px; font-size: .9em;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+  pre { background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px; overflow-x: auto;
+    border: 1px solid var(--border); font-size: .85rem; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { text-align: left; padding: .55rem .7rem; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  .pit { border-left: 3px solid var(--warn); background: #fffaf0; padding: .7rem 1rem; border-radius: 0 6px 6px 0; margin: 1rem 0; }
+  .pit h3 { margin-top: 0; }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 600; padding: .1em .5em; border-radius: 4px;
+    vertical-align: middle; margin-left: .4rem; }
+  .tag.block { background: #fde8e6; color: var(--accent); }
+  .tag.ok { background: #e7f4e8; color: var(--ok); }
+  aside { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.2rem; margin: 1.2rem 0; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>WebDriverAgent 元素树控制 — 接入指南与踩坑</h1>
+  <p class="lede">iphone-use 的 <strong>L2 元素层</strong>:通过 iOS 自己的辅助功能树按「元素」操作 App,
+  事件由手机自己合成 —— 不抢 Mac 光标、不靠视觉猜坐标、中文输入直通。这是对镜像+CGEvent(L3 像素层)的升级,
+  不是替代。本页记录在真机上验证出的全部坑。</p>
+</header>
+
+<h2>为什么要这一层</h2>
+<p>镜像窗口对 macOS 来说只是一块视频,iOS 的按钮不在 Mac 的辅助功能树里,所以现状(L3)只能<strong>看图猜坐标 + 用 Mac 的真实光标代点</strong>:慢、随布局/语言/分辨率漂移、且和正在用电脑的人抢同一颗光标。WebDriverAgent(WDA,Appium 的底座)作为一个测试 runner 跑<strong>在手机上</strong>,能直接拿到 iOS 的元素树并由手机自己合成事件。</p>
+
+<table>
+  <tr><th>层</th><th>通道</th><th>本质</th><th>短板</th></tr>
+  <tr><td>L1 动词</td><td>Shortcuts / App Intents</td><td>调 App 暴露的类型化动作,最快最确定</td><td>只覆盖 App 愿意暴露的</td></tr>
+  <tr><td><strong>L2 元素</strong></td><td><strong>WebDriverAgent</strong></td><td>读 iOS 元素树,按元素点击,手机自己合成事件</td><td>需 Xcode 签名装 runner</td></tr>
+  <tr><td>L3 像素</td><td>镜像 + CGEvent</td><td>看图猜坐标,Mac 光标代点 —— 万能兜底</td><td>慢、脆、抢光标</td></tr>
+</table>
+
+<h2>前置条件</h2>
+<ul>
+  <li>Mac:Xcode(命令行套件),并在 <em>Xcode → Settings → Accounts</em> 登录 Apple ID(免费 Personal Team 即可)。</li>
+  <li>iPhone:开启<strong>开发者模式</strong>(设置 → 隐私与安全性 → 开发者模式 → 开 → 重启)。</li>
+  <li><strong>iPhone 的 iOS 版本必须 ≤ Xcode 支持的最高 iOS</strong> —— 见下方头号坑。</li>
+  <li>WDA 源码:<code>git clone https://github.com/appium/WebDriverAgent.git</code></li>
+</ul>
+
+<h2>一次跑通的命令</h2>
+<pre><code>cd WebDriverAgent
+xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
+  -destination "platform=iOS,id=&lt;设备UDID&gt;" \
+  -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM=&lt;你的TeamID&gt; \
+  PRODUCT_BUNDLE_IDENTIFIER=com.yourname.wdarunner \
+  test
+# 成功标志:日志出现 ServerURLHere -&gt; http://&lt;phone-ip&gt;:8100/</code></pre>
+
+<h2>踩坑清单(真机验证)</h2>
+
+<div class="pit">
+  <h3>① iOS 版本不能超前于 Xcode 的 DDI <span class="tag block">头号硬坑</span></h3>
+  <p>Xcode 自带的 Developer Disk Image(DDI)必须 <strong>≥ 设备 iOS 版本</strong>才能挂载。装了 iOS beta 的手机配旧 Xcode,开发服务永远起不来 —— <code>devicectl</code> 显示 <code>ddiServicesAvailable: false</code>,xcodebuild 报 <code>"Developer Disk Image is not mounted… Ensure that the device is unlocked"</code>。<strong>注意这句和「锁屏」报错文案一模一样,极易误判成锁屏问题。</strong></p>
+  <p>排查:<code>plutil -p /Library/Developer/DeveloperDiskImages/iOS_DDI/version.plist</code> 看 <code>ProductBuildVersion</code>(如 <code>17A400</code>=iOS 26.0),对比手机 <em>设置→通用→关于本机</em> 的版本。</p>
+  <p>修复:升级 Xcode 到能覆盖该 iOS 的版本(iOS beta 用户要装对应 Xcode beta);或别在 beta 系统的设备上跑 WDA。<strong>结论:WDA 路线要求「设备 iOS ≤ Xcode 支持的最高 iOS」。</strong></p>
+</div>
+
+<div class="pit">
+  <h3>② 手机锁屏 → 开发服务起不来(另一个独立原因,文案相同)</h3>
+  <p>首次挂载 DDI 必须保持手机<strong>解锁</strong>。报错与坑①完全一样,所以先排除版本不匹配,再确认是否锁屏。建议跑 WDA 期间把自动锁定调长。</p>
+</div>
+
+<div class="pit">
+  <h3>③ 两套设备 ID,别搞混</h3>
+  <p><code>xcrun devicectl list devices</code> 显示的是 CoreDevice UUID(如 <code>98E449E4-…</code>);xcodebuild <code>-destination "id=…"</code> 要的是<strong>老式 UDID</strong>(如 <code>00008110-001C…</code>)。用错直接报 <code>"Unable to find a device matching the provided destination specifier"</code>。查正确 UDID:<code>xcodebuild -showdestinations</code> 或 <code>devicectl device info details</code> 里的 <code>udid</code> 字段。</p>
+</div>
+
+<div class="pit">
+  <h3>④ 未登录开发团队 → 签名失败</h3>
+  <p>新机器 <code>security find-identity -p codesigning</code> 返回 0,xcodebuild 报 <code>"Signing for WebDriverAgentRunner requires a development team"</code>。修复:Xcode → Settings → Accounts 登录 Apple ID;证书首次编译用 <code>-allowProvisioningUpdates</code> 自动生成。</p>
+</div>
+
+<div class="pit">
+  <h3>⑤ 手机上要信任开发者证书</h3>
+  <p>装上后首次启动若被拒,去 <em>设置 → 通用 → VPN 与设备管理</em> 信任你的开发者证书。</p>
+</div>
+
+<div class="pit">
+  <h3>⑥ 免费账号签名 7 天过期</h3>
+  <p>免费 Personal Team 签出来的 WDA 7 天失效,要每周重装;付费开发者账号(¥688/年)签名一年有效。长期部署建议付费账号。</p>
+</div>
+
+<h2>跑通之后(验证清单)</h2>
+<p>WDA 起来后(<code>http://&lt;phone-ip&gt;:8100</code>),下列能力是这条路线相对镜像+CGEvent 的核心优势:</p>
+<ul>
+  <li><code>GET /source</code> — 拿到元素树(含中文 App 的 label)。</li>
+  <li>按元素点击 / <code>POST …/value</code> 写值 — <strong>不碰 Mac 光标</strong>,人可同时正常用电脑。</li>
+  <li>type 直接送字符串 — <strong>绕过 keycode / 拼音 IME 整个坑,中文直通</strong>。</li>
+  <li>按元素 label 定位 — 无坐标漂移。</li>
+</ul>
+
+<aside>
+  <strong>这一层不取代镜像。</strong> 镜像 + WebRTC 仍是人类远程桌面、视觉兜底、以及 WDA 覆盖不到时的保险。
+  agent 的默认路径优先 L1 动词 → L2 元素 → L3 像素兜底。
+</aside>
+
+<footer>
+  iphone-use · WDA 接入与踩坑 · 真机验证环境:macOS 26 / Xcode 26.0.1 / iPhone 14 (iOS 27.0 beta)。
+  本页随路线推进持续更新。
+</footer>
+</body>
+</html>

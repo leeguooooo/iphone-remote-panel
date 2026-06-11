@@ -214,6 +214,7 @@ npx skills add leeguooooo/iphone-use
   在 27 beta 上重新验证抓取 + 输入，并加上新的 **控制中心** 快捷操作。目标：一个构建跑通 macOS 15 / 26 / 27。
 - [x] **MCP 服务器** 封装智能体 API，让 MCP 客户端（Claude 等）把 `tap` / `type` / `scroll` / `screenshot` 当原生工具用。
 - [ ] **跨网络验证** Cloudflare 动态 TURN 链路（铸造 + 刷新代码已就绪；需要一次真实 key 的非局域网端到端跑通）。
+- [ ] **基于 WebDriverAgent 的元素树控制（「L2」层）。** 现在的输入是像素级的（视觉 → 坐标 → 在宿主 Mac 唯一共享光标上合成点击）：慢、易漂移、且会和正在用这台 Mac 的人抢光标。WDA 跑*在手机上*、驱动 iOS 自己的辅助功能树 —— 不抢光标、无坐标漂移，且**中文输入直通**（绕过 keycode/输入法坑）。它将成为默认路径，镜像 + CGEvent 退为通用的像素兜底。接入步骤 + 全部真机验证过的坑（含*「iOS 版本不能超前于 Xcode 的 DDI」*头号坑）见 **[`docs/wda-setup.html`](docs/wda-setup.html)**。
 - [x] **CI 发布二进制** + 一行 `curl … install.sh | sh` 安装。
 - [ ] 一个简短的 **演示**（GIF / 视频）：AI 智能体通过 API 操作手机。
 
