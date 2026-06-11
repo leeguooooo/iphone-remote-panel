@@ -77,6 +77,13 @@ Hard-won facts (hardware-validated — trust these):
   to US keycodes: a Chinese/Pinyin IME then eats digits as candidate-selectors
   (`a1b2c3` → `啊不c3`) — switch the phone to the English ABC keyboard for
   literal ASCII, and don't attempt CJK at all.
+- **WDA and iPhone Mirroring are mutually exclusive** (A/B-tested on hardware):
+  the on-phone XCUITest runner monopolizes the device's remote session, so
+  while `wda:true` the Mirroring window shows "Connection Interrupted" and the
+  human's live video is replaced by ~2.5s stills — that's expected, not broken.
+  Don't try to "fix" the mirror while WDA runs. If a task truly needs live
+  Mirroring (L3 video), the operator must run `scripts/setup-wda.sh stop` and
+  click Try Again; restarting WDA later kills the mirror again.
 - **One action at a time.** The phone animates; give transitions ~1s before
   the verify screenshot. App launches / share sheets can take 2–4s.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`

@@ -143,6 +143,20 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 <div class="pit">
   <h3>⑧ 跨子网也能直连;手机频繁锁屏挡操作</h3>
   <p>WDA 监听手机的 <code>0.0.0.0:8100</code>,日志打印 <code>ServerURLHere-&gt;http://&lt;phone-ip&gt;:8100&lt;-ServerURLHere</code>。实测<strong>手机和 Mac 不在同一 /24 子网也能直连</strong>(只要可路由);否则用 <code>iproxy 8100 8100</code> 走 USB 转发。<br>另:很多操作(启动 app、输入)要求手机解锁,默认「自动锁定 30 秒」会反复打断 —— 把它设成<strong>永不</strong>。讽刺的是 <strong>agent 自己就能用 WDA 设</strong>:按标签点 <em>设置 → 显示与亮度 → 自动锁定 → 永不</em>(本项目已这么验证过)。但首次解锁仍需真人(Face ID/密码),WDA 不能解锁。</p>
+
+  <h3>⑨ WDA 与 iPhone 镜像互斥:runner 一启动,镜像必断 <span class="tag block">架构级</span></h3>
+  <p>跑在手机上的 XCUITest runner(WDA)会<strong>独占设备的远程会话</strong>:它一启动,iPhone 镜像立刻断成
+  「Connection Interrupted」;它活着,镜像点 Try Again 永远连不回去 —— <strong>哪怕手机已锁屏</strong>。
+  反向同样成立,先连镜像再启 runner,镜像当场被踢掉。真机 A/B 实测(iPhone 17 / iOS 27,2026-06-12):
+  带着 WDA 点 Try Again → 失败;杀掉 runner 再点 → <strong>秒连</strong>;镜像连着时重启 runner → 镜像当场断。</p>
+  <p>所以 L2(元素树)和 L3(镜像实时视频)是<strong>二选一的模式</strong>,不是叠加层:</p>
+  <ul>
+    <li><strong>镜像模式</strong>(给人看):实时视频 + L3 像素输入。先 <code>setup-wda.sh stop</code>,再在镜像窗口点 Try Again。</li>
+    <li><strong>Agent 模式</strong>(给 agent 用):元素树、中文直通、手机端原生截图;此时网页端自动切到
+    <strong>静帧兜底</strong>(每 2.5s 一帧 WDA 抓屏,人仍能看到手机在干嘛),镜像窗口显示 Interrupted 属正常现象。</li>
+  </ul>
+  <p>切换命令:<code>scripts/setup-wda.sh</code>(启 = 进 Agent 模式)/ <code>scripts/setup-wda.sh stop</code>(停 = 回镜像模式,记得点 Try Again)。
+  排障速记:<strong>镜像怎么也连不上时,第一反应查 WDA 是否在跑</strong>(<code>curl http://127.0.0.1:8100/status</code>)。</p>
 </div>
 
 <h2>已验证(iPhone 17 / iOS 27 真机,2026-06-11)</h2>
