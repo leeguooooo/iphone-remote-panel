@@ -140,6 +140,7 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | `PHONE_REMOTE_PASSWORD` | *(none)* | Shared password (cookie login + agent bearer fallback). |
 | `PHONE_REMOTE_AGENT_TOKEN` | *(none)* | Dedicated agent bearer token. When set, the agent API accepts **only** this token (the password is no longer valid as a bearer); unset = password doubles as the bearer (legacy). |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → ephemeral relay creds for cross-network. |
+| `PHONE_REMOTE_WDA_URL` | *(none)* | L2 element-tree control: a WebDriverAgent reachable at this URL (use `http://127.0.0.1:8100` via the relay from `scripts/setup-wda.sh`). When set, agent text/taps auto-route through the phone-side element layer — CJK text lands cleanly, label-taps need no coordinates, nothing touches the host cursor. Unset = pure pixel path. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Static TURN server (alternative to Cloudflare). |
 
 ## Agent API
@@ -245,15 +246,15 @@ LaunchAgent install. Next:
   `tap` / `type` / `scroll` / `screenshot` as native tools.
 - [ ] **Cross-network validation** of the Cloudflare dynamic TURN path with a real key
   (the minting + refresh code already ships; needs an end-to-end run off-LAN).
-- [~] **Element-tree control via WebDriverAgent (the "L2" layer)** — *spike validated on
-  hardware (iPhone 17 / iOS 27); daemon integration pending.* Today's input is pixel-level
-  (vision → coordinates → a synthetic click on the host Mac's one shared cursor): slow,
-  drift-prone, and it fights a human using the same Mac. WDA runs *on the phone* and drives
-  iOS's own accessibility tree. Proven on real hardware: read the element tree (Chinese
-  labels included), tap by label (no cursor contention), and **CJK text goes straight in
-  cleanly** (where the L3 keycode path produces Pinyin-IME garbage). Remaining: wire the
-  [`wda` client](crates/server/src/wda.rs) into the agent routing (L1 verb → L2 element →
-  L3 pixel) and a `setup-wda.sh`. Setup + every hardware-validated pitfall is in
+- [x] **Element-tree control via WebDriverAgent (the "L2" layer)** — shipped and
+  hardware-validated (iPhone 17 / iOS 27) *through the daemon's own API*. WDA runs *on the
+  phone* and drives iOS's accessibility tree, so the same agent API auto-routes to the best
+  path: `{"type":"text"}` lands **CJK cleanly** (the pixel path's keycodes get eaten by the
+  Pinyin IME), `{"type":"tap","label":"…"}` taps **by element** (no coordinates, no host
+  cursor), `GET /agent/elements` returns the UI as text (an order of magnitude cheaper than
+  vision), and screenshots fall back to on-device capture when Mirroring is gone — the agent
+  keeps seeing and acting **while a human is holding the phone**. One-command setup:
+  `./scripts/setup-wda.sh` (requires Xcode); every hardware-validated pitfall is in
   **[`docs/wda-setup.html`](docs/wda-setup.html)**.
 - [x] **Release binaries** in CI + a one-line `curl … install.sh | sh` install.
 - [ ] A short **demo** (GIF / video) of an AI agent driving the phone through the API.

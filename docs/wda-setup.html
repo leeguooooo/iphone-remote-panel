@@ -57,23 +57,45 @@
   <tr><td>L3 像素</td><td>镜像 + CGEvent</td><td>看图猜坐标,Mac 光标代点 —— 万能兜底</td><td>慢、脆、抢光标</td></tr>
 </table>
 
+<h2>一键安装(推荐)</h2>
+<pre><code># 前置:Xcode 已装且登录了 Apple ID(Settings → Accounts);
+#       手机已配对、开发者模式已开;brew install socat(或 libimobiledevice)
+./scripts/setup-wda.sh           # 编译装机 → 守护运行 → localhost 中继 → 配置 daemon
+./scripts/setup-wda.sh status    # 看 WDA + 中继状态
+./scripts/setup-wda.sh stop      # 停掉
+</code></pre>
+<p>脚本把本页所有坑都编码进去了:等 DDI 挂载会提示你解锁、撞到证书信任会给出指路、自动选 iproxy(USB)或 socat(Wi-Fi)做 localhost 中继、最后自动把 <code>PHONE_REMOTE_WDA_URL</code> 写进 daemon 的 LaunchAgent 并重启。完成后 daemon 的 agent API 自动启用 L2 路由(见下方「统一 API」)。</p>
+
 <h2>前置条件</h2>
 <ul>
   <li>Mac:Xcode(命令行套件),并在 <em>Xcode → Settings → Accounts</em> 登录 Apple ID(免费 Personal Team 即可)。</li>
   <li>iPhone:开启<strong>开发者模式</strong>(设置 → 隐私与安全性 → 开发者模式 → 开 → 重启)。</li>
-  <li><strong>iPhone 的 iOS 版本必须 ≤ Xcode 支持的最高 iOS</strong> —— 见下方头号坑。</li>
-  <li>WDA 源码:<code>git clone https://github.com/appium/WebDriverAgent.git</code></li>
+  <li>中继工具:<code>brew install socat</code>(Wi-Fi)或 <code>brew install libimobiledevice</code>(USB 的 iproxy)。</li>
 </ul>
 
-<h2>一次跑通的命令</h2>
-<pre><code>cd WebDriverAgent
+<h2>手动跑(理解原理用)</h2>
+<pre><code>git clone --depth 1 https://github.com/appium/WebDriverAgent.git && cd WebDriverAgent
 xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   -destination "platform=iOS,id=&lt;设备UDID&gt;" \
   -allowProvisioningUpdates \
   DEVELOPMENT_TEAM=&lt;你的TeamID&gt; \
-  PRODUCT_BUNDLE_IDENTIFIER=com.yourname.wdarunner \
+  PRODUCT_BUNDLE_IDENTIFIER=com.leeguoo.iphone-use.wda \
   test
-# 成功标志:日志出现 ServerURLHere -&gt; http://&lt;phone-ip&gt;:8100/</code></pre>
+# 成功标志:日志出现 ServerURLHere -&gt; http://&lt;phone-ip&gt;:8100/
+# 注意 xcodebuild 不能退出 —— 它退了 WDA 就死(setup-wda.sh 帮你守护)。</code></pre>
+
+<h2>统一 API:daemon 的自动路由</h2>
+<p>给 daemon 设 <code>PHONE_REMOTE_WDA_URL=http://127.0.0.1:8100</code>(setup 脚本自动配)后,<strong>同一套 agent API 自动选最优路径</strong>,调用方零改动:</p>
+<table>
+  <tr><th>调用</th><th>路由</th><th>说明</th></tr>
+  <tr><td><code>POST /agent/input {"type":"text","text":"你好"}</code></td><td>L2 → 失败回退 L3</td><td><strong>中文直通</strong>(Unicode 进文本框,不被 IME 吃)</td></tr>
+  <tr><td><code>POST /agent/input {"type":"tap","label":"新备忘录"}</code></td><td>仅 L2</td><td><strong>按元素点</strong>:无坐标、无漂移、不碰 Mac 光标(L3 无此能力)</td></tr>
+  <tr><td><code>POST /agent/input {"type":"tap","x":0.5,"y":0.5}</code></td><td>L2 → 失败回退 L3</td><td>归一化坐标,手机端合成,无需镜像窗口在最前</td></tr>
+  <tr><td><code>GET /agent/elements</code></td><td>仅 L2</td><td>扁平元素树 <code>{kind,label,rect,depth}</code> —— 文本,比截图便宜一个量级</td></tr>
+  <tr><td><code>GET /agent/screenshot</code></td><td>L3 → 无窗口时回退 L2</td><td>镜像断开(人拿着手机)时仍能看到屏幕</td></tr>
+  <tr><td><code>scroll / key / shortcut</code></td><td>仅 L3</td><td>仍走镜像 + CGEvent</td></tr>
+</table>
+<p><code>GET /agent/status</code> 返回 <code>{"ok","phone_target","wda"}</code> —— <code>wda:true</code> 表示 L2 实时可用。</p>
 
 <h2>踩坑清单(真机验证)</h2>
 
@@ -112,7 +134,14 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 </div>
 
 <div class="pit">
-  <h3>⑦ 跨子网也能直连;手机频繁锁屏挡操作</h3>
+  <h3>⑦ macOS「本地网络」隐私会静默拦截 daemon 直连手机 <span class="tag block">必须走 localhost 中继</span></h3>
+  <p>真机实测:终端里 <code>curl http://&lt;phone-ip&gt;:8100/status</code> 通,但 <strong>daemon(后台 LaunchAgent)发同样的请求失败</strong>、不弹任何授权框 —— macOS 15+/26 的「本地网络」隐私对后台进程访问私网地址是<strong>静默拒绝</strong>。</p>
+  <p>解法:让 daemon 访问 <strong><code>127.0.0.1</code>(localhost 豁免本地网络权限)</strong>,由一个终端上下文的中继进程把流量转给手机:USB 在时用 <code>iproxy 8100 8100 -u &lt;UDID&gt;</code>(最稳,手机换 Wi-Fi 也不断);否则 <code>socat TCP-LISTEN:8100,fork,reuseaddr,bind=127.0.0.1 TCP:&lt;phone-ip&gt;:8100</code>。setup-wda.sh 自动选择。顺带的好处:daemon 配置永远是 <code>http://127.0.0.1:8100</code>,手机 IP 变了只动中继。</p>
+  <p>注:<code>iproxy</code> 走 usbmuxd,只在 USB(或 usbmuxd 级 Wi-Fi 配对)下可用 —— CoreDevice 的 Wi-Fi 隧道(devicectl 那套)usbmuxd 看不见,那种情况用 socat。</p>
+</div>
+
+<div class="pit">
+  <h3>⑧ 跨子网也能直连;手机频繁锁屏挡操作</h3>
   <p>WDA 监听手机的 <code>0.0.0.0:8100</code>,日志打印 <code>ServerURLHere-&gt;http://&lt;phone-ip&gt;:8100&lt;-ServerURLHere</code>。实测<strong>手机和 Mac 不在同一 /24 子网也能直连</strong>(只要可路由);否则用 <code>iproxy 8100 8100</code> 走 USB 转发。<br>另:很多操作(启动 app、输入)要求手机解锁,默认「自动锁定 30 秒」会反复打断 —— 把它设成<strong>永不</strong>。讽刺的是 <strong>agent 自己就能用 WDA 设</strong>:按标签点 <em>设置 → 显示与亮度 → 自动锁定 → 永不</em>(本项目已这么验证过)。但首次解锁仍需真人(Face ID/密码),WDA 不能解锁。</p>
 </div>
 

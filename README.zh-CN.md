@@ -123,6 +123,7 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | `PHONE_REMOTE_PASSWORD` | *(无)* | 共享密码（cookie 登录 + 智能体 bearer 兜底）。 |
 | `PHONE_REMOTE_AGENT_TOKEN` | *(无)* | 专用的智能体 bearer token。设置后，智能体 API **只**接受这个 token（密码不再能当 bearer）；不设置时密码兼作 bearer（兼容旧行为）。 |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → 临时中继凭证，用于跨网络。 |
+| `PHONE_REMOTE_WDA_URL` | *(无)* | L2 元素树控制：指向可达的 WebDriverAgent（推荐 `http://127.0.0.1:8100`，由 `scripts/setup-wda.sh` 的中继提供）。设置后 agent 的文字/点按自动路由到手机端元素层 —— 中文直通、按标签点按无需坐标、完全不碰 Mac 光标；不设 = 纯像素路径。 |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 静态 TURN 服务器（Cloudflare 的替代方案）。 |
 
 ## 智能体 API
@@ -214,7 +215,7 @@ npx skills add leeguooooo/iphone-use
   在 27 beta 上重新验证抓取 + 输入，并加上新的 **控制中心** 快捷操作。目标：一个构建跑通 macOS 15 / 26 / 27。
 - [x] **MCP 服务器** 封装智能体 API，让 MCP 客户端（Claude 等）把 `tap` / `type` / `scroll` / `screenshot` 当原生工具用。
 - [ ] **跨网络验证** Cloudflare 动态 TURN 链路（铸造 + 刷新代码已就绪；需要一次真实 key 的非局域网端到端跑通）。
-- [~] **基于 WebDriverAgent 的元素树控制（「L2」层）** —— *spike 已真机验证（iPhone 17 / iOS 27），daemon 集成待做。* 现在的输入是像素级的（视觉 → 坐标 → 在宿主 Mac 唯一共享光标上合成点击）：慢、易漂移、且会和正在用这台 Mac 的人抢光标。WDA 跑*在手机上*、驱动 iOS 自己的辅助功能树。真机已证实：读元素树（含中文标签）、按标签点击（不抢光标）、**中文一次到位**（而 L3 的 keycode 路径会被拼音 IME 打成乱码）。剩下：把 [`wda` 客户端](crates/server/src/wda.rs) 接进 agent 路由（L1 动词 → L2 元素 → L3 像素），加 `setup-wda.sh`。接入步骤 + 全部真机验证过的坑见 **[`docs/wda-setup.html`](docs/wda-setup.html)**。
+- [x] **基于 WebDriverAgent 的元素树控制（「L2」层）** —— 已交付并通过 *daemon 自身 API* 真机验证（iPhone 17 / iOS 27）。WDA 跑*在手机上*、驱动 iOS 辅助功能树，同一套 agent API 自动选最优路径：`{"type":"text"}` **中文直通**（像素路径的 keycode 会被拼音 IME 吃掉）、`{"type":"tap","label":"…"}` **按元素点按**（无坐标、不碰 Mac 光标）、`GET /agent/elements` 以文本返回 UI（比视觉便宜一个量级）、镜像断开时截图自动回退手机端抓取 —— **人拿着手机时 agent 依然能看能操作**。一键安装：`./scripts/setup-wda.sh`（需 Xcode）；全部真机验证过的坑见 **[`docs/wda-setup.html`](docs/wda-setup.html)**。
 - [x] **CI 发布二进制** + 一行 `curl … install.sh | sh` 安装。
 - [ ] 一个简短的 **演示**（GIF / 视频）：AI 智能体通过 API 操作手机。
 
