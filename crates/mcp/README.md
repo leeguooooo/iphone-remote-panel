@@ -83,11 +83,13 @@ Remote Mac (daemon on a different machine on the LAN):
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `phone_status` | — | Query daemon status; returns `{"ok":true,"phone_target":bool}` |
+| `phone_status` | — | Query daemon status; returns `{"ok":true,"phone_target":bool,"wda":bool}` |
 | `phone_screenshot` | — | Capture current screen → PNG image content |
+| `phone_elements` | — | **(wda)** The UI as a flattened element list — prefer over screenshots for reasoning |
 | `phone_tap` | `x`, `y` (0–1) | Single tap at normalized position |
+| `phone_tap_label` | `label` | **(wda)** Tap an element by its visible label — no coordinates, no drift |
 | `phone_scroll` | `x`, `y`, `dx`, `dy` | Scroll-wheel gesture; negative `dy` scrolls content up |
-| `phone_type` | `text` | Type US-ASCII text (CGEvent injection) |
+| `phone_type` | `text` | Type text; with `wda:true` any Unicode (incl. CJK) lands cleanly, else US-ASCII keycodes |
 | `phone_key` | `name` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
 | `phone_shortcut` | `name` | System shortcut: `home`, `spotlight`, `switcher` |
 

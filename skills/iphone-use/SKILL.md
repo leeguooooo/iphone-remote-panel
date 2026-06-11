@@ -35,8 +35,9 @@ a first-unlock-after-boot needs a human.
 
 | Call | Purpose |
 |---|---|
-| `GET /agent/status` | `{"ok":true,"phone_target":bool}` |
-| `GET /agent/screenshot` | Current phone screen as PNG |
+| `GET /agent/status` | `{"ok":true,"phone_target":bool,"wda":bool}` — `wda:true` unlocks the element layer below |
+| `GET /agent/elements` | **(wda) The UI as text**: `{"elements":[{kind,label,rect,depth},…]}` — prefer this over screenshots |
+| `GET /agent/screenshot` | Current phone screen as PNG (falls back to on-device capture when Mirroring is gone) |
 | `POST /agent/input` | One action (JSON body, below) |
 
 Actions — coordinates are **normalized [0,1]** over the phone screen
@@ -44,6 +45,7 @@ Actions — coordinates are **normalized [0,1]** over the phone screen
 
 ```bash
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","label":"新备忘录"}'  # (wda) tap BY ELEMENT — no coords
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":-60}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"text","text":"Health"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"key","name":"return"}'
@@ -56,19 +58,25 @@ same actions as native MCP tools (`phone_tap`, `phone_screenshot`, …).
 
 ## The loop: see → act → verify
 
-1. `screenshot` → look at it → decide ONE action
-2. `input` the action
-3. `screenshot` again → **verify the expected change happened** before the next step
+1. **See**: if `status` says `wda:true`, `GET /agent/elements` first — it's text
+   (10× cheaper than vision), carries exact labels, and works even while a human
+   is holding the phone. Fall back to `screenshot` when you need pixels (images,
+   maps, unlabeled UI).
+2. **Act**: ONE action. Prefer `{"type":"tap","label":"…"}` (no coordinate
+   drift) over coordinate taps when the element has a label.
+3. **Verify**: `elements` (or `screenshot`) again → confirm the expected change
+   before the next step.
 
 Hard-won facts (hardware-validated — trust these):
 
 - **Scroll**: `dy < 0` scrolls content up (reveals what's below). A swipe is a
   scroll, NOT a drag — drags are for sliders/reorder via `longpress`+`up`.
-- **Text is US keycodes.** If the phone keyboard is a Chinese/Pinyin IME,
-  digits get eaten as candidate-selectors (`a1b2c3` → `啊不c3`). For literal
-  text, first switch the phone to the English ABC keyboard (tap the 🌐 globe
-  key on the soft keyboard, screenshot to confirm a QWERTY layout). CJK input
-  needs the on-phone IME — don't fight it.
+- **Text routing depends on `wda`.** With `wda:true`, `{"type":"text"}` goes
+  through the on-phone element layer and **any Unicode (incl. CJK) lands
+  cleanly** — just make sure a text field has focus. Without WDA it falls back
+  to US keycodes: a Chinese/Pinyin IME then eats digits as candidate-selectors
+  (`a1b2c3` → `啊不c3`) — switch the phone to the English ABC keyboard for
+  literal ASCII, and don't attempt CJK at all.
 - **One action at a time.** The phone animates; give transitions ~1s before
   the verify screenshot. App launches / share sheets can take 2–4s.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`
@@ -119,3 +127,7 @@ only screenshots at steps 2, 5 and 6 as checkpoints.
 - A human can preempt you at any time (single shared cursor, last actor wins) —
   if the screen changes under you mid-task, screenshot and re-orient instead of
   continuing the old plan.
+- **Check before you type.** `text` lands in whatever field currently has focus —
+  if the human is mid-chat, your words go into THEIR message box. Read
+  `/agent/elements` (or a screenshot) first and confirm the foreground app is
+  the one you intend to drive.

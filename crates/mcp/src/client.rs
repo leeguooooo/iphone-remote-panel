@@ -97,6 +97,32 @@ impl DaemonClient {
         let bytes = resp.bytes().await?;
         Ok(bytes.to_vec())
     }
+
+    /// `GET /agent/elements` — the phone's UI as a flattened element list
+    /// (L2 / WebDriverAgent). Returns the JSON body verbatim:
+    /// `{"elements":[{kind,label,rect:[x,y,w,h],depth},…]}`.
+    pub async fn elements(&self) -> anyhow::Result<String> {
+        let req = self.auth(self.client.get(self.url("/agent/elements")));
+        let resp = req.send().await?;
+        check_status(&resp)?;
+        Ok(resp.text().await?)
+    }
+
+    /// `POST /agent/input` with a **label tap** — `{"type":"tap","label":…}`.
+    ///
+    /// Not part of [`InputMsg`]: the wire tag is the same `"tap"` as the
+    /// coordinate variant, which serde's internally-tagged enum can't express
+    /// as a second variant, so the JSON is built here directly.
+    pub async fn tap_label(&self, label: &str) -> anyhow::Result<()> {
+        let json = serde_json::json!({ "type": "tap", "label": label }).to_string();
+        let req = self
+            .auth(self.client.post(self.url("/agent/input")))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json);
+        let resp = req.send().await?;
+        check_status(&resp)?;
+        Ok(())
+    }
 }
 
 /// Turn a non-2xx status into an `anyhow::Error` that includes the status code

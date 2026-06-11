@@ -169,7 +169,8 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 
 [`iphone-use-mcp`](crates/mcp/README.md) is an MCP stdio server (`crates/mcp`) that
 bridges MCP clients — Claude Desktop, Claude Code — to the daemon's agent API. Seven
-tools: `phone_status`, `screenshot`, `tap`, `scroll`, `type`, `key`, `shortcut`. Two
+tools: `phone_status`, `screenshot`, `elements`, `tap`, `tap_label`, `scroll`, `type`
+(CJK-clean when WDA is live), `key`, `shortcut`. Two
 env vars: `PHONE_REMOTE_URL` (default `http://127.0.0.1:44321`) and `PHONE_REMOTE_TOKEN`
 (optional; maps to `PHONE_REMOTE_AGENT_TOKEN` on the daemon side).
 

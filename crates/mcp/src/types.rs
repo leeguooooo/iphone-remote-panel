@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 pub struct StatusResponse {
     pub ok: bool,
     pub phone_target: bool,
+    /// L2 element layer (WebDriverAgent) live right now. `None` when talking
+    /// to an older daemon that predates the field.
+    #[serde(default)]
+    pub wda: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -32,8 +36,10 @@ pub enum InputMsg {
     Tap { x: f64, y: f64 },
     /// Scroll-wheel gesture.  `dy < 0` scrolls content up (iOS "natural").
     Scroll { x: f64, y: f64, dx: f64, dy: f64 },
-    /// Send US-ASCII text (printable characters).  CJK must go through the
-    /// on-phone IME; the daemon maps this to a sequence of CGEvents.
+    /// Send text. With the L2 element layer live (`wda:true` in status) the
+    /// daemon routes this through WebDriverAgent and **any Unicode (incl. CJK)
+    /// lands cleanly**; otherwise it falls back to per-character keycodes,
+    /// which only handle printable US-ASCII reliably.
     Text { text: String },
     /// Named key press: `return | escape | space | tab | delete | up | down |
     /// left | right`.

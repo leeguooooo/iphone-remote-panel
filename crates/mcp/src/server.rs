@@ -59,6 +59,14 @@ pub struct TypeParams {
     pub text: String,
 }
 
+/// Parameters for [`phone_tap_label`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TapLabelParams {
+    /// The element's visible accessibility label, exactly as shown by
+    /// `phone_elements` (e.g. "新备忘录", "Connect").
+    pub label: String,
+}
+
 /// Parameters for [`phone_key`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct KeyParams {
@@ -153,11 +161,12 @@ impl PhoneHandler {
     // phone_type
     // -----------------------------------------------------------------------
 
-    #[tool(description = "Type US-ASCII text on the iPhone. The daemon injects one \
-        CGEvent per character via the macOS input pipeline. \
-        CAVEAT: Only printable US-ASCII characters are reliably supported. \
-        CJK and other non-ASCII characters must be entered via the on-phone \
-        software keyboard IME — this tool cannot type them directly.")]
+    #[tool(description = "Type text on the iPhone into the currently focused \
+        field. When phone_status reports wda:true the daemon routes this through \
+        the on-phone element layer and ANY Unicode — including Chinese/Japanese/\
+        Korean — lands cleanly. Without WDA it falls back to per-character \
+        keycodes: only printable US-ASCII is reliable there, and an active \
+        Pinyin IME will mangle the input.")]
     async fn phone_type(
         &self,
         Parameters(TypeParams { text }): Parameters<TypeParams>,
@@ -201,9 +210,10 @@ impl PhoneHandler {
     #[tool(description = "Query the iphone-use daemon status. \
         Returns a JSON object: \
         'ok' (bool) — daemon is reachable; \
-        'phone_target' (bool) — an iPhone Mirroring window is currently on-screen. \
-        Use this before other tools to confirm the daemon is running and the phone \
-        is mirrored.")]
+        'phone_target' (bool) — an iPhone Mirroring window is currently on-screen; \
+        'wda' (bool) — the L2 element layer (WebDriverAgent on the phone) is live, \
+        enabling phone_elements, phone_tap_label and clean CJK phone_type. \
+        Use this before other tools to learn which capabilities are available.")]
     async fn phone_status(&self) -> CallToolResult {
         match self.daemon.status().await {
             Ok(s) => {
@@ -214,6 +224,49 @@ impl PhoneHandler {
             Err(e) => {
                 CallToolResult::error(vec![Content::text(format!("status failed: {e:#}"))])
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // phone_elements (L2)
+    // -----------------------------------------------------------------------
+
+    #[tool(description = "Read the iPhone's current UI as a flattened element list \
+        (requires wda:true in phone_status). Returns JSON \
+        {elements:[{kind,label,rect:[x,y,w,h],depth},...]} — buttons, cells, text \
+        fields and labelled text in document order. PREFER this over \
+        phone_screenshot for reasoning: it is text (an order of magnitude cheaper), \
+        carries exact labels for phone_tap_label, and works even while a human is \
+        holding the phone (no Mirroring needed).")]
+    async fn phone_elements(&self) -> CallToolResult {
+        match self.daemon.elements().await {
+            Ok(json) => CallToolResult::success(vec![Content::text(json)]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "elements failed (is WDA set up? see docs/wda-setup.html): {e:#}"
+            ))]),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // phone_tap_label (L2)
+    // -----------------------------------------------------------------------
+
+    #[tool(description = "Tap an iPhone UI element by its visible label \
+        (requires wda:true in phone_status). Resolves the element on-device and \
+        taps it — no coordinates, no layout drift, works while a human holds the \
+        phone. Get labels from phone_elements. Falls back with an error if the \
+        label matches nothing (then use phone_tap with coordinates).")]
+    async fn phone_tap_label(
+        &self,
+        Parameters(TapLabelParams { label }): Parameters<TapLabelParams>,
+    ) -> CallToolResult {
+        match self.daemon.tap_label(&label).await {
+            Ok(()) => CallToolResult::success(vec![Content::text(format!(
+                "tapped element: {label}"
+            ))]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "tap_label '{label}' failed: {e:#}"
+            ))]),
         }
     }
 }

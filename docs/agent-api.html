@@ -90,17 +90,20 @@
   <tr><td><span class="method get">GET</span></td><td class="ep">/agent/status</td><td>Auth / health probe.</td></tr>
   <tr><td><span class="method post">POST</span></td><td class="ep">/agent/input</td><td>Inject one control message.</td></tr>
   <tr><td><span class="method get">GET</span></td><td class="ep">/agent/screenshot</td><td>Current phone screen as PNG.</td></tr>
+  <tr><td><span class="method get">GET</span></td><td class="ep">/agent/elements</td><td>The UI as a flattened element list (L2 / WDA).</td></tr>
+  <tr><td><span class="method get">GET</span> / <span class="method post">POST</span></td><td class="ep">/agent/inbox</td><td>Structured results POSTed back by the phone (Shortcuts bridge); GET drains, <code>?peek=1</code> keeps.</td></tr>
 </table>
 
 <h3><span class="method get">GET</span> <span class="ep">/agent/status</span></h3>
 <p>Returns <code>200</code> with JSON when the bearer is valid.</p>
-<pre><code>{ "ok": true, "phone_target": true }</code></pre>
+<pre><code>{ "ok": true, "phone_target": true, "wda": true }</code></pre>
 <p class="muted">
   <code>phone_target</code> is <code>true</code> when the iPhone Mirroring window is currently
-  visible on-screen (a cheap ScreenCaptureKit probe at request time). All event types —
-  <code>tap</code>, <code>scroll</code>, <code>text</code>, <code>key</code>,
-  <code>shortcut</code> — use fully native <code>CGEvent</code> injection; no external
-  binary is required.
+  visible on-screen (a cheap ScreenCaptureKit probe at request time).
+  <code>wda</code> is <code>true</code> when the optional L2 element layer (a WebDriverAgent
+  on the phone, <code>PHONE_REMOTE_WDA_URL</code>) is live — it unlocks
+  <code>/agent/elements</code>, label-taps, and clean CJK text. Without it, all event types
+  use fully native <code>CGEvent</code> injection against the Mirroring window.
 </p>
 
 <h3><span class="method post">POST</span> <span class="ep">/agent/input</span></h3>
@@ -112,9 +115,10 @@
 
 <table>
   <tr><th>Message</th><th>Effect</th></tr>
-  <tr><td><code>{"type":"tap","x":0.5,"y":0.5}</code></td><td>Tap at centre.</td></tr>
+  <tr><td><code>{"type":"tap","x":0.5,"y":0.5}</code></td><td>Tap at centre (on-device via WDA when live, else Mirroring cursor).</td></tr>
+  <tr><td><code>{"type":"tap","label":"新备忘录"}</code></td><td><strong>(wda)</strong> Tap an element by its visible label — no coordinates, no drift. <code>502</code> if no match.</td></tr>
   <tr><td><code>{"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":-40}</code></td><td>Scroll up (negative <code>dy</code>) at the anchor. <code>dx/dy</code> are pixel deltas.</td></tr>
-  <tr><td><code>{"type":"text","text":"hello"}</code></td><td>Type literal text (US keycodes; the field must be focused first). See the CJK-IME caveat below.</td></tr>
+  <tr><td><code>{"type":"text","text":"hello"}</code></td><td>Type into the focused field. With <code>wda:true</code> any Unicode (incl. CJK) lands cleanly; otherwise US keycodes — see the CJK-IME caveat below.</td></tr>
   <tr><td><code>{"type":"key","name":"return"}</code></td><td>One named key (<code>return</code>, <code>escape</code>, <code>space</code>…).</td></tr>
   <tr><td><code>{"type":"shortcut","name":"home"}</code></td><td>System shortcut: <code>home</code> | <code>spotlight</code> | <code>switcher</code>.</td></tr>
   <tr><td><code>{"type":"longpress","x":0.4,"y":0.6}</code></td><td>Press &amp; hold (release with a matching <code>up</code>).</td></tr>
@@ -134,13 +138,39 @@
   window is not currently found.
 </p>
 
+<h3><span class="method get">GET</span> <span class="ep">/agent/elements</span></h3>
+<p>
+  <strong>(Requires <code>wda:true</code>.)</strong> The phone's current UI flattened to
+  agent-friendly rows, in document order:
+</p>
+<pre><code>{ "elements": [
+  { "kind": "Button", "label": "新备忘录", "rect": [369, 885, 38, 38], "depth": 7 },
+  ...
+] }</code></pre>
+<p class="muted">
+  Prefer this over <code>/agent/screenshot</code> for reasoning: it is text (an order of
+  magnitude cheaper than vision), the labels feed straight into
+  <code>{"type":"tap","label":…}</code>, and it works even while a human is holding the
+  phone (no Mirroring window needed). <code>503</code> when WDA is not configured,
+  <code>502</code> when configured but unreachable.
+</p>
+
+<h3><span class="method get">GET</span>/<span class="method post">POST</span> <span class="ep">/agent/inbox</span></h3>
+<p>
+  The return path of the <a href="../shortcuts/README.md">Shortcuts RPC bridge</a>: the phone
+  (an iOS Shortcut's "Get Contents of URL" action) <code>POST</code>s arbitrary JSON here;
+  an agent <code>GET</code>s it. GET drains the queue; <code>GET /agent/inbox?peek=1</code>
+  reads without draining. Bounded ring buffer (64), oldest dropped.
+</p>
+
 <h2>Example — a see-decide-act loop</h2>
 <pre><code>HOST=http://192.168.0.190:44321
 PW=&lt;password&gt;
 AUTH="Authorization: Bearer $PW"
 
 # 1. confirm reachable
-curl -s -H "$AUTH" "$HOST/agent/status"            # {"ok":true,"phone_target":true}
+curl -s -H "$AUTH" "$HOST/agent/status"            # {"ok":true,"phone_target":true,"wda":true}
+curl -s -H "$AUTH" "$HOST/agent/elements"          # the UI as text — prefer over vision when wda:true
 
 # 2. see
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png

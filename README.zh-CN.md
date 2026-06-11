@@ -150,8 +150,9 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3
 ## MCP 服务器
 
 [`iphone-use-mcp`](crates/mcp/README.md) 是一个 MCP stdio 服务器（`crates/mcp`），
-把 MCP 客户端（Claude Desktop、Claude Code）桥接到守护进程的智能体 API。七个工具：
-`phone_status`、`screenshot`、`tap`、`scroll`、`type`、`key`、`shortcut`。两个环境变量：
+把 MCP 客户端（Claude Desktop、Claude Code）桥接到守护进程的智能体 API。九个工具：
+`phone_status`、`screenshot`、`elements`（UI 元素树）、`tap`、`tap_label`（按标签点按）、
+`scroll`、`type`（WDA 在线时中文直通）、`key`、`shortcut`。两个环境变量：
 `PHONE_REMOTE_URL`（默认 `http://127.0.0.1:44321`）和 `PHONE_REMOTE_TOKEN`（可选；对应守护进程侧的 `PHONE_REMOTE_AGENT_TOKEN`）。
 
 加到你的 `claude_desktop_config.json`（或 Claude Code 的 MCP 配置）：
