@@ -341,6 +341,23 @@ impl WdaClient {
     pub fn invalidate_session(&mut self) {
         self.session = None;
     }
+
+    /// `POST /session/:id/wda/lock` — lock the phone's screen. Used by the
+    /// agent→mirror mode switch: iPhone Mirroring can only connect to a
+    /// LOCKED phone, so locking right before the runner is stopped makes the
+    /// reconnect deterministic (hardware-verified).
+    pub async fn lock(&mut self) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/wda/lock", self.base, sid))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("POST wda/lock")?
+            .error_for_status()
+            .context("wda/lock status")?;
+        Ok(())
+    }
 }
 
 /// One row of the flattened element tree.

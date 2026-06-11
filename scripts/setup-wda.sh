@@ -22,6 +22,11 @@
 set -eu
 
 WDA_DIR="${WDA_DIR:-$HOME/.iphone-use/WebDriverAgent}"
+# When spawned by the daemon (POST /agent/mode) the environment is a bare
+# LaunchAgent PATH — Homebrew tools (socat, iproxy) and even xcrun helpers
+# live outside it. Extend deterministically rather than relying on the shell.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 WDA_PORT="${WDA_PORT:-8100}"
 WDA_BUNDLE_ID="${WDA_BUNDLE_ID:-com.leeguoo.iphone-use.wda}"
 STATE_DIR="$HOME/.iphone-use"
@@ -37,6 +42,14 @@ warn() { printf '%s\n' "${YLW}⚠${RST}  $*"; }
 die()  { printf '%s\n' "${RED}✗ $*${RST}" >&2; exit 1; }
 
 mkdir -p "$STATE_DIR"
+
+# Self-install: keep a copy at a fixed path so the daemon's `POST /agent/mode`
+# can start/stop WDA without knowing where the repo lives. Skip when we ARE
+# that copy (cp onto itself fails) or when the source isn't readable.
+SELF_INSTALL="$STATE_DIR/setup-wda.sh"
+if [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" != "$SELF_INSTALL" ]; then
+    cp -f "$0" "$SELF_INSTALL" 2>/dev/null && chmod +x "$SELF_INSTALL" 2>/dev/null || true
+fi
 
 _kill_pidfile() {
     local f="$1"
@@ -193,13 +206,24 @@ ok "WDA reachable at http://127.0.0.1:$WDA_PORT"
 PLIST="$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.plist"
 if [ -f "$PLIST" ]; then
     info "Configuring the iphone-use daemon"
-    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:PHONE_REMOTE_WDA_URL" "$PLIST" 2>/dev/null || true
-    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PHONE_REMOTE_WDA_URL string http://127.0.0.1:$WDA_PORT" "$PLIST"
-    UID_NUM="$(id -u)"
-    launchctl bootout "gui/$UID_NUM/com.leeguoo.iphone-use" 2>/dev/null || true
-    launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || true
-    sleep 2
-    ok "daemon restarted with PHONE_REMOTE_WDA_URL=http://127.0.0.1:$WDA_PORT"
+    TARGET_URL="http://127.0.0.1:$WDA_PORT"
+    CURRENT_URL="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PHONE_REMOTE_WDA_URL" "$PLIST" 2>/dev/null || true)"
+    if [ "$CURRENT_URL" = "$TARGET_URL" ]; then
+        # Idempotent skip — CRITICAL when the daemon itself spawned this script
+        # (POST /agent/mode {"mode":"agent"}): `launchctl bootout` kills the
+        # daemon's entire cgroup, which includes THIS script and the runner +
+        # relay it just started (hardware-verified failure). No value change →
+        # no restart needed.
+        ok "daemon already configured (PHONE_REMOTE_WDA_URL=$TARGET_URL) — no restart needed"
+    else
+        /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:PHONE_REMOTE_WDA_URL" "$PLIST" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PHONE_REMOTE_WDA_URL string $TARGET_URL" "$PLIST"
+        UID_NUM="$(id -u)"
+        launchctl bootout "gui/$UID_NUM/com.leeguoo.iphone-use" 2>/dev/null || true
+        launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || true
+        sleep 2
+        ok "daemon restarted with PHONE_REMOTE_WDA_URL=$TARGET_URL"
+    fi
 else
     warn "daemon LaunchAgent not found — run the daemon with:"
     printf '    PHONE_REMOTE_WDA_URL=http://127.0.0.1:%s ... iphone-use serve\n' "$WDA_PORT"

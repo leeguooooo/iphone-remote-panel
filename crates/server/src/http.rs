@@ -204,6 +204,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Agent operation entry (connect-in; reuses the validated injector +
         // control lease). Bearer-token auth; see `agent_input` / `agent_status`.
         .route("/agent/status", get(agent_status))
+        .route("/agent/mode", post(agent_mode))
         .route("/agent/input", post(agent_input))
         .route("/agent/screenshot", get(agent_screenshot))
         .route("/agent/elements", get(agent_elements))
@@ -530,12 +531,177 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         Some(w) => w.lock().await.is_up().await,
         None => false,
     };
-    let body = format!(r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda}}}"#);
+    // Derived mode (see `agent_mode`): WDA up wins — while the on-phone
+    // XCUITest runner is alive, Mirroring CANNOT connect (hardware-verified
+    // mutual exclusion), so phone_target at best shows the Interrupted screen.
+    let mode = if wda {
+        "agent"
+    } else if phone_target {
+        "mirror"
+    } else {
+        "offline"
+    };
+    let body = format!(
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"mode":"{mode}"}}"#
+    );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     with_security_headers(resp)
+}
+
+/// `POST /agent/mode` — switch between the two (mutually exclusive) control
+/// modes. Body: `{"mode":"mirror"}` or `{"mode":"agent"}`.
+///
+/// The on-phone XCUITest runner (WDA, the L2 layer) monopolizes the device's
+/// remote session: while it runs, iPhone Mirroring shows "Connection
+/// Interrupted" and can never reconnect — even with the phone locked
+/// (hardware A/B-verified, see docs/wda-setup.html pitfall ⑨). So L2 and
+/// L3-video are switch MODES, not stacked layers, and this endpoint
+/// orchestrates the switch:
+///
+/// * `mirror` — stop the WDA runner + relay (via `~/.iphone-use/setup-wda.sh
+///   stop`, falling back to pkill), bring Mirroring frontmost, and tap its
+///   "Try Again" button through the L3 injector. Returns once dispatched;
+///   callers poll `/agent/status` for `"mode":"mirror"` and verify pixels.
+/// * `agent` — spawn `~/.iphone-use/setup-wda.sh` detached (the script
+///   self-installs there). WDA takes ~30-90s; poll `/agent/status` for
+///   `"wda":true`. Mirroring will drop — expected.
+async fn agent_mode(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => return with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        ),
+        AgentAuth::Denied => return with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        ),
+        AgentAuth::Ok => {}
+    }
+    let mode = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+    match mode.as_str() {
+        "mirror" => {
+            // 0) Lock the phone via WDA while it's still alive — Mirroring
+            //    can only connect to a LOCKED phone, so this makes the
+            //    reconnect deterministic instead of depending on whatever
+            //    state the agent left the phone in. Best-effort.
+            if let Some(wda) = &state.wda {
+                if let Err(e) = wda.lock().await.lock().await {
+                    tracing::warn!("wda lock before mirror switch failed (continuing): {e:#}");
+                }
+            }
+            // 1) Stop the runner + relay. Prefer the script (single source of
+            //    truth for pidfiles); fall back to pkill patterns.
+            let script = setup_sh.clone();
+            let stopped = tokio::task::spawn_blocking(move || {
+                let via_script = std::path::Path::new(&script).exists()
+                    && std::process::Command::new("bash")
+                        .arg(&script)
+                        .arg("stop")
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                if !via_script {
+                    for pat in ["xcodebuild.*WebDriverAgentRunner", "socat.*8100", "iproxy 8100"] {
+                        let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
+                    }
+                }
+                via_script
+            })
+            .await
+            .unwrap_or(false);
+            // 2) Drop any cached WDA session — it's dead now.
+            if let Some(wda) = &state.wda {
+                wda.lock().await.invalidate_session();
+            }
+            // 3) Give the phone a moment to release the session, then bring
+            //    Mirroring frontmost and tap "Try Again" (the button sits at
+            //    ~(0.5, 0.65) of the Interrupted screen — hardware-verified;
+            //    a stray tap there is harmless if already connected).
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "iPhone Mirroring"])
+                    .status();
+                tokio::task::spawn_blocking(|| {
+                    crate::macos::ensure_mirroring_frontmost(std::time::Duration::from_secs(4))
+                })
+                .await
+                .ok();
+            }
+            if let Some(ev) =
+                crate::input_bridge::decode_control(r#"{"type":"tap","x":0.5,"y":0.65}"#)
+            {
+                {
+                    let mut control = recover(state.control.lock());
+                    let lease = control
+                        .acquire(core::control::Holder::Agent("mode-switch".into()), now_secs());
+                    *recover(state.current_lease.lock()) = Some(lease);
+                }
+                state.injector.send(ev);
+            }
+            let body = format!(
+                r#"{{"ok":true,"mode":"mirror","switching":true,"stopped_via_script":{stopped}}}"#
+            );
+            with_security_headers(
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            )
+        }
+        "agent" => {
+            if !std::path::Path::new(&setup_sh).exists() {
+                return with_security_headers(
+                    (
+                        StatusCode::CONFLICT,
+                        "setup-wda.sh not installed — run scripts/setup-wda.sh once manually \
+                         (it self-installs to ~/.iphone-use/) before using mode=agent",
+                    )
+                        .into_response(),
+                );
+            }
+            // Detached: the runner takes ~30-90s (xcodebuild). Log to a file
+            // the operator can tail.
+            let log = format!("{home}/.iphone-use/wda-mode-switch.log");
+            let spawned = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("nohup bash '{setup_sh}' > '{log}' 2>&1 &"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            // The one thing automation cannot do: xcodebuild refuses to
+            // launch the runner on a LOCKED phone, and Face ID can't be
+            // faked. The spawned script waits patiently, so a single human
+            // unlock completes the switch.
+            let body = format!(
+                r#"{{"ok":{spawned},"mode":"agent","starting":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — the launcher waits for it"}}"#
+            );
+            with_security_headers(
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            )
+        }
+        _ => with_security_headers(
+            (
+                StatusCode::BAD_REQUEST,
+                r#"body must be {"mode":"mirror"} or {"mode":"agent"}"#,
+            )
+                .into_response(),
+        ),
+    }
 }
 
 /// `POST /agent/input` — inject one control message (same JSON shape as the

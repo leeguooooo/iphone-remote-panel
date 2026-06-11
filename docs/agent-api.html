@@ -92,11 +92,12 @@
   <tr><td><span class="method get">GET</span></td><td class="ep">/agent/screenshot</td><td>Current phone screen as PNG.</td></tr>
   <tr><td><span class="method get">GET</span></td><td class="ep">/agent/elements</td><td>The UI as a flattened element list (L2 / WDA).</td></tr>
   <tr><td><span class="method get">GET</span> / <span class="method post">POST</span></td><td class="ep">/agent/inbox</td><td>Structured results POSTed back by the phone (Shortcuts bridge); GET drains, <code>?peek=1</code> keeps.</td></tr>
+  <tr><td><span class="method post">POST</span></td><td class="ep">/agent/mode</td><td>Switch between <code>mirror</code> (live video) and <code>agent</code> (WDA element layer) — they are mutually exclusive.</td></tr>
 </table>
 
 <h3><span class="method get">GET</span> <span class="ep">/agent/status</span></h3>
 <p>Returns <code>200</code> with JSON when the bearer is valid.</p>
-<pre><code>{ "ok": true, "phone_target": true, "wda": true }</code></pre>
+<pre><code>{ "ok": true, "phone_target": true, "wda": true, "mode": "agent" }</code></pre>
 <p class="muted">
   <code>phone_target</code> is <code>true</code> when the iPhone Mirroring window is currently
   visible on-screen (a cheap ScreenCaptureKit probe at request time).
@@ -104,6 +105,33 @@
   on the phone, <code>PHONE_REMOTE_WDA_URL</code>) is live — it unlocks
   <code>/agent/elements</code>, label-taps, and clean CJK text. Without it, all event types
   use fully native <code>CGEvent</code> injection against the Mirroring window.
+  <code>mode</code> is derived: <code>"agent"</code> when WDA is up (live Mirroring video is
+  then impossible — see <code>/agent/mode</code>), <code>"mirror"</code> when the Mirroring
+  window is up without WDA, else <code>"offline"</code>.
+</p>
+
+<h3><span class="method post">POST</span> <span class="ep">/agent/mode</span></h3>
+<p>The on-phone XCUITest runner (WDA) and iPhone Mirroring are <strong>mutually
+exclusive</strong> — while the runner is alive, Mirroring shows “Connection Interrupted”
+and cannot reconnect, even with the phone locked (hardware-verified; see the
+WDA guide, pitfall ⑨). This endpoint orchestrates the switch:</p>
+<pre><code>curl -s -H "$AUTH" -X POST "$HOST/agent/mode" -d '{"mode":"agent"}'
+# → {"ok":true,"mode":"agent","starting":true,"log":"~/.iphone-use/wda-mode-switch.log",
+#    "hint":"if the phone is locked, unlock it once now — the launcher waits for it"}
+# poll /agent/status until "wda":true (≈10 s when the runner app is already installed)
+
+curl -s -H "$AUTH" -X POST "$HOST/agent/mode" -d '{"mode":"mirror"}'
+# → {"ok":true,"mode":"mirror","switching":true,...}
+# locks the phone via WDA (Mirroring connects only to a locked phone), stops the
+# runner + relay, brings Mirroring frontmost and taps its Try Again button.
+# Fully automatic; live video is back in ≈10 s — verify via /agent/screenshot.</code></pre>
+<p class="muted">
+  The one asymmetry: <code>mode=agent</code> needs the phone <em>unlocked</em> at launch
+  (Apple blocks launching the runner on a locked device, and Face&nbsp;ID can’t be
+  automated) — if it’s locked, one human unlock completes the switch; the launcher
+  waits. <code>mode=mirror</code> is fully automatic. Requires
+  <code>scripts/setup-wda.sh</code> to have run once (it self-installs to
+  <code>~/.iphone-use/</code>).
 </p>
 
 <h3><span class="method post">POST</span> <span class="ep">/agent/input</span></h3>

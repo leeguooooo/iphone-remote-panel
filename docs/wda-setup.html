@@ -155,7 +155,8 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
     <li><strong>Agent 模式</strong>(给 agent 用):元素树、中文直通、手机端原生截图;此时网页端自动切到
     <strong>静帧兜底</strong>(每 2.5s 一帧 WDA 抓屏,人仍能看到手机在干嘛),镜像窗口显示 Interrupted 属正常现象。</li>
   </ul>
-  <p>切换命令:<code>scripts/setup-wda.sh</code>(启 = 进 Agent 模式)/ <code>scripts/setup-wda.sh stop</code>(停 = 回镜像模式,记得点 Try Again)。
+  <p>切换方式(推荐用 API,一条龙全自动):<code>POST /agent/mode {"mode":"mirror"}</code>(WDA 锁屏 → 停 runner → 激活镜像 → 自动点 Try Again,约 10 秒)/
+  <code>{"mode":"agent"}</code>(后台拉起 runner;若手机锁着需人解锁一次,launcher 会等)。命令行等价:<code>scripts/setup-wda.sh</code> / <code>scripts/setup-wda.sh stop</code>。
   排障速记:<strong>镜像怎么也连不上时,第一反应查 WDA 是否在跑</strong>(<code>curl http://127.0.0.1:8100/status</code>)。</p>
 </div>
 

@@ -81,9 +81,11 @@ Hard-won facts (hardware-validated — trust these):
   the on-phone XCUITest runner monopolizes the device's remote session, so
   while `wda:true` the Mirroring window shows "Connection Interrupted" and the
   human's live video is replaced by ~2.5s stills — that's expected, not broken.
-  Don't try to "fix" the mirror while WDA runs. If a task truly needs live
-  Mirroring (L3 video), the operator must run `scripts/setup-wda.sh stop` and
-  click Try Again; restarting WDA later kills the mirror again.
+  Don't try to "fix" the mirror while WDA runs. Switch modes via the API:
+  `POST /agent/mode {"mode":"mirror"}` (fully automatic: locks the phone,
+  stops WDA, reconnects the mirror, ~10s) or `{"mode":"agent"}` (starts WDA;
+  needs the phone unlocked once if it's locked). `GET /agent/status` reports
+  the current `mode`.
 - **One action at a time.** The phone animates; give transitions ~1s before
   the verify screenshot. App launches / share sheets can take 2–4s.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`
