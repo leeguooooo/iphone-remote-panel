@@ -72,9 +72,24 @@ mod imp {
     /// is localized differently this is a no-op and input may not register until
     /// the user focuses the window manually. Logged at debug level on failure.
     pub fn bring_mirroring_frontmost() {
-        // `open -a` activates the app by name; on a zh-CN system the app is named
-        // "iPhone 镜像" — try both.
-        for name in ["iPhone Mirroring", "iPhone 镜像"] {
+        // macOS 14+ "cooperative activation" silently DENIES focus-stealing by
+        // background processes — `open -a` returns success but the window never
+        // comes frontmost while the user is active in another app (observed on
+        // macOS 26: open -a no-ops, agent input drops). AppleScript `activate`
+        // works: the Apple Event asks the TARGET app to activate itself, which
+        // the system permits. First use pops an Automation consent once
+        // ("iPhoneUse" wants to control "iPhone Mirroring") — grant it once.
+        for name in MIRRORING_NAMES {
+            let status = std::process::Command::new("/usr/bin/osascript")
+                .args(["-e", &format!(r#"tell application "{name}" to activate"#)])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                return;
+            }
+        }
+        // Fallback (helps when Automation consent was denied): open -a still
+        // works when the user isn't actively focused elsewhere.
+        for name in MIRRORING_NAMES {
             let status = std::process::Command::new("/usr/bin/open")
                 .args(["-a", name])
                 .status();
@@ -82,11 +97,37 @@ mod imp {
                 return;
             }
         }
-        tracing::debug!("could not bring iPhone Mirroring frontmost via `open -a`");
+        tracing::debug!("could not bring iPhone Mirroring frontmost via osascript or `open -a`");
     }
 
     /// The known localized names of the iPhone Mirroring app (en + zh-CN).
     const MIRRORING_NAMES: [&str; 2] = ["iPhone Mirroring", "iPhone 镜像"];
+
+    /// Ensure the Mirroring app is frontmost, **synchronously**.
+    ///
+    /// `open -a` activation is asynchronous — it returns before the window
+    /// actually receives focus. Injecting a CGEvent immediately after loses
+    /// that race: the click lands on whatever app is *still* frontmost (the
+    /// user's editor / browser), so agent taps silently no-op on a busy Mac.
+    /// Hit in practice the moment the daemon ran on a machine the user was
+    /// actively working on.
+    ///
+    /// Activates, then polls [`mirroring_is_frontmost`] until it sticks or
+    /// `deadline` passes. Returns whether Mirroring is frontmost at the end.
+    pub fn ensure_mirroring_frontmost(deadline: std::time::Duration) -> bool {
+        if mirroring_is_frontmost() {
+            return true;
+        }
+        bring_mirroring_frontmost();
+        let end = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < end {
+            if mirroring_is_frontmost() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        mirroring_is_frontmost()
+    }
 
     /// Returns true if the iPhone Mirroring app is currently the frontmost app.
     ///
@@ -114,8 +155,8 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    bring_mirroring_frontmost, mirroring_is_frontmost, ns_application_load,
-    request_screen_capture, tcc_status, TccStatus,
+    bring_mirroring_frontmost, ensure_mirroring_frontmost, mirroring_is_frontmost,
+    ns_application_load, request_screen_capture, tcc_status, TccStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,5 +194,10 @@ pub fn bring_mirroring_frontmost() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn mirroring_is_frontmost() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_mirroring_frontmost(_deadline: std::time::Duration) -> bool {
     false
 }

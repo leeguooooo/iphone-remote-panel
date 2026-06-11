@@ -16,3 +16,7 @@ __pycache__/
 *.pid
 env.txt
 url.txt
+
+# build/dev artifacts
+/iPhoneUse.app/
+assets/icon-1024-old.png

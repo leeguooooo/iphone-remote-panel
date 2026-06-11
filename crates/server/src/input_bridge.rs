@@ -167,23 +167,31 @@ fn injector_loop<F>(
 {
     use core::input::{inject, CgEventSink};
     let mut sink = CgEventSink::new();
-    // HID-tap / scroll-wheel events land only on the *frontmost* app. Re-assert
-    // frontmost when (and only when) focus was stolen — the check is a cheap
-    // in-process query, while the `open -a` re-activation is throttled so a brief
-    // not-yet-frontmost window after activation doesn't spawn a burst of them.
-    let mut last_front: Option<std::time::Instant> = None;
-    const FRONT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(400);
+    // HID-tap / scroll-wheel events land only on the *frontmost* app, and
+    // activation (`open -a` / osascript) is asynchronous. Injecting right after
+    // activating loses the race — the event clicks whatever is still frontmost
+    // (the user's editor), a silent no-op. So block until Mirroring actually IS
+    // frontmost before each event; if it never lands (app gone / activation
+    // denied / the user actively typing elsewhere keeps stealing focus back),
+    // drop the event loudly instead of silently.
+    //
+    // The osascript activation path takes >2s on first use, so the default
+    // deadline is generous; tune via PHONE_REMOTE_FRONT_DEADLINE_MS without a
+    // rebuild (rebuilds invalidate ad-hoc TCC grants — expensive during dev).
+    let front_deadline = std::env::var("PHONE_REMOTE_FRONT_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_millis(4000));
     while let Ok(ev) = rx.recv() {
         if !is_allowed() {
             continue;
         }
-        if !crate::macos::mirroring_is_frontmost() {
-            let now = std::time::Instant::now();
-            let throttled = last_front.is_some_and(|t| now.duration_since(t) < FRONT_THROTTLE);
-            if !throttled {
-                crate::macos::bring_mirroring_frontmost();
-                last_front = Some(now);
-            }
+        if !crate::macos::ensure_mirroring_frontmost(front_deadline) {
+            tracing::warn!(
+                "input dropped {ev:?}: iPhone Mirroring could not be brought frontmost"
+            );
+            continue;
         }
         if let Err(e) = inject(&ev, &geo, &mut sink) {
             tracing::debug!("inject dropped {ev:?}: {e}");
