@@ -82,6 +82,7 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   <p>Xcode 自带的 Developer Disk Image(DDI)必须 <strong>≥ 设备 iOS 版本</strong>才能挂载。装了 iOS beta 的手机配旧 Xcode,开发服务永远起不来 —— <code>devicectl</code> 显示 <code>ddiServicesAvailable: false</code>,xcodebuild 报 <code>"Developer Disk Image is not mounted… Ensure that the device is unlocked"</code>。<strong>注意这句和「锁屏」报错文案一模一样,极易误判成锁屏问题。</strong></p>
   <p>排查:<code>plutil -p /Library/Developer/DeveloperDiskImages/iOS_DDI/version.plist</code> 看 <code>ProductBuildVersion</code>(如 <code>17A400</code>=iOS 26.0),对比手机 <em>设置→通用→关于本机</em> 的版本。</p>
   <p>修复:升级 Xcode 到能覆盖该 iOS 的版本(iOS beta 用户要装对应 Xcode beta);或别在 beta 系统的设备上跑 WDA。<strong>结论:WDA 路线要求「设备 iOS ≤ Xcode 支持的最高 iOS」。</strong></p>
+  <p><strong>易错点:点版本不跨大版本。</strong> 设备是 iOS 27.0(大版本)时,Xcode 26.5(DDI build 17F42 = iOS 26.5)再新也不行 —— 必须装 <strong>Xcode 27.x beta</strong>(release notes 写 "iOS 27 SDK")。Apple 年份命名下 26→27 是跨大版本。iOS 17+ 的 DDI 是设备个性化的 cryptex,由对应 Xcode 现场拉取,<strong>手动塞 DDI 的老办法对 iOS 17+ 不再适用</strong>,所以只能装对的 Xcode。</p>
 </div>
 
 <div class="pit">
