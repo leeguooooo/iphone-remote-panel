@@ -39,6 +39,11 @@ act now" signal (WDA is up, or the mirror is showing live content).
   - `mirror_state:"in_use"` → a human is on the phone; **lock the phone** to reconnect
     (the on-screen Connect button does NOT reconnect while it's in use). Don't fight them.
   - `mirror_state:"offline"` → no Mirroring window; open iPhone Mirroring on the Mac.
+- `human_active:true` → **a human is using the Mac right now** (Mirroring isn't frontmost).
+  In mirror mode an L3 tap first yanks Mirroring frontmost, stealing the person's focus —
+  so **back off**: pause and re-poll until `human_active:false`, or switch to agent mode
+  (`POST /agent/mode {"mode":"agent"}`) where input is on-device and never touches the Mac
+  cursor. (Always `false` in agent/WDA mode — no contention there.)
 - `viewer_count` = connected `/ws` viewers (one streams; others queue, issue #8).
 
 ## The API (3 endpoints)

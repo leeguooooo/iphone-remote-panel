@@ -116,6 +116,11 @@
   <code>"offline"</code> → no Mirroring window.
   <code>viewer_count</code> is the number of connected <code>/ws</code> viewers (one streams,
   the rest queue).
+  <code>human_active</code> (issue #16) is <code>true</code> when a human is using the Mac
+  right now — in mirror mode the agent and the human share one cursor, so an L3 tap first
+  yanks Mirroring frontmost and steals their focus. When it's <code>true</code>, back off
+  (pause + re-poll) or switch to agent/WDA mode (on-device, no contention). Always
+  <code>false</code> in agent mode.
 </aside>
 <p class="muted">
   <code>phone_target</code> is <code>true</code> when the iPhone Mirroring window is currently

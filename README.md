@@ -183,6 +183,8 @@ Gate actions on **`drivable`**, not `phone_target`: the Mirroring window can be 
 yet showing the "Connection Paused" / "iPhone in Use" interstitial, where taps land
 in the void. `mirror_state` (`active`/`paused`/`in_use`/`offline`) + `hint` say what
 to do (paused → tap Resume; in_use → lock the phone; offline → open Mirroring).
+`human_active:true` warns a person is using the Mac — in mirror mode an L3 tap steals
+their focus, so back off or switch to agent mode (`/agent/mode`, on-device).
 
 Full reference: **[`docs/agent-api.html`](docs/agent-api.html)**.
 

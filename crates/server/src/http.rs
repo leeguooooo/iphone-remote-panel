@@ -594,6 +594,16 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     } else {
         ("offline", false)
     };
+    // Human-presence signal (issue #16): in mirror mode the agent and the human
+    // share ONE Mac cursor — an L3 tap first yanks iPhone Mirroring frontmost,
+    // stealing focus from whatever the human is doing. If Mirroring isn't
+    // frontmost right now, a human/another app holds the Mac, so the next tap
+    // WILL interrupt them. (Agent/WDA mode injects on-device → no contention,
+    // so this is always false there.) Passive NSWorkspace read — no focus steal.
+    #[cfg(target_os = "macos")]
+    let human_active = !wda && drivable && !crate::macos::mirroring_is_frontmost();
+    #[cfg(not(target_os = "macos"))]
+    let human_active = false;
     // Version + update hint. `latest_release` is fetched by a background
     // task (24h cadence); compare as plain tags — any mismatch with the
     // running version means a release the binary doesn't match.
@@ -618,6 +628,9 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
             "offline" => "no iPhone Mirroring window — open iPhone Mirroring on the Mac, or start WebDriverAgent for on-device control",
             _ => "",
         }
+    } else if human_active {
+        // Issue #16: a human is on the Mac — yield instead of stealing focus.
+        "a human is using the Mac (iPhone Mirroring is not frontmost) — an L3 tap will steal their focus; pause until they are idle, or switch to agent mode (on-device, no focus steal) via POST /agent/mode mode=agent"
     } else if !wda {
         // Mirror is live but there's no on-device element layer. Taps and scroll
         // land; text/key injection through the mirror is unreliable (Mirroring
@@ -628,7 +641,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         ""
     };
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
