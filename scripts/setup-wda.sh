@@ -51,6 +51,21 @@ if [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" != "$SELF_INS
     cp -f "$0" "$SELF_INSTALL" 2>/dev/null && chmod +x "$SELF_INSTALL" 2>/dev/null || true
 fi
 
+# devicectl can HANG FOREVER on a device whose tunnel is stuck "connecting"
+# (hardware-verified 2026-06-12 — it wedged the whole mode-switch). Every call
+# goes through this wrapper: run in background, kill after $1 seconds.
+_devicectl_t() {
+    local secs="$1"; shift
+    local out; out="$(mktemp)"
+    ( xcrun devicectl "$@" > "$out" 2>/dev/null ) &
+    local pid=$!
+    ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+    local killer=$!
+    wait "$pid" 2>/dev/null
+    kill "$killer" 2>/dev/null
+    cat "$out"; rm -f "$out"
+}
+
 _kill_pidfile() {
     local f="$1"
     if [ -f "$f" ]; then
@@ -126,10 +141,10 @@ if [ -z "${WDA_UDID:-}" ]; then
 fi
 # Show WHICH phone was picked (auto-detect grabs the first destination; with
 # several paired iPhones it can choose an unavailable one — let the user catch it).
-PICKED_NAME="$(xcrun devicectl device info details --device "$WDA_UDID" 2>/dev/null \
+PICKED_NAME="$(_devicectl_t 8 device info details --device "$WDA_UDID" \
               | sed -n 's/.*marketingName: *//p' | head -1 || true)"
 ok "Device UDID: $WDA_UDID${PICKED_NAME:+  ($PICKED_NAME)}"
-IOS_COUNT="$(xcrun devicectl list devices 2>/dev/null | grep -ciE 'iPhone|iPad' || true)"
+IOS_COUNT="$(_devicectl_t 8 list devices | grep -ciE 'iPhone|iPad' || true)"
 if [ "${IOS_COUNT:-0}" -gt 1 ]; then
     warn "$IOS_COUNT iOS devices are paired — if the wrong one was picked, re-run with WDA_UDID=<classic-udid> (the 00008…/8-… id)."
 fi
@@ -138,16 +153,16 @@ fi
 # Pitfall: 'Developer Disk Image is not mounted' usually means the phone is
 # LOCKED or just-connected — not an Xcode version problem. Keep it unlocked.
 info "Waiting for developer services (UNLOCK the iPhone, keep it awake, and plug it in via USB)"
-DEV_UUID="$(xcrun devicectl list devices 2>/dev/null | awk -v u="$WDA_UDID" 'NR>2 {print $(NF-2)}' | head -1 || true)"
+DEV_UUID="$(_devicectl_t 8 list devices | awk -v u="$WDA_UDID" 'NR>2 {print $(NF-2)}' | head -1 || true)"
 TRIES=0
-until xcrun devicectl device info details --device "$WDA_UDID" 2>/dev/null | grep -q "ddiServicesAvailable: true"; do
+until _devicectl_t 10 device info details --device "$WDA_UDID" | grep -q "ddiServicesAvailable: true"; do
     TRIES=$((TRIES+1))
     if [ $TRIES -gt 45 ]; then
         warn "developer services never became available for $WDA_UDID."
         warn "Most reliable fix: connect this iPhone to the Mac with a USB cable"
         warn "(Wi-Fi-only often sits in 'connecting' and never mounts the disk image),"
         warn "keep it unlocked + awake, then re-run. Devices the Mac currently sees:"
-        xcrun devicectl list devices 2>/dev/null | sed 's/^/    /' >&2 || true
+        _devicectl_t 8 list devices | sed 's/^/    /' >&2 || true
         warn "If the wrong phone was picked, re-run with WDA_UDID=<classic-udid>."
         die "developer services not available (docs/wda-setup.html pitfall ①)"
     fi
