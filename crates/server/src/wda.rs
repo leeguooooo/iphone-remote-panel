@@ -203,6 +203,25 @@ impl WdaClient {
         }
     }
 
+    /// Launch (or foreground) an app by bundle id (`POST /wda/apps/launch`).
+    /// This bypasses the Home-Screen icon grid entirely — those icons report
+    /// `rect [0,0,0,0]` and don't navigate on a label/coordinate tap (issue
+    /// #18-A), so launching by bundle id is the only reliable way to open a
+    /// system app. Examples: Settings = `com.apple.Preferences`, Photos =
+    /// `com.apple.mobileslideshow`.
+    pub async fn launch_app(&mut self, bundle_id: &str) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/wda/apps/launch", self.base, sid))
+            .json(&serde_json::json!({ "bundleId": bundle_id }))
+            .send()
+            .await
+            .context("POST /wda/apps/launch")?
+            .error_for_status()
+            .context("/wda/apps/launch status")?;
+        Ok(())
+    }
+
     /// Type a string into whatever currently has keyboard focus
     /// (`POST /wda/keys`). The string goes in as Unicode — CJK lands cleanly
     /// even with a Pinyin keyboard active (hardware-validated).

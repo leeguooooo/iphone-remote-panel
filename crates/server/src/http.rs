@@ -858,6 +858,44 @@ async fn agent_input(
                         (StatusCode::OK, "ok (wda keyboard dismiss)").into_response(),
                     );
                 }
+                // Open an app by bundle id (issue #18-A): Home-Screen icons report
+                // rect [0,0,0,0] and don't navigate on tap, so launching by bundle
+                // is the only reliable way to open a system app. Accepts an
+                // explicit `{"bundle":"com.apple.Preferences"}` or a `{"name":"设置"}`
+                // mapped from the common-app table below.
+                ("launch_app", _) => {
+                    let bundle = v
+                        .get("bundle")
+                        .and_then(|b| b.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            v.get("name")
+                                .and_then(|n| n.as_str())
+                                .and_then(system_app_bundle)
+                                .map(str::to_string)
+                        });
+                    return match bundle {
+                        Some(b) => match wda.lock().await.launch_app(&b).await {
+                            Ok(()) => with_security_headers(
+                                (StatusCode::OK, "ok (wda launch)").into_response(),
+                            ),
+                            Err(e) => {
+                                tracing::warn!("wda launch_app '{b}' failed: {e:#}");
+                                with_security_headers(
+                                    (StatusCode::BAD_GATEWAY, "wda: launch failed")
+                                        .into_response(),
+                                )
+                            }
+                        },
+                        None => with_security_headers(
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "launch_app needs \"bundle\":\"<id>\" (or a known \"name\")",
+                            )
+                                .into_response(),
+                        ),
+                    };
+                }
                 ("tap", Some(label)) => {
                     let r = wda.lock().await.click_label(label).await;
                     return match r {
@@ -992,36 +1030,43 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         ),
         AgentAuth::Ok => {}
     }
+    // Always answer with parseable JSON so a client's `r.json()["elements"]`
+    // never throws — even when WDA is absent or mid-transition (issue #18-B:
+    // a non-JSON 502/503 body crashed agents' decoders, same class as #15-C).
+    let json_body = |body: String| {
+        with_security_headers(
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        )
+    };
     let Some(wda) = &state.wda else {
-        return with_security_headers(
-            (StatusCode::SERVICE_UNAVAILABLE, "wda not configured (PHONE_REMOTE_WDA_URL)")
-                .into_response(),
+        return json_body(
+            r#"{"elements":[],"error":"wda not configured (PHONE_REMOTE_WDA_URL)"}"#.to_string(),
         );
     };
     let mut w = wda.lock().await;
     let rows = match w.elements().await {
         Ok(rows) => rows,
         Err(_) => {
-            // One stale-session retry.
+            // One stale-session retry, then degrade gracefully: an empty set with
+            // `transitioning:true` (WDA is mid-screen-change or briefly down) lets
+            // the agent retry instead of crashing on an unparseable body.
             w.invalidate_session();
             match w.elements().await {
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!("wda elements failed: {e:#}");
-                    return with_security_headers(
-                        (StatusCode::BAD_GATEWAY, "wda unreachable").into_response(),
-                    );
+                    return json_body(r#"{"elements":[],"transitioning":true}"#.to_string());
                 }
             }
         }
     };
-    let body = serde_json::to_string(&serde_json::json!({ "elements": rows }))
-        .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string());
-    let resp = Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    with_security_headers(resp)
+    json_body(
+        serde_json::to_string(&serde_json::json!({ "elements": rows }))
+            .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string()),
+    )
 }
 
 /// `GET /agent/screenshot` — current phone screen as a PNG.
@@ -1109,6 +1154,35 @@ fn is_valid_png(bytes: &[u8]) -> bool {
     const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     // 8 sig + 4 len + 4 "IHDR" + 13 IHDR data + 4 CRC = 33 minimum.
     bytes.len() >= 33 && bytes.starts_with(&PNG_SIG)
+}
+
+/// Map a friendly app name (zh or en) to its iOS bundle id, for
+/// `{"type":"launch_app","name":…}` (issue #18-A). Unknown names return `None`
+/// — the caller can always pass an explicit `bundle`. Covers the stock apps an
+/// agent most often needs to reach.
+fn system_app_bundle(name: &str) -> Option<&'static str> {
+    Some(match name.trim() {
+        "设置" | "设定" | "Settings" | "settings" => "com.apple.Preferences",
+        "照片" | "Photos" | "photos" => "com.apple.mobileslideshow",
+        "相机" | "Camera" | "camera" => "com.apple.camera",
+        "时钟" | "Clock" | "clock" => "com.apple.mobiletimer",
+        "备忘录" | "Notes" | "notes" => "com.apple.mobilenotes",
+        "提醒事项" | "Reminders" | "reminders" => "com.apple.reminders",
+        "日历" | "Calendar" | "calendar" => "com.apple.mobilecal",
+        "Safari" | "safari" | "浏览器" => "com.apple.mobilesafari",
+        "信息" | "Messages" | "messages" => "com.apple.MobileSMS",
+        "电话" | "Phone" | "phone" => "com.apple.mobilephone",
+        "邮件" | "Mail" | "mail" => "com.apple.mobilemail",
+        "地图" | "Maps" | "maps" => "com.apple.Maps",
+        "App Store" | "app store" | "appstore" | "应用商店" => "com.apple.AppStore",
+        "钱包" | "Wallet" | "wallet" => "com.apple.Passbook",
+        "健康" | "Health" | "health" => "com.apple.Health",
+        "文件" | "Files" | "files" => "com.apple.DocumentsApp",
+        "快捷指令" | "Shortcuts" | "shortcuts" => "com.apple.shortcuts",
+        "音乐" | "Music" | "music" => "com.apple.Music",
+        "App资源库" | "Find My" | "查找" => "com.apple.findmy",
+        _ => return None,
+    })
 }
 
 /// `POST /agent/inbox` — the phone (an iOS Shortcut) delivers a structured result.
