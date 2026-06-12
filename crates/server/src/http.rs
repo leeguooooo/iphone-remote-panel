@@ -611,15 +611,21 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // When not drivable, tell the caller HOW to recover (the recovery differs by
     // state, and auto-recovery is blocked by macOS while the phone is in use).
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
-    let hint = if drivable {
-        ""
-    } else {
+    let hint = if !drivable {
         match mirror_state {
             "paused" => "Mirroring paused — tap the Resume button to reconnect (a tap at x=0.5, y=0.64 hits it)",
             "in_use" => "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
             "offline" => "no iPhone Mirroring window — open iPhone Mirroring on the Mac, or start WebDriverAgent for on-device control",
             _ => "",
         }
+    } else if !wda {
+        // Mirror is live but there's no on-device element layer. Taps and scroll
+        // land; text/key injection through the mirror is unreliable (Mirroring
+        // does not forward synthetic keystrokes — issue #15). Point the agent at
+        // the reliable path before it types into the void.
+        "no WDA: taps/scroll work but text typing is unreliable through the mirror — for reliable typing start WDA via POST /agent/mode mode=agent (needs the phone unlocked once)"
+    } else {
+        ""
     };
     let body = format!(
         r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
