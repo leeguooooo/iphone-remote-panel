@@ -145,6 +145,7 @@ npx skills update -g                                                            
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → 临时中继凭证，用于跨网络。 |
 | `PHONE_REMOTE_WDA_URL` | *(无)* | L2 元素树控制：指向可达的 WebDriverAgent（推荐 `http://127.0.0.1:8100`，由 `scripts/setup-wda.sh` 的中继提供）。设置后 agent 的文字/点按自动路由到手机端元素层 —— 中文直通、按标签点按无需坐标、完全不碰 Mac 光标；不设 = 纯像素路径。 |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 静态 TURN 服务器（Cloudflare 的替代方案）。 |
+| `PHONE_REMOTE_AUTO_RESUME` | *(关)* | `1` = 实验性：watchdog 自动点击 Mirroring 的 Resume/Connect 按钮恢复暂停屏。默认关 —— 手机使用中时 macOS 不允许后台 agent 把 Mirroring 置前，无法做到可靠，改用 `mirror_state`/`hint` 提示你何时手动点。 |
 
 ## 智能体 API
 
@@ -154,9 +155,11 @@ Bearer 鉴权：`Authorization: Bearer <token>`，其中 token 在设置了 `PHO
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/agent/status` | 鉴权 / 健康探测。 |
-| `POST` | `/agent/input` | 一条控制消息：点按 / 滚动 / 文字 / 按键 / 快捷操作（坐标归一化到 `[0,1]`）。 |
-| `GET` | `/agent/screenshot` | 当前手机画面，PNG 格式。 |
+| `GET` | `/agent/status` | 鉴权 / 健康探测 + 可操作性：`{ok, phone_target, wda, drivable, mirror_state, hint, mode, viewer_count, …}`。 |
+| `POST` | `/agent/input` | 一条控制消息：点按 / 滚动 / 文字 / 按键 / 快捷操作 / 收键盘（坐标归一化到 `[0,1]`）。 |
+| `GET` | `/agent/screenshot` | 当前手机画面，PNG 格式（校验帧；可回退到手机端截图）。 |
+
+判断能否操作要看 **`drivable`** 而非 `phone_target`：Mirroring 窗口可能在、但显示「Connection Paused」/「iPhone in Use」中间屏，此时点按打空。`mirror_state`（`active`/`paused`/`in_use`/`offline`）+ `hint` 告诉你怎么办（paused → 点 Resume；in_use → 锁屏；offline → 打开 Mirroring）。
 
 完整参考：**[`docs/agent-api.html`](docs/agent-api.html)**。
 
@@ -165,6 +168,7 @@ HOST=http://<mac的局域网IP>:44321; AUTH="Authorization: Bearer $PW"
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'   # 收起键盘 (wda)
 ```
 
 ## MCP 服务器
