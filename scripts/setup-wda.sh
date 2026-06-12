@@ -124,18 +124,34 @@ if [ -z "${WDA_UDID:-}" ]; then
                 | sed -n 's/.*platform:iOS, arch:arm64.*id:\([0-9A-F-]*\),.*/\1/p' | head -1 || true)"
     [ -n "$WDA_UDID" ] || die "no iOS device found — plug in / pair the iPhone, enable Developer Mode"
 fi
-ok "Device UDID: $WDA_UDID"
+# Show WHICH phone was picked (auto-detect grabs the first destination; with
+# several paired iPhones it can choose an unavailable one — let the user catch it).
+PICKED_NAME="$(xcrun devicectl device info details --device "$WDA_UDID" 2>/dev/null \
+              | sed -n 's/.*marketingName: *//p' | head -1 || true)"
+ok "Device UDID: $WDA_UDID${PICKED_NAME:+  ($PICKED_NAME)}"
+IOS_COUNT="$(xcrun devicectl list devices 2>/dev/null | grep -ciE 'iPhone|iPad' || true)"
+if [ "${IOS_COUNT:-0}" -gt 1 ]; then
+    warn "$IOS_COUNT iOS devices are paired — if the wrong one was picked, re-run with WDA_UDID=<classic-udid> (the 00008…/8-… id)."
+fi
 
 # ── 3. Wait for dev services (DDI) ────────────────────────────────────────────
 # Pitfall: 'Developer Disk Image is not mounted' usually means the phone is
 # LOCKED or just-connected — not an Xcode version problem. Keep it unlocked.
-info "Waiting for developer services (UNLOCK the iPhone and keep it awake)"
+info "Waiting for developer services (UNLOCK the iPhone, keep it awake, and plug it in via USB)"
 DEV_UUID="$(xcrun devicectl list devices 2>/dev/null | awk -v u="$WDA_UDID" 'NR>2 {print $(NF-2)}' | head -1 || true)"
 TRIES=0
 until xcrun devicectl device info details --device "$WDA_UDID" 2>/dev/null | grep -q "ddiServicesAvailable: true"; do
     TRIES=$((TRIES+1))
-    [ $TRIES -gt 60 ] && die "developer services never came up — is the phone unlocked + connected? (docs/wda-setup.html pitfall ①)"
-    [ $((TRIES % 10)) -eq 1 ] && warn "still waiting (unlock the phone, keep the screen on) ..."
+    if [ $TRIES -gt 45 ]; then
+        warn "developer services never became available for $WDA_UDID."
+        warn "Most reliable fix: connect this iPhone to the Mac with a USB cable"
+        warn "(Wi-Fi-only often sits in 'connecting' and never mounts the disk image),"
+        warn "keep it unlocked + awake, then re-run. Devices the Mac currently sees:"
+        xcrun devicectl list devices 2>/dev/null | sed 's/^/    /' >&2 || true
+        warn "If the wrong phone was picked, re-run with WDA_UDID=<classic-udid>."
+        die "developer services not available (docs/wda-setup.html pitfall ①)"
+    fi
+    [ $((TRIES % 8)) -eq 1 ] && warn "still waiting — UNLOCK the phone, keep the screen on, and plug in USB ..."
     sleep 4
 done
 ok "Developer Disk Image mounted"
