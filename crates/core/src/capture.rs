@@ -564,9 +564,12 @@ pub fn mirroring_state() -> anyhow::Result<MirrorState> {
     Ok(MirrorState::Active)
 }
 
-/// Color of the iPhone Mirroring interstitial background + per-channel match
-/// tolerance. Hardware-sampled from both "Connection Paused" and "iPhone in Use".
-const PAUSED_GRAY: [i32; 3] = [46, 50, 52];
+/// Background colors of the iPhone Mirroring interstitials + per-channel match
+/// tolerance. The interstitial follows the system appearance, so we match BOTH:
+/// dark mode RGB(46,50,52) and light mode RGB(233,235,237) — hardware-sampled
+/// from "Connection Paused" and "iPhone in Use" in each appearance (each ≈0.86
+/// of the frame). A live mirror is never this uniform in either color.
+const INTERSTITIAL_BGS: [[i32; 3]; 2] = [[46, 50, 52], [233, 235, 237]];
 const PAUSED_GRAY_TOL: i32 = 16;
 /// Min gray fraction to treat a frame as an interstitial (not live). Both paused
 /// and in-use sample ≈0.87; live content is far below, so 0.70 has wide margin.
@@ -619,10 +622,12 @@ fn sample_fractions(bytes: &[u8]) -> anyhow::Result<(f32, f32)> {
         while x < w {
             let p = &row[x * channels..];
             let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
-            if (r - PAUSED_GRAY[0]).abs() <= PAUSED_GRAY_TOL
-                && (g - PAUSED_GRAY[1]).abs() <= PAUSED_GRAY_TOL
-                && (b - PAUSED_GRAY[2]).abs() <= PAUSED_GRAY_TOL
-            {
+            // Background if within tolerance of EITHER appearance's interstitial color.
+            if INTERSTITIAL_BGS.iter().any(|c| {
+                (r - c[0]).abs() <= PAUSED_GRAY_TOL
+                    && (g - c[1]).abs() <= PAUSED_GRAY_TOL
+                    && (b - c[2]).abs() <= PAUSED_GRAY_TOL
+            }) {
                 gray += 1;
             }
             if b > 120 && b - r > 40 && b - g > 20 {
@@ -900,11 +905,14 @@ mod tests {
     fn classify_distinguishes_active_paused_in_use() {
         // Live content (white): below the gray threshold → Active.
         assert_eq!(classify_mirror_png(&solid_png(120, 200, [255, 255, 255])).unwrap(), MirrorState::Active);
-        // Uniform interstitial gray, no blue glyph → Connection Paused.
+        // Uniform interstitial gray, no blue glyph → Connection Paused (dark + light).
         assert_eq!(classify_mirror_png(&solid_png(120, 200, [46, 50, 52])).unwrap(), MirrorState::Paused);
-        // Same gray plus a blue phone glyph (~1% area) → iPhone in Use.
+        assert_eq!(classify_mirror_png(&solid_png(120, 200, [233, 235, 237])).unwrap(), MirrorState::Paused);
+        // Same gray plus a blue phone glyph (~1% area) → iPhone in Use (dark + light).
         let in_use = png_with_glyph(160, 280, [46, 50, 52], [90, 150, 235], 0.01);
         assert_eq!(classify_mirror_png(&in_use).unwrap(), MirrorState::InUse);
+        let in_use_light = png_with_glyph(160, 280, [233, 235, 237], [90, 150, 235], 0.01);
+        assert_eq!(classify_mirror_png(&in_use_light).unwrap(), MirrorState::InUse);
         // State helpers.
         assert!(MirrorState::Active.drivable());
         assert!(!MirrorState::Paused.drivable());
