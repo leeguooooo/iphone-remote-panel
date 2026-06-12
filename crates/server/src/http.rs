@@ -631,11 +631,15 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     } else if human_active {
         // Issue #16: a human is on the Mac — yield instead of stealing focus.
         "a human is using the Mac (iPhone Mirroring is not frontmost) — an L3 tap will steal their focus; pause until they are idle, or switch to agent mode (on-device, no focus steal) via POST /agent/mode mode=agent"
+    } else if !wda && state.wda.is_some() {
+        // WDA was configured but the probe is down — the on-phone XCUITest runner
+        // was almost certainly reaped by iOS (issue #14 §4). Spell out the
+        // recovery, not just "no WDA".
+        "WDA configured but unreachable (the on-phone runner was likely reaped) — taps/scroll still work but text typing is unreliable; restart WDA via POST /agent/mode mode=agent, then poll status for wda:true"
     } else if !wda {
-        // Mirror is live but there's no on-device element layer. Taps and scroll
-        // land; text/key injection through the mirror is unreliable (Mirroring
-        // does not forward synthetic keystrokes — issue #15). Point the agent at
-        // the reliable path before it types into the void.
+        // No WDA configured at all. Taps/scroll land; text/key injection through
+        // the mirror is unreliable (Mirroring does not forward synthetic
+        // keystrokes — issue #15). Point the agent at the reliable path.
         "no WDA: taps/scroll work but text typing is unreliable through the mirror — for reliable typing start WDA via POST /agent/mode mode=agent (needs the phone unlocked once)"
     } else {
         ""
@@ -929,6 +933,32 @@ async fn agent_input(
             );
         }
     };
+    // Cooperative yield (issue #16): an agent that doesn't want to interrupt a
+    // human sets `X-Yield-To-Human: 1`. This L3 path would yank iPhone Mirroring
+    // frontmost and steal the Mac's focus — so if a human/another app currently
+    // holds the foreground, refuse with 409 instead of barging in. Opt-in, so
+    // default behavior is unchanged. (WDA-handled events returned earlier; their
+    // on-device injection never contends, so only the L3 path is gated.)
+    let yield_to_human = headers
+        .get("x-yield-to-human")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.is_empty() && v != "0" && v != "false");
+    #[cfg(target_os = "macos")]
+    let mac_held_by_human = yield_to_human && !crate::macos::mirroring_is_frontmost();
+    #[cfg(not(target_os = "macos"))]
+    let mac_held_by_human = {
+        let _ = yield_to_human;
+        false
+    };
+    if mac_held_by_human {
+        return with_security_headers(
+            (
+                StatusCode::CONFLICT,
+                "yielded to human: iPhone Mirroring is not frontmost — retry when status human_active is false, or switch to agent mode",
+            )
+                .into_response(),
+        );
+    }
     // Take an Agent lease so the injector gate permits this event.
     let agent_id = headers
         .get("x-agent-id")
