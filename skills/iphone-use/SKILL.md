@@ -24,18 +24,28 @@ AUTH="Authorization: Bearer $PHONE_REMOTE_TOKEN"   # daemon password or PHONE_RE
 5 consecutive auth failures lock you out for 30s):
 
 ```bash
-curl -s -H "$AUTH" "$HOST/agent/status"   # want {"ok":true,"phone_target":true}
+curl -s -H "$AUTH" "$HOST/agent/status"
+# {"ok":true,"phone_target":true,"wda":false,"drivable":true,"mirror_state":"active",
+#  "hint":"","mode":"mirror","viewer_count":0, ...}
 ```
 
-`phone_target:false` → the Mirroring window is gone (phone disconnected /
-locked after reboot). A tap at the center sometimes wakes the "paused" screen;
-a first-unlock-after-boot needs a human.
+**Check `drivable`, not `phone_target`.** `phone_target` only means the Mirroring
+*window* exists — it stays `true` on the "Connection Paused" and "iPhone in Use"
+interstitials, where taps land in the void. `drivable:true` is the real "can I
+act now" signal (WDA is up, or the mirror is showing live content).
+
+- `drivable:false` + `mirror_state` tells you why and what to do — read `hint`:
+  - `mirror_state:"paused"` → tap the Resume button (a tap at `x=0.5, y=0.64` hits it).
+  - `mirror_state:"in_use"` → a human is on the phone; **lock the phone** to reconnect
+    (the on-screen Connect button does NOT reconnect while it's in use). Don't fight them.
+  - `mirror_state:"offline"` → no Mirroring window; open iPhone Mirroring on the Mac.
+- `viewer_count` = connected `/ws` viewers (one streams; others queue, issue #8).
 
 ## The API (3 endpoints)
 
 | Call | Purpose |
 |---|---|
-| `GET /agent/status` | `{"ok":true,"phone_target":bool,"wda":bool}` — `wda:true` unlocks the element layer below |
+| `GET /agent/status` | `{ok, phone_target, wda, drivable, mirror_state, hint, mode, viewer_count, …}` — gate on **`drivable`**; `wda:true` unlocks the element layer below |
 | `GET /agent/elements` | **(wda) The UI as text**: `{"elements":[{kind,label,rect,depth},…]}` — prefer this over screenshots |
 | `GET /agent/screenshot` | Current phone screen as PNG (falls back to on-device capture when Mirroring is gone) |
 | `POST /agent/input` | One action (JSON body, below) |
@@ -51,7 +61,11 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"text","text":"Health
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"key","name":"return"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'      # home|spotlight|switcher
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"longpress","x":0.4,"y":0.6}'   # release with {"type":"up",...}
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'                     # (wda) dismiss the on-screen keyboard
 ```
+
+After typing into a web form the keyboard covers the page's own submit/next
+buttons — send `{"type":"keyboard"}` to dismiss it before tapping them.
 
 MCP alternative: the repo ships `iphone-use-mcp` (crates/mcp) exposing the
 same actions as native MCP tools (`phone_tap`, `phone_screenshot`, …).
