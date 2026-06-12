@@ -164,6 +164,7 @@ the heaviest users make the product better.
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → ephemeral relay creds for cross-network. |
 | `PHONE_REMOTE_WDA_URL` | *(none)* | L2 element-tree control: a WebDriverAgent reachable at this URL (use `http://127.0.0.1:8100` via the relay from `scripts/setup-wda.sh`). When set, agent text/taps auto-route through the phone-side element layer — CJK text lands cleanly, label-taps need no coordinates, nothing touches the host cursor. Unset = pure pixel path. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Static TURN server (alternative to Cloudflare). |
+| `PHONE_REMOTE_AUTO_RESUME` | *(off)* | `1` = experimental: a watchdog clicks the Mirroring Resume/Connect button to recover the paused screen unattended. Off by default — macOS blocks a background agent from focusing Mirroring while the phone is in use, so it can't be made reliable; `mirror_state`/`hint` tell you when to click manually instead. |
 
 ## Agent API
 
@@ -174,9 +175,14 @@ otherwise `PHONE_REMOTE_PASSWORD` (legacy fallback).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/agent/status` | Auth / health probe. |
-| `POST` | `/agent/input` | One control message: tap / scroll / text / key / shortcut (normalized `[0,1]` coords). |
-| `GET` | `/agent/screenshot` | Current phone screen as PNG. |
+| `GET` | `/agent/status` | Auth / health probe + driveability: `{ok, phone_target, wda, drivable, mirror_state, hint, mode, viewer_count, …}`. |
+| `POST` | `/agent/input` | One control message: tap / scroll / text / key / shortcut / keyboard (normalized `[0,1]` coords). |
+| `GET` | `/agent/screenshot` | Current phone screen as PNG (validated frame; falls back to on-device capture). |
+
+Gate actions on **`drivable`**, not `phone_target`: the Mirroring window can be up
+yet showing the "Connection Paused" / "iPhone in Use" interstitial, where taps land
+in the void. `mirror_state` (`active`/`paused`/`in_use`/`offline`) + `hint` say what
+to do (paused → tap Resume; in_use → lock the phone; offline → open Mirroring).
 
 Full reference: **[`docs/agent-api.html`](docs/agent-api.html)**.
 
@@ -185,6 +191,7 @@ HOST=http://<mac-lan-ip>:44321; AUTH="Authorization: Bearer $PW"
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
 curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
+curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'   # dismiss the keyboard (wda)
 ```
 
 ## MCP server

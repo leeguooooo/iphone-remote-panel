@@ -97,8 +97,26 @@
 
 <h3><span class="method get">GET</span> <span class="ep">/agent/status</span></h3>
 <p>Returns <code>200</code> with JSON when the bearer is valid.</p>
-<pre><code>{ "ok": true, "phone_target": true, "wda": true, "mode": "agent",
+<pre><code>{ "ok": true, "phone_target": true, "wda": false,
+  "drivable": false, "mirror_state": "in_use",
+  "hint": "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
+  "mode": "mirror", "viewer_count": 0,
   "version": "0.2.0", "latest": "v0.2.0", "update_available": false }</code></pre>
+<aside class="note">
+  <strong>Gate on <code>drivable</code>, not <code>phone_target</code>.</strong>
+  <code>phone_target</code> only means the Mirroring <em>window</em> exists — it stays
+  <code>true</code> on the "Connection Paused" and "iPhone in Use" interstitials, where
+  taps land in the void (the classic false positive). <code>drivable</code> is the honest
+  "can I act right now" signal: <code>true</code> when WDA is up <em>or</em> the mirror shows
+  live content. When it's <code>false</code>, read <code>mirror_state</code> +
+  <code>hint</code>:
+  <code>"paused"</code> → tap the Resume button (a tap at <code>x=0.5, y=0.64</code> hits it);
+  <code>"in_use"</code> → a human is on the phone, <strong>lock it</strong> to reconnect
+  (the Connect button won't, and macOS blocks unattended auto-recovery while in use);
+  <code>"offline"</code> → no Mirroring window.
+  <code>viewer_count</code> is the number of connected <code>/ws</code> viewers (one streams,
+  the rest queue).
+</aside>
 <p class="muted">
   <code>phone_target</code> is <code>true</code> when the iPhone Mirroring window is currently
   visible on-screen (a cheap ScreenCaptureKit probe at request time).
@@ -155,6 +173,7 @@ curl -s -H "$AUTH" -X POST "$HOST/agent/mode" -d '{"mode":"mirror"}'
   <tr><td><code>{"type":"text","text":"hello"}</code></td><td>Type into the focused field. With <code>wda:true</code> any Unicode (incl. CJK) lands cleanly; otherwise US keycodes — see the CJK-IME caveat below.</td></tr>
   <tr><td><code>{"type":"key","name":"return"}</code></td><td>One named key (<code>return</code>, <code>escape</code>, <code>space</code>…).</td></tr>
   <tr><td><code>{"type":"shortcut","name":"home"}</code></td><td>System shortcut: <code>home</code> | <code>spotlight</code> | <code>switcher</code>.</td></tr>
+  <tr><td><code>{"type":"keyboard"}</code></td><td><strong>(wda)</strong> Dismiss the on-screen keyboard — after typing into a web form it covers the page's own submit/next buttons. (Also <code>{"type":"key","name":"dismiss"}</code>.)</td></tr>
   <tr><td><code>{"type":"longpress","x":0.4,"y":0.6}</code></td><td>Press &amp; hold (release with a matching <code>up</code>).</td></tr>
   <tr><td><code>{"type":"down"}</code> / <code>{"type":"up"}</code></td><td>Low-level press / release for custom drags.</td></tr>
 </table>
