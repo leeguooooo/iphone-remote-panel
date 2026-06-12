@@ -105,6 +105,12 @@ Hard-won facts (hardware-validated — trust these):
   stops WDA, reconnects the mirror, ~10s) or `{"mode":"agent"}` (starts WDA;
   needs the phone unlocked once if it's locked). `GET /agent/status` reports
   the current `mode`.
+- **Never blind-tap retry loops on the Mirroring interstitials.** A reconnect
+  handshake takes 10–30s and a tap landing mid-handshake CANCELS it — a loop
+  that taps Try Again every 20–30s turns "connects fine" into "connects then
+  always drops" (hardware-verified the hard way). Tap the recovery button at
+  most ONCE per state change, then give it 45s+. Never tap while `in_use`
+  (the button is inert; lock the phone instead).
 - **One action at a time.** The phone animates; give transitions ~1s before
   the verify screenshot. App launches / share sheets can take 2–4s.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`

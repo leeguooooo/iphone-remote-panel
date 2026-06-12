@@ -196,7 +196,12 @@ fn spawn_pause_watchdog(state: Arc<AppState>) {
     tokio::spawn(async move {
         use std::time::{Duration, Instant};
         const POLL: Duration = Duration::from_secs(5);
-        const COOLDOWN: Duration = Duration::from_secs(20);
+        // Hardware lesson (2026-06-12): a Mirroring reconnect handshake takes
+        // 10–30s, and a tap landing mid-handshake CANCELS it — an aggressive
+        // retry loop turns "connects fine" into "connects then always drops"
+        // (observed live; the blind-tapping session monitor caused exactly
+        // that). Cool down long enough for a full handshake to finish.
+        const COOLDOWN: Duration = Duration::from_secs(45);
         let mut last_attempt: Option<Instant> = None;
         loop {
             tokio::time::sleep(POLL).await;
@@ -211,10 +216,13 @@ fn spawn_pause_watchdog(state: Arc<AppState>) {
             })
             .await
             .unwrap_or(core::capture::MirrorState::Active);
-            // Recover either interstitial — both carry a recovery button at the
-            // same spot. (Active = live, offline = no window: nothing to do.)
+            // Only the "Connection Paused" interstitial is recoverable by a
+            // click. "iPhone in Use" is NOT: the on-screen Connect button does
+            // nothing while the phone is in active use (hardware-verified —
+            // /agent/status says exactly this in its hint), and the tap itself
+            // keeps poking the session. Wait in_use out instead.
             use core::capture::MirrorState;
-            if !matches!(mstate, MirrorState::Paused | MirrorState::InUse) {
+            if !matches!(mstate, MirrorState::Paused) {
                 continue;
             }
             if last_attempt.is_some_and(|t| t.elapsed() < COOLDOWN) {
