@@ -608,8 +608,21 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     };
     // Connected `/ws` viewers (active + queued) — issue #8.
     let viewer_count = recover(state.viewers.lock()).count();
+    // When not drivable, tell the caller HOW to recover (the recovery differs by
+    // state, and auto-recovery is blocked by macOS while the phone is in use).
+    // Plain text only — kept free of quotes/braces so it drops into the JSON.
+    let hint = if drivable {
+        ""
+    } else {
+        match mirror_state {
+            "paused" => "Mirroring paused — tap the Resume button to reconnect (a tap at x=0.5, y=0.64 hits it)",
+            "in_use" => "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
+            "offline" => "no iPhone Mirroring window — open iPhone Mirroring on the Mac, or start WebDriverAgent for on-device control",
+            _ => "",
+        }
+    };
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"mode":"{mode}","mirror_state":"{mirror_state}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
