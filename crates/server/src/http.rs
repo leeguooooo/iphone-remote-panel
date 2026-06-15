@@ -687,6 +687,76 @@ fn read_setup_blocked_on() -> String {
         .to_string()
 }
 
+/// launchd label for the dedicated, self-healing WDA job.
+const WDA_AGENT_LABEL: &str = "com.leeguoo.iphone-use.wda";
+
+/// Current GUI launchd domain (`gui/<uid>`), via `id -u`.
+fn gui_domain() -> String {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    format!("gui/{uid}")
+}
+
+/// Write the WDA LaunchAgent plist and (re)bootstrap it. Running WDA as its OWN
+/// launchd job — `KeepAlive=true`, in the user's GUI domain, NOT this daemon's
+/// cgroup — makes it (a) survive daemon restarts and (b) auto-restart when the
+/// runner dies (WARP reconnect / sleep / USB hiccup). `ThrottleInterval` caps
+/// the rebuild rate so a persistent killer thrashes harmlessly. Returns whether
+/// the bootstrap succeeded.
+fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &str) -> bool {
+    let plist_path = format!("{home}/Library/LaunchAgents/{WDA_AGENT_LABEL}.plist");
+    let udid_kv = if udid.is_empty() {
+        String::new()
+    } else {
+        format!("        <key>WDA_UDID</key><string>{udid}</string>\n")
+    };
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>{WDA_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/bash</string><string>{setup_sh}</string></array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WDA_KEEPALIVE</key><string>1</string>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+{udid_kv}    </dict>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"#
+    );
+    if std::fs::write(&plist_path, plist).is_err() {
+        return false;
+    }
+    let domain = gui_domain();
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{WDA_AGENT_LABEL}")])
+        .status();
+    std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist_path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Boot out the WDA LaunchAgent (so its KeepAlive stops rebuilding the runner).
+/// Best-effort; ignored if it isn't loaded.
+fn bootout_wda_agent() {
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/{WDA_AGENT_LABEL}", gui_domain())])
+        .status();
+}
+
 /// `POST /agent/mode` — switch between the two (mutually exclusive) control
 /// modes. Body: `{"mode":"mirror"}` or `{"mode":"agent"}`.
 ///
@@ -749,10 +819,13 @@ async fn agent_mode(
                     tracing::warn!("wda lock before mirror switch failed (continuing): {e:#}");
                 }
             }
-            // 1) Stop the runner + relay. Prefer the script (single source of
-            //    truth for pidfiles); fall back to pkill patterns.
+            // 1) Stop the WDA LaunchAgent FIRST (else its KeepAlive would just
+            //    rebuild the runner we're about to kill), then the runner +
+            //    relay via the script (single source of truth for pidfiles),
+            //    falling back to pkill.
             let script = setup_sh.clone();
             let stopped = tokio::task::spawn_blocking(move || {
+                bootout_wda_agent();
                 let via_script = std::path::Path::new(&script).exists()
                     && std::process::Command::new("bash")
                         .arg(&script)
@@ -821,30 +894,23 @@ async fn agent_mode(
                         .into_response(),
                 );
             }
-            // Detached: the runner takes ~30-90s (xcodebuild). Log to a file
-            // the operator can tail. An explicit `udid` (sanitized above) is
-            // exported as WDA_UDID so a second, non-Mirroring phone can be the
-            // target. NOTE: setup-wda.sh hard-stops if WARP is on (it kills
-            // CoreDevice) — we deliberately do NOT auto-disconnect the user's
-            // WARP/office VPN from here; the block surfaces as
-            // status.setup_blocked_on="warp" for the caller to act on.
-            let log = format!("{home}/.iphone-use/wda-mode-switch.log");
-            let udid_env = match &udid {
-                Some(u) => format!("WDA_UDID='{u}' "),
-                None => String::new(),
-            };
-            let spawned = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(format!("{udid_env}nohup bash '{setup_sh}' > '{log}' 2>&1 &"))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            // The one thing automation cannot do: xcodebuild refuses to
-            // launch the runner on a LOCKED phone, and Face ID can't be
-            // faked. The spawned script waits patiently, so a single human
-            // unlock completes the switch.
+            // Run WDA under a DEDICATED LaunchAgent (com.leeguoo.iphone-use.wda)
+            // with KeepAlive instead of nohup-spawning a child. Two reasons,
+            // both hardware-painful bugs:
+            //   1. A nohup child lives in THIS daemon's launchd cgroup, so the
+            //      next daemon restart (`launchctl bootout`) reaps the runner —
+            //      WDA "randomly" died on every redeploy.
+            //   2. When the runner dies (WARP reconnect kills the CoreDevice
+            //      tunnel, sleep, USB hiccup) nothing brought it back. KeepAlive
+            //      relaunches it; setup-wda.sh's WDA_KEEPALIVE mode blocks until
+            //      the runner dies so launchd sees the exit and rebuilds.
+            // ThrottleInterval caps the rebuild rate so a persistent killer
+            // (WARP Always-On) thrashes harmlessly instead of hot-looping.
+            let log = format!("{home}/.iphone-use/wda-agent.log");
+            let udid_env = udid.as_deref().unwrap_or("");
+            let spawned = write_and_bootstrap_wda_agent(&home, &setup_sh, &log, udid_env);
             let body = format!(
-                r#"{{"ok":{spawned},"mode":"agent","starting":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — the launcher waits for it"}}"#
+                r#"{{"ok":{spawned},"mode":"agent","starting":true,"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — the launcher waits for it; WDA now auto-restarts if it drops"}}"#
             );
             with_security_headers(
                 Response::builder()

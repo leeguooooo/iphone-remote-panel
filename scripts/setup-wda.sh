@@ -355,3 +355,23 @@ printf '  Tap       : {"type":"tap","label":"<element label>"}\n'
 printf '  CJK text  : {"type":"text","text":"你好"} — lands clean via WDA\n'
 printf '  Stop      : ./scripts/setup-wda.sh stop\n'
 printf '  Note      : free Apple ID signing expires in 7 days — re-run this script weekly.\n'
+
+# Self-healing: when launched by the dedicated WDA LaunchAgent
+# (com.leeguoo.iphone-use.wda, KeepAlive=true), DON'T exit — block until the
+# runner dies. Then this script exits, launchd relaunches it, and WDA rebuilds
+# (incrementally, fast). This is what makes WDA recover automatically from a
+# dropped CoreDevice tunnel (WARP reconnect, sleep, USB hiccup) instead of
+# staying dead until a human re-runs setup. (Interactive runs return normally.)
+if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
+    RPID="$(cat "$RUNNER_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$RPID" ]; then
+        info "KeepAlive mode: holding while runner pid $RPID is alive (launchd restarts on exit)"
+        # `wait` only works on direct children; the runner was nohup'd, so poll.
+        while kill -0 "$RPID" 2>/dev/null && curl -s -m 4 "http://127.0.0.1:$WDA_PORT/status" >/dev/null 2>&1; do
+            sleep 10
+        done
+        warn "WDA runner/relay went down — exiting so launchd KeepAlive rebuilds it"
+        _kill_pidfile "$RELAY_PID_FILE"
+        exit 1
+    fi
+fi
