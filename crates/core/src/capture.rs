@@ -614,6 +614,16 @@ fn sample_fractions(bytes: &[u8]) -> anyhow::Result<(f32, f32)> {
     let (w, h) = (info.width as usize, info.height as usize);
     let data = &buf[..info.buffer_size()];
     let stride = w * channels;
+    // Count blue ONLY in the central glyph region. The blue/indigo iPhone
+    // Mirroring badge in the TOP-LEFT corner is present on EVERY interstitial
+    // ("Connection Paused", "iPhone in Use", "Connection Interrupted", "Timed
+    // Out", "Wi-Fi Off"), so a whole-frame blue count mis-read the gray-phone
+    // screens (Timed Out / Interrupted) as "iPhone in Use" and told the user to
+    // LOCK the phone — wrong recovery (hardware bug, 2026-06-14). The real
+    // distinguisher is the CENTER phone glyph: BLUE only on "iPhone in Use",
+    // gray on every other interstitial.
+    let (cx0, cx1) = ((w as f32 * 0.30) as usize, (w as f32 * 0.70) as usize);
+    let (cy0, cy1) = ((h as f32 * 0.32) as usize, (h as f32 * 0.58) as usize);
     let (mut gray, mut blue, mut total) = (0u64, 0u64, 0u64);
     let mut y = 0;
     while y < h {
@@ -630,7 +640,7 @@ fn sample_fractions(bytes: &[u8]) -> anyhow::Result<(f32, f32)> {
             }) {
                 gray += 1;
             }
-            if b > 120 && b - r > 40 && b - g > 20 {
+            if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 && b > 120 && b - r > 40 && b - g > 20 {
                 blue += 1;
             }
             total += 1;

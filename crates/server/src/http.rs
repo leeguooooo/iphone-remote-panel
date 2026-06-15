@@ -623,7 +623,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
     let hint = if !drivable {
         match mirror_state {
-            "paused" => "Mirroring paused — tap the Resume button to reconnect (a tap at x=0.5, y=0.64 hits it)",
+            "paused" => "Mirroring needs reconnecting (paused / interrupted / timed out) — tap the Resume/Connect/Try Again button (x=0.5, y=0.64), once, then wait 45s+; do NOT loop",
             "in_use" => "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
             "offline" => "no iPhone Mirroring window — open iPhone Mirroring on the Mac, or start WebDriverAgent for on-device control",
             _ => "",
