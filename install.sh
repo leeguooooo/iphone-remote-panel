@@ -354,13 +354,21 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapt
 sleep 1
 info "Opening System Settings > Privacy & Security > Accessibility ..."
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+sleep 1
+# Reveal the app in Finder so it can be DRAGGED into the TCC lists — the app
+# lives in ~/Applications (no sudo), but the "+" file picker defaults to the
+# system /Applications, where it ISN'T, which is a common "I can't find it" snag.
+open -R "$DEST" 2>/dev/null || true
 
 echo ""
-printf "${YELLOW}ACTION REQUIRED:${RESET}\n"
-printf "  1. In ${BOLD}Screen Recording${RESET}: enable the toggle next to ${BOLD}iPhoneUse${RESET}.\n"
-printf "  2. In ${BOLD}Accessibility${RESET}: enable the toggle next to ${BOLD}iPhoneUse${RESET}.\n"
-printf "  3. After granting both, restart the daemon:\n"
+printf "${YELLOW}ACTION REQUIRED — grant in BOTH panes (Screen Recording + Accessibility):${RESET}\n"
+printf "  • If ${BOLD}iPhoneUse${RESET} is already listed: just enable its toggle.\n"
+printf "  • If it's NOT listed yet, add it — it's in ${BOLD}~/Applications${RESET}, NOT /Applications:\n"
+printf "      – easiest: drag ${BOLD}iPhoneUse.app${RESET} (revealed in Finder) into the list, OR\n"
+printf "      – click ${BOLD}+${RESET} → press ${BOLD}⌘⇧G${RESET} → type ${BOLD}~/Applications${RESET} → Enter → pick iPhoneUse.app\n"
+printf "  • After granting both, the daemon auto-restarts (KeepAlive); or force it:\n"
 printf "     ${BOLD}launchctl kickstart -k gui/%s/%s${RESET}\n" "$UID_NUM" "$PLIST_LABEL"
+printf "  ${BOLD}This is a ONE-TIME grant${RESET} — the stable signature keeps it across future updates.\n"
 printf "\n"
 printf "${YELLOW}NOTE (monthly):${RESET} macOS ~monthly re-prompts for Screen Recording.\n"
 printf "  You must re-grant it in the GUI; it cannot be suppressed without MDM/PPPC.\n"
