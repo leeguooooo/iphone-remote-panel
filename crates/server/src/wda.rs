@@ -108,6 +108,52 @@ impl WdaClient {
             .with_context(|| format!("no element for {using}={value}: {text}"))
     }
 
+    /// Find ALL elements matching a locator (`POST .../elements`, plural), in
+    /// document order. Returns their element ids. Used to address the Nth
+    /// element of a kind (e.g. the 3 columns of a date PickerWheel) when none
+    /// has a usable label.
+    pub async fn find_elements(&mut self, using: &str, value: &str) -> Result<Vec<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        let v: Envelope<Vec<serde_json::Value>> = self
+            .http
+            .post(format!("{}/session/{}/elements", self.base, sid))
+            .json(&serde_json::json!({ "using": using, "value": value }))
+            .send()
+            .await
+            .context("POST /elements")?
+            .json()
+            .await
+            .context("parse /elements")?;
+        Ok(v.value
+            .iter()
+            .filter_map(|e| {
+                e.get("ELEMENT")
+                    .or_else(|| e.get("element-6066-11e4-a52e-4f735466cecf"))
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .collect())
+    }
+
+    /// Set a date/option PickerWheel to a target value (issue #23). A `scroll`
+    /// gesture doesn't reach the wheel's recognizer; the reliable path is
+    /// XCUITest's `adjustToPickerWheelValue:`, which WDA triggers when you POST
+    /// a value to the wheel element. `column` selects which wheel (0-based, the
+    /// order they appear — e.g. month=0, day=1, year=2). On-device, so no
+    /// cursor/frontmost requirement.
+    pub async fn set_picker(&mut self, column: usize, value: &str) -> Result<()> {
+        let wheels = self
+            .find_elements("class chain", "**/XCUIElementTypePickerWheel")
+            .await?;
+        let id = wheels.get(column).ok_or_else(|| {
+            anyhow!(
+                "picker column {column} out of range ({} wheel(s) on screen)",
+                wheels.len()
+            )
+        })?;
+        self.type_into(id, value).await
+    }
+
     /// Tap an element by id (`POST .../element/:id/click`). Lands on the element
     /// regardless of where it is or what's frontmost — no host cursor involved.
     pub async fn click_element(&mut self, element_id: &str) -> Result<()> {

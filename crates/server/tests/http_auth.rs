@@ -402,7 +402,12 @@ fn agent_input_accepts_valid_message_with_bearer() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "body={body}");
+            // Bearer accepted (not 401) and the message parsed (not 400). The
+            // status may be 409 "dropped" — no iPhone Mirroring window in the
+            // test env to deliver the L3 event to (issue #25). This test covers
+            // auth + parsing, so assert neither rejected it.
+            assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "body={body}");
+            assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "body={body}");
         }
     });
 }
@@ -441,7 +446,11 @@ fn agent_open_mode_allows_without_bearer() {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // Auth passed (open mode) — NOT rejected as 401. Status may be 409
+        // "dropped": no iPhone Mirroring window in the test env to deliver the
+        // L3 tap to (issue #25 — input reports deliverability, not a blind
+        // "ok"). This test is about the auth gate, so assert auth let it through.
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     });
 }
 

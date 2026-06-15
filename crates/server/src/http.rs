@@ -952,6 +952,35 @@ async fn agent_input(
                         ),
                     };
                 }
+                // Tap the Nth element from /agent/elements by its rect center
+                // (#24.1) — for when labels are non-unique/opaque. WDA-only,
+                // on-device. `{"type":"tap","element":N}`.
+                ("tap", None) if v.get("element").and_then(|e| e.as_u64()).is_some() => {
+                    let idx = v.get("element").and_then(|e| e.as_u64()).unwrap() as usize;
+                    let mut w = wda.lock().await;
+                    let r = async {
+                        let rows = w.elements().await?;
+                        let row = rows.get(idx).ok_or_else(|| {
+                            anyhow::anyhow!("element {idx} out of range ({} on screen)", rows.len())
+                        })?;
+                        let (cx, cy) = (row.rect[0] + row.rect[2] / 2.0, row.rect[1] + row.rect[3] / 2.0);
+                        w.tap_point(cx, cy).await
+                    }
+                    .await;
+                    return match r {
+                        Ok(()) => with_security_headers(
+                            (StatusCode::OK, "ok (wda element tap)").into_response(),
+                        ),
+                        Err(e) => {
+                            w.invalidate_session();
+                            tracing::warn!("wda element tap [{idx}] failed: {e:#}");
+                            with_security_headers(
+                                (StatusCode::BAD_GATEWAY, format!("wda element tap: {e}"))
+                                    .into_response(),
+                            )
+                        }
+                    };
+                }
                 ("tap", Some(label)) => {
                     let r = wda.lock().await.click_label(label).await;
                     return match r {
@@ -1014,6 +1043,39 @@ async fn agent_input(
                         }
                     }
                 }
+                // Set a date/option PickerWheel — WDA-only (a scroll gesture
+                // can't move it; issue #23). `{"type":"picker","column":N,
+                // "value":"March"}`. No L3 fallback (the mirror can't express
+                // adjustToPickerWheelValue).
+                ("picker", _) => {
+                    let column = v.get("column").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+                    let value = v.get("value").and_then(|x| x.as_str());
+                    return match value {
+                        Some(value) => {
+                            let mut w = wda.lock().await;
+                            match w.set_picker(column, value).await {
+                                Ok(()) => with_security_headers(
+                                    (StatusCode::OK, "ok (wda picker)").into_response(),
+                                ),
+                                Err(e) => {
+                                    w.invalidate_session();
+                                    tracing::warn!("wda set_picker col={column} '{value}': {e:#}");
+                                    with_security_headers(
+                                        (StatusCode::BAD_GATEWAY, format!("wda picker: {e}"))
+                                            .into_response(),
+                                    )
+                                }
+                            }
+                        }
+                        None => with_security_headers(
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "picker needs \"value\":\"<target>\" (and optional \"column\":N, 0-based)",
+                            )
+                                .into_response(),
+                        ),
+                    };
+                }
                 _ => {} // scroll/key/shortcut/down/up → L3 (mirroring) below
             }
         }
@@ -1064,6 +1126,30 @@ async fn agent_input(
         let mut control = recover(state.control.lock());
         let lease = control.acquire(core::control::Holder::Agent(agent_id), now_secs());
         *recover(state.current_lease.lock()) = Some(lease);
+    }
+    // Deliverability check (issue #25): an L3 event only lands if iPhone
+    // Mirroring can be brought frontmost. When a human is on the Mac, macOS
+    // refuses to let a background LaunchAgent steal focus, so the event is
+    // silently dropped — and returning "ok" makes an agent loop blindly. Bring
+    // it frontmost up front; if that fails, report the drop instead of lying.
+    #[cfg(target_os = "macos")]
+    {
+        let delivered = tokio::task::spawn_blocking(|| {
+            crate::macos::ensure_mirroring_frontmost(std::time::Duration::from_millis(1200))
+        })
+        .await
+        .unwrap_or(false);
+        if !delivered {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"dropped":true,"reason":"iPhone Mirroring could not be brought frontmost (a human is using the Mac, or it is paused/in-use) — poll /agent/status until human_active is false and drivable is true, or switch to agent mode (POST /agent/mode mode=agent)"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        }
     }
     state.injector.send(event);
     with_security_headers((StatusCode::OK, "ok").into_response())
@@ -1119,9 +1205,17 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
             }
         }
     };
+    // Screen size so the agent can normalize the point-space rects to [0,1]
+    // instead of guessing the device dimensions from the largest rect (#24.2).
+    // The array index of each row is its stable handle for `{"type":"tap",
+    // "element":<i>}` (#24.1) — useful when labels are non-unique/opaque.
+    let screen = w.window_size().await.ok();
     json_body(
-        serde_json::to_string(&serde_json::json!({ "elements": rows }))
-            .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string()),
+        serde_json::to_string(&serde_json::json!({
+            "screen": screen.map(|(width, height)| serde_json::json!({"width": width, "height": height})),
+            "elements": rows,
+        }))
+        .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string()),
     )
 }
 
