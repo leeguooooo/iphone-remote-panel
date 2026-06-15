@@ -351,6 +351,31 @@ printf "\n"
 printf "${YELLOW}NOTE (headless):${RESET} The daemon only starts after a desktop login (Aqua session).\n"
 printf "  On unattended machines enable auto-login: System Settings > Users & Groups.\n"
 
+# ── Step 9b — Companion agent skill (best-effort) ────────────────────────────
+# Teach skills-capable agents (Claude Code, Codex, Cursor, …) how to drive this
+# daemon. `npx skills add -g` both installs a fresh copy and updates an existing
+# one, so this doubles as the skill-side upgrade. Best-effort: gated on `npx`
+# being present, never fails the install, and opt-out via IPHONE_USE_SKIP_SKILL=1.
+echo ""
+printf "${BOLD}━━━ Agent skill ━━━${RESET}\n"
+if [ "${IPHONE_USE_SKIP_SKILL:-0}" = "1" ]; then
+    info "Skipped (IPHONE_USE_SKIP_SKILL=1)."
+elif command -v npx >/dev/null 2>&1; then
+    info "Installing/updating the iphone-use agent skill via npx skills ..."
+    # A harmless 'PromptScript does not support global skill installation' line
+    # may appear (PromptScript is project-level only); the other agents install
+    # fine and the exit status stays 0.
+    if npx -y skills add leeguooooo/iphone-use -g -y >/dev/null 2>&1; then
+        ok "Agent skill installed/updated (npx skills add leeguooooo/iphone-use -g)."
+    else
+        warn "npx skills did not complete — run it yourself:"
+        printf "    npx skills add leeguooooo/iphone-use -g -y\n"
+    fi
+else
+    info "npx not found — skipping. To teach agents to drive the phone, run:"
+    printf "    npx skills add leeguooooo/iphone-use -g -y\n"
+fi
+
 # ── Step 10 — Print current status ───────────────────────────────────────────
 echo ""
 printf "${BOLD}━━━ Current LaunchAgent status ━━━${RESET}\n"
