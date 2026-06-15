@@ -104,7 +104,14 @@ Hard-won facts (hardware-validated — trust these):
   `POST /agent/mode {"mode":"mirror"}` (fully automatic: locks the phone,
   stops WDA, reconnects the mirror, ~10s) or `{"mode":"agent"}` (starts WDA;
   needs the phone unlocked once if it's locked). `GET /agent/status` reports
-  the current `mode`.
+  the current `mode`. To drive a SECOND, non-Mirroring phone, pass its UDID:
+  `{"mode":"agent","udid":"00008…"}`.
+- **`mode=agent` stuck / `wda` stays false → read `status.setup_blocked_on`**
+  (`warp|usb|trust|ddi`). The #1 blocker is **`warp`**: Cloudflare WARP (or any
+  VPN) wedges the CoreDevice tunnel xcodebuild needs, so WDA never installs and
+  the runner dies the instant WARP reconnects. Tell the operator to
+  `warp-cli disconnect` (or run `setup-wda.sh doctor` for the full checklist).
+  `trust` = a one-time "trust the Apple Development cert" tap on the phone.
 - **Never blind-tap retry loops on the Mirroring interstitials.** A reconnect
   handshake takes 10–30s and a tap landing mid-handshake CANCELS it — a loop
   that taps Try Again every 20–30s turns "connects fine" into "connects then
