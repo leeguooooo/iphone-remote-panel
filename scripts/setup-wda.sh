@@ -66,6 +66,72 @@ _devicectl_t() {
     cat "$out"; rm -f "$out"
 }
 
+STATUS_FILE="$STATE_DIR/wda-setup-status.json"
+# Structured progress the daemon surfaces via /agent/status.blocked_on, so a
+# caller (or POST /agent/mode) knows WHY a setup is stuck instead of polling blind.
+# $1=phase  $2=blocked_on(empty=ok)  $3=human message
+_setstatus() {
+    printf '{"phase":"%s","blocked_on":"%s","message":"%s","ts":%s}\n' \
+        "$1" "${2:-}" "$(printf '%s' "${3:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$(date +%s)" \
+        > "$STATUS_FILE" 2>/dev/null || true
+}
+
+# UDIDs of iPhones physically on USB (usbmuxd — always present, no libimobiledevice
+# needed, can't hang like devicectl).
+_usb_udids() {
+python3 - 2>/dev/null <<'PY'
+import socket,struct,plistlib
+try:
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(3);s.connect("/var/run/usbmuxd")
+    p=plistlib.dumps({"MessageType":"ListDevices","ClientVersionString":"x","ProgName":"x"})
+    s.sendall(struct.pack("<IIII",len(p)+16,1,8,1)+p)
+    h=s.recv(16);ln=struct.unpack("<I",h[:4])[0];d=b""
+    while len(d)<ln-16:d+=s.recv(ln-16-len(d))
+    print(" ".join(sorted({x["Properties"]["SerialNumber"] for x in plistlib.loads(d).get("DeviceList",[]) if x["Properties"].get("ConnectionType")=="USB"})))
+except Exception: pass
+PY
+}
+
+# WARP breaks the CoreDevice tunnel xcodebuild needs to install AND keep WDA
+# alive (hardware-verified: the runner dies "connection was invalidated" the
+# moment WARP reconnects). This was the #1 cause of the whole "Device is busy /
+# Waiting for developer services" nightmare. Detect it up front.
+WARP_WAS_ON=0
+_warp_on() { command -v warp-cli >/dev/null 2>&1 && warp-cli status 2>/dev/null | grep -qi "Connected"; }
+_warp_restore() { [ "$WARP_WAS_ON" = 1 ] && { warn "restoring WARP ..."; warp-cli connect >/dev/null 2>&1 || true; }; }
+_warp_check() {
+    _warp_on || return 0
+    if [ "${WDA_AUTO_WARP:-0}" = 1 ]; then
+        warn "WARP is on -> temporarily disconnecting for the build (breaks CoreDevice); will restore on exit."
+        WARP_WAS_ON=1; trap _warp_restore EXIT INT TERM
+        warp-cli disconnect >/dev/null 2>&1 || true; sleep 3
+    else
+        _setstatus prereq warp "WARP is connected and breaks CoreDevice"
+        die "WARP is ON and will block WDA (the CoreDevice tunnel dies, taking the runner with it).
+   Fix ONE of:
+     - warp-cli disconnect            (reconnect after; or set WDA_AUTO_WARP=1 to auto-toggle)
+     - ask your Zero-Trust admin to EXCLUDE the device tunnel (fe80::/10) from WARP
+   See docs/wda-setup.html pitfall (WARP). This is the #1 reason WDA 'just won't start'."
+    fi
+}
+
+# One-shot preflight: report the FIRST blocker as a checklist instead of a blind
+# wait loop.  `setup-wda.sh doctor`
+cmd_doctor() {
+    info "WDA preflight"
+    local fail=0
+    if xcode-select -p >/dev/null 2>&1; then ok "Xcode: $(xcodebuild -version 2>/dev/null | head -1)"; else warn "X Xcode CLT missing (xcode-select --install)"; fail=1; fi
+    local t="${WDA_TEAM_ID:-$(defaults read com.apple.dt.Xcode IDEProvisioningTeamManagerLastSelectedTeamID 2>/dev/null || true)}"
+    [ -n "$t" ] && ok "Dev team: $t" || { warn "X no dev team (Xcode -> Settings -> Accounts, or WDA_TEAM_ID=)"; fail=1; }
+    if _warp_on; then warn "X WARP is CONNECTED -> breaks CoreDevice. warp-cli disconnect (or WDA_AUTO_WARP=1)"; fail=1; else ok "WARP: off / not present"; fi
+    local usb; usb="$(_usb_udids)"
+    [ -n "$usb" ] && ok "iPhone on USB: $usb" || warn "~ no iPhone on USB (Wi-Fi-only often will not mount the DDI -> plug in a cable)"
+    if command -v iproxy >/dev/null 2>&1 || command -v socat >/dev/null 2>&1; then ok "relay tool present"; else warn "X need iproxy or socat: brew install libimobiledevice"; fail=1; fi
+    curl -s -m 4 "http://127.0.0.1:$WDA_PORT/status" >/dev/null 2>&1 && ok "WDA already serving on 127.0.0.1:$WDA_PORT"
+    [ $fail = 0 ] && ok "preflight clean -- setup should succeed" || warn "fix the X items above, then re-run"
+    return $fail
+}
+
 _kill_pidfile() {
     local f="$1"
     if [ -f "$f" ]; then
@@ -96,12 +162,15 @@ cmd_status() {
 case "${1:-setup}" in
     stop)   cmd_stop;   exit 0 ;;
     status) cmd_status; exit 0 ;;
+    doctor) cmd_doctor; exit $? ;;
     setup)  ;;
-    *) die "unknown command: $1 (use: setup|status|stop)" ;;
+    *) die "unknown command: $1 (use: setup|status|stop|doctor)" ;;
 esac
 
 # ── 0. Prereqs ────────────────────────────────────────────────────────────────
+_setstatus prereq "" "checking prerequisites"
 info "Checking prerequisites"
+_warp_check   # hard-stops (or auto-toggles) if WARP is on — the #1 blocker
 xcode-select -p >/dev/null 2>&1 || die "Xcode not installed (xcode-select -p failed)"
 ok "Xcode: $(xcodebuild -version | head -1)"
 
@@ -112,6 +181,16 @@ ok "Team: $TEAM_ID"
 
 # ── 1. Resolve device ─────────────────────────────────────────────────────────
 info "Resolving target device"
+# Prefer the iPhone physically on USB — with several paired phones, auto-detect
+# otherwise grabs the first -showdestinations hit, which is often a dead one.
+if [ -z "${WDA_UDID:-}" ]; then
+    _USB="$(_usb_udids)"
+    if [ "$(printf '%s' "$_USB" | wc -w)" = 1 ]; then
+        WDA_UDID="$_USB"; ok "using USB-connected iPhone: $WDA_UDID"
+    elif [ -n "$_USB" ]; then
+        warn "multiple iPhones on USB ($_USB) — set WDA_UDID=<one> to disambiguate"
+    fi
+fi
 if [ -z "${WDA_UDID:-}" ]; then
     # Pitfall: xcodebuild needs the classic UDID (00008…), NOT the CoreDevice
     # UUID that `devicectl list devices` shows. -showdestinations prints the
@@ -152,6 +231,7 @@ fi
 # ── 3. Wait for dev services (DDI) ────────────────────────────────────────────
 # Pitfall: 'Developer Disk Image is not mounted' usually means the phone is
 # LOCKED or just-connected — not an Xcode version problem. Keep it unlocked.
+_setstatus ddi-wait usb "waiting for developer services — unlock + USB"
 info "Waiting for developer services (UNLOCK the iPhone, keep it awake, and plug it in via USB)"
 DEV_UUID="$(_devicectl_t 8 list devices | awk -v u="$WDA_UDID" 'NR>2 {print $(NF-2)}' | head -1 || true)"
 TRIES=0
@@ -164,12 +244,15 @@ until _devicectl_t 10 device info details --device "$WDA_UDID" | grep -q "ddiSer
         warn "keep it unlocked + awake, then re-run. Devices the Mac currently sees:"
         _devicectl_t 8 list devices | sed 's/^/    /' >&2 || true
         warn "If the wrong phone was picked, re-run with WDA_UDID=<classic-udid>."
-        die "developer services not available (docs/wda-setup.html pitfall ①)"
+        warn "If WARP/any VPN is on, it WILL keep the tunnel in 'connecting' — turn it off."
+        _setstatus ddi-fail ddi "developer services never became available"
+        die "developer services not available (docs/wda-setup.html pitfall ①; check WARP/USB)"
     fi
     [ $((TRIES % 8)) -eq 1 ] && warn "still waiting — UNLOCK the phone, keep the screen on, and plug in USB ..."
     sleep 4
 done
 ok "Developer Disk Image mounted"
+_setstatus building "" "building + launching WDA"
 
 # ── 4. Build + run WDA (stays running; this is the server) ───────────────────
 # Pitfall: PRODUCT_NAME must NOT be overridden (it renames WebDriverAgentLib
@@ -197,6 +280,7 @@ while [ -z "$PHONE_URL" ]; do
     TRIES=$((TRIES+1))
     [ $TRIES -gt 120 ] && die "timed out waiting for WDA to start — check $RUN_LOG"
     if grep -q "not trusted" "$RUN_LOG" 2>/dev/null; then
+        _setstatus trust trust "trust the Apple Development cert on the iPhone"
         die "Developer cert not trusted. On the iPhone: 设置 → 通用 → VPN与设备管理 → 信任 'Apple Development: …', then re-run. (pitfall ②)"
     fi
     if grep -q "device is locked\|Unlock iPhone" "$RUN_LOG" 2>/dev/null; then
@@ -206,6 +290,7 @@ while [ -z "$PHONE_URL" ]; do
     [ -z "$PHONE_URL" ] && sleep 3
 done
 ok "WDA serving at $PHONE_URL"
+_setstatus serving "" "WDA serving — starting relay"
 
 # ── 5. Localhost relay ────────────────────────────────────────────────────────
 # Pitfall (macOS 15+/26): the daemon is a background LaunchAgent and macOS
@@ -216,7 +301,7 @@ info "Starting localhost relay on 127.0.0.1:$WDA_PORT"
 _kill_pidfile "$RELAY_PID_FILE"
 PHONE_HOSTPORT="${PHONE_URL#http://}"; PHONE_HOSTPORT="${PHONE_HOSTPORT%/}"
 PHONE_IP="${PHONE_HOSTPORT%%:*}"; PHONE_WDA_PORT="${PHONE_HOSTPORT##*:}"
-if command -v iproxy >/dev/null && idevice_id -l 2>/dev/null | grep -q "$WDA_UDID"; then
+if command -v iproxy >/dev/null && _usb_udids | grep -q "$WDA_UDID"; then
     nohup iproxy "$WDA_PORT" "$PHONE_WDA_PORT" -u "$WDA_UDID" > "$STATE_DIR/wda-relay.log" 2>&1 &
     echo $! > "$RELAY_PID_FILE"
     ok "iproxy (USB) relay pid $(cat "$RELAY_PID_FILE")"
@@ -260,6 +345,7 @@ else
     printf '    PHONE_REMOTE_WDA_URL=http://127.0.0.1:%s ... iphone-use serve\n' "$WDA_PORT"
 fi
 
+_setstatus ready "" "WDA up and relayed"
 printf '\n%s\n' "${BOLD}━━━ L2 element layer ready ━━━${RST}"
 printf '  WDA       : %s (on-phone), http://127.0.0.1:%s (relay)\n' "$PHONE_URL" "$WDA_PORT"
 printf '  Try       : curl -H "Authorization: Bearer \$PW" http://127.0.0.1:44321/agent/elements\n'

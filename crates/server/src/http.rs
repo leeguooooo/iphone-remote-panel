@@ -644,14 +644,47 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     } else {
         ""
     };
+    // Setup progress: `setup-wda.sh` writes ~/.iphone-use/wda-setup-status.json
+    // ({phase, blocked_on, message, ts}) as it runs. Surface `setup_blocked_on`
+    // so a caller (or POST /agent/mode) knows WHY a WDA bring-up is stuck —
+    // "warp" | "usb" | "trust" | "ddi" | "" — instead of polling wda:false
+    // blind. Only honored while fresh (< 5 min) so a stale file isn't reported.
+    let setup_blocked_on = read_setup_blocked_on();
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     with_security_headers(resp)
+}
+
+/// Read `blocked_on` from `setup-wda.sh`'s status file, but only if it was
+/// written in the last 5 minutes (a stale file from a finished run shouldn't be
+/// reported as a live blocker). Returns "" when absent/stale/unparseable —
+/// best-effort, never errors.
+fn read_setup_blocked_on() -> String {
+    let path = match std::env::var("HOME") {
+        Ok(h) => format!("{h}/.iphone-use/wda-setup-status.json"),
+        Err(_) => return String::new(),
+    };
+    let txt = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+    if now_secs().saturating_sub(ts) > 300 {
+        return String::new();
+    }
+    v.get("blocked_on")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// `POST /agent/mode` — switch between the two (mutually exclusive) control
@@ -676,19 +709,33 @@ async fn agent_mode(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => return with_security_headers(
-            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-        ),
-        AgentAuth::Denied => return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        ),
-        AgentAuth::Ok => {}
+    // Cookie OR bearer (same gate as screenshot/status) so the web client's
+    // "Reconnect" button can drive the mode switch without the agent token.
+    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
+    if !cookie_ok {
+        match agent_auth(&state, &headers) {
+            AgentAuth::Locked => return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            ),
+            AgentAuth::Denied => return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            ),
+            AgentAuth::Ok => {}
+        }
     }
-    let mode = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let mode = parsed
+        .as_ref()
         .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
         .unwrap_or_default();
+    // Optional target UDID — drive a SPECIFIC paired phone (not just the
+    // Mirroring one). Passed to setup-wda.sh as WDA_UDID. Sanitized to the
+    // hex/dash charset so it can't inject into the spawned shell command.
+    let udid = parsed
+        .as_ref()
+        .and_then(|v| v.get("udid").and_then(|u| u.as_str()))
+        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .map(String::from);
     let home = std::env::var("HOME").unwrap_or_default();
     let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
     match mode.as_str() {
@@ -775,11 +822,20 @@ async fn agent_mode(
                 );
             }
             // Detached: the runner takes ~30-90s (xcodebuild). Log to a file
-            // the operator can tail.
+            // the operator can tail. An explicit `udid` (sanitized above) is
+            // exported as WDA_UDID so a second, non-Mirroring phone can be the
+            // target. NOTE: setup-wda.sh hard-stops if WARP is on (it kills
+            // CoreDevice) — we deliberately do NOT auto-disconnect the user's
+            // WARP/office VPN from here; the block surfaces as
+            // status.setup_blocked_on="warp" for the caller to act on.
             let log = format!("{home}/.iphone-use/wda-mode-switch.log");
+            let udid_env = match &udid {
+                Some(u) => format!("WDA_UDID='{u}' "),
+                None => String::new(),
+            };
             let spawned = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(format!("nohup bash '{setup_sh}' > '{log}' 2>&1 &"))
+                .arg(format!("{udid_env}nohup bash '{setup_sh}' > '{log}' 2>&1 &"))
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -1094,6 +1150,24 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
                 (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
             ),
             AgentAuth::Ok => {}
+        }
+    }
+    // Prefer the WDA on-device capture whenever WDA is configured. In agent mode
+    // the Mirroring window only shows the "iPhone in Use" interstitial (WDA
+    // monopolizes the device), and when WDA targets a *second* phone the mirror
+    // is a different device entirely — so the L3 mirror bytes would be the WRONG
+    // screen. WDA bytes are always the actual target phone. Falls through to the
+    // L3 mirror capture when WDA is absent or its runner is down (the failed
+    // call doubles as the liveness check, so no extra /status round-trip).
+    if let Some(wda) = &state.wda {
+        if let Ok(bytes) = wda.lock().await.screenshot_png().await {
+            if is_valid_png(&bytes) {
+                let resp = Response::builder()
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return with_security_headers(resp);
+            }
         }
     }
     let png = tokio::task::spawn_blocking(core::capture::screenshot_mirroring_png).await;

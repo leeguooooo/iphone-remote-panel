@@ -60,11 +60,12 @@
 <h2>一键安装(推荐)</h2>
 <pre><code># 前置:Xcode 已装且登录了 Apple ID(Settings → Accounts);
 #       手机已配对、开发者模式已开;brew install socat(或 libimobiledevice)
+./scripts/setup-wda.sh doctor    # ★ 先跑这个:一行行检查 WARP/USB/证书,告诉你卡在哪
 ./scripts/setup-wda.sh           # 编译装机 → 守护运行 → localhost 中继 → 配置 daemon
 ./scripts/setup-wda.sh status    # 看 WDA + 中继状态
 ./scripts/setup-wda.sh stop      # 停掉
 </code></pre>
-<p>脚本把本页所有坑都编码进去了:等 DDI 挂载会提示你解锁、撞到证书信任会给出指路、自动选 iproxy(USB)或 socat(Wi-Fi)做 localhost 中继、最后自动把 <code>PHONE_REMOTE_WDA_URL</code> 写进 daemon 的 LaunchAgent 并重启。完成后 daemon 的 agent API 自动启用 L2 路由(见下方「统一 API」)。</p>
+<p><strong>装不上先跑 <code>doctor</code></strong> —— 它按顺序检查 Xcode/开发团队/<strong>WARP</strong>/USB 设备/中继工具,直接指出第一个拦路项,不用再盯着「转圈等待」猜。脚本本身也把本页所有坑都编码进去了:开机先验 WARP(<strong>#1 杀手</strong>)、等 DDI 挂载会提示你解锁、撞到证书信任会给出指路、自动优先选 USB 上的手机、自动选 iproxy(USB)或 socat(Wi-Fi)做 localhost 中继、最后把 <code>PHONE_REMOTE_WDA_URL</code> 写进 daemon 的 LaunchAgent。整个过程把结构化进度写进 <code>~/.iphone-use/wda-setup-status.json</code>,daemon 的 <code>/agent/status</code> 用 <code>setup_blocked_on</code> 字段透出来(<code>warp|usb|trust|ddi</code>),所以 <code>POST /agent/mode {"mode":"agent"}</code> 卡住时你一眼知道为什么。</p>
 
 <h2>前置条件</h2>
 <ul>
@@ -158,6 +159,30 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   <p>切换方式(推荐用 API,一条龙全自动):<code>POST /agent/mode {"mode":"mirror"}</code>(WDA 锁屏 → 停 runner → 激活镜像 → 自动点 Try Again,约 10 秒)/
   <code>{"mode":"agent"}</code>(后台拉起 runner;若手机锁着需人解锁一次,launcher 会等)。命令行等价:<code>scripts/setup-wda.sh</code> / <code>scripts/setup-wda.sh stop</code>。
   排障速记:<strong>镜像怎么也连不上时,第一反应查 WDA 是否在跑</strong>(<code>curl http://127.0.0.1:8100/status</code>)。</p>
+</div>
+
+<div class="pit">
+  <h3>⑩ WARP / 任何 VPN 会卡死 CoreDevice 设备隧道 → WDA 根本装不上 <span class="tag block">#1 头号坑(真因)</span></h3>
+  <p>这是花了<strong>整整一晚</strong>才揪出来的真凶。症状极具迷惑性:<code>xcodebuild</code> 永远
+  <code>Device is busy (Connecting to iPhone)</code>、<code>devicectl device info details</code> 永久挂起、
+  设备隧道死在 <code>connecting</code> 不肯到 <code>available</code>。试遍重插 USB、kickstart usbd/usbmuxd/remoted、
+  重启手机、<strong>甚至重启 Mac</strong> 全都没用。</p>
+  <p><strong>真因 = Cloudflare WARP(或任何 VPN)</strong>:iOS 17+ 的 CoreDevice 靠一条网络隧道(RSD/utun)连真机
+  ——<strong>哪怕走 USB 也要建虚拟网络接口</strong>,WARP 劫持路由把它卡死。实锤:<code>warp-cli disconnect</code> 后
+  <strong>24 秒</strong>设备就从 connecting → available,xcodebuild 立刻能装。而且 <code>xcodebuild test</code> 的
+  XCUITest 会话<strong>全程</strong>要靠 CoreDevice 维持 runner 存活,所以 WARP 一旦重连,runner 当场死
+  (<code>Testing failed: The connection was invalidated</code>)。</p>
+  <p><strong>解法:</strong></p>
+  <ul>
+    <li><strong>临时</strong>:装机 + 运行期间 <code>warp-cli disconnect</code>。注意若组织策略是 <code>Always On: true</code>,
+    disconnect 会被自动重连——这时得用下面的永久解。<code>setup-wda.sh</code> 开机即检测 WARP,
+    on 就硬停并指路(或 <code>WDA_AUTO_WARP=1</code> 自动断开-恢复)。</li>
+    <li><strong>永久(推荐)</strong>:让 Zero Trust 管理员在 WARP 设备配置的 Split Tunnels <strong>排除列表</strong>里
+    加上 <strong>CoreDevice 设备隧道的 IPv6 段</strong>(<code>fe80::/10</code> 链路本地 + 设备 RSD ULA),
+    这样 CoreDevice 不走 WARP,WDA 就能在 WARP 开着时跑——真正做到「办公 VPN + 操作手机」两不误。</li>
+  </ul>
+  <p>排障速记:<strong>WDA / 真机装不上,第一反应 <code>warp-cli status</code>,Connected 就先 disconnect 再试</strong>
+  ——或直接 <code>setup-wda.sh doctor</code> 让它告诉你。</p>
 </div>
 
 <h2>已验证(iPhone 17 / iOS 27 真机,2026-06-11)</h2>

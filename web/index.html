@@ -306,6 +306,13 @@
       opacity: 0;
     }
     #offlineOverlay.visible { opacity: 1; }
+    #reconnectBtn {
+      margin-top: 14px; padding: .5rem 1.3rem; border-radius: 99px; cursor: pointer;
+      border: 1px solid rgba(99,102,241,.55); background: rgba(99,102,241,.18);
+      color: #c7d2fe; font-size: 13px; pointer-events: auto; transition: background .15s;
+    }
+    #reconnectBtn:hover { background: rgba(99,102,241,.32); }
+    #reconnectBtn:disabled { opacity: .5; cursor: default; }
     #offlineOverlay .ol-icon  { font-size: 36px; line-height: 1; }
     #offlineOverlay .ol-title {
       font-family: var(--sans); font-size: 16px; font-weight: 600;
@@ -376,6 +383,7 @@
       <div class="ol-icon">📵</div>
       <div class="ol-title" id="olTitle">画面已停止</div>
       <div class="ol-sub"  id="olSub">手机可能已锁屏、断开或镜像已暂停</div>
+      <button id="reconnectBtn" type="button">重新连接</button>
     </div>
 
     <!-- floating status pill -->
@@ -479,6 +487,22 @@ const statusLine     = document.getElementById('statusLine');
 const toastEl        = document.getElementById('toast');
 const textInput      = document.getElementById('textInput');
 const offlineOverlay = document.getElementById('offlineOverlay');
+const reconnectBtn = document.getElementById('reconnectBtn');
+if (reconnectBtn) reconnectBtn.onclick = async () => {
+  reconnectBtn.disabled = true;
+  const orig = reconnectBtn.textContent;
+  reconnectBtn.textContent = '连接中…';
+  try {
+    // mode=mirror runs the full server-side recovery (lock phone, stop any WDA,
+    // bring Mirroring frontmost, tap Try Again). One click, no blind tapping.
+    await fetch('/agent/mode', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'mirror' }),
+    });
+  } catch (_) { /* best-effort */ }
+  setTimeout(() => { reconnectBtn.disabled = false; reconnectBtn.textContent = orig; }, 12000);
+};
 const olTitle        = document.getElementById('olTitle');
 const olSub          = document.getElementById('olSub');
 
