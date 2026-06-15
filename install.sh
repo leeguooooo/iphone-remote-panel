@@ -126,21 +126,38 @@ info "Removing quarantine attribute ..."
 xattr -dr com.apple.quarantine "$APP_SRC" 2>/dev/null || true
 ok "Quarantine cleared"
 
-# ── Step 3 — Sign locally if not already signed with a stable identity ────────
-SIGNED_ID="$(codesign --display --verbose=4 "$APP_SRC" 2>&1 \
-             | grep 'Identifier=' | head -1 \
-             | sed 's/.*Identifier=\(.*\)/\1/' || true)"
+# ── Step 3 — Sign with a STABLE identity so TCC grants survive updates ────────
+# TCC (Screen Recording / Accessibility) grants are keyed to the code
+# signature's Designated Requirement. An AD-HOC signature — what a GitHub-release
+# .app ships with and what `codesign -s -` produces — changes its cdhash on
+# every build, so TCC would silently DROP on every update (the user re-grants
+# each time; a real reported pain). A stable self-signed leaf cert keeps the DR
+# constant, so a one-time grant persists across all future updates. So we re-sign
+# with scripts/sign.sh whenever the app isn't ALREADY carrying that stable
+# identity — matching on bundle-id alone was the bug (an ad-hoc sig has the right
+# bundle-id yet still resets TCC).
+STABLE_AUTHORITY="iPhoneUse Local Signing"
+CUR_AUTHORITY="$(codesign -dvv "$APP_SRC" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
 
-if [ "$SIGNED_ID" = "$BUNDLE_ID" ]; then
-    ok "Already signed with bundle-id: $BUNDLE_ID"
+if [ "$CUR_AUTHORITY" = "$STABLE_AUTHORITY" ]; then
+    ok "Already signed with the stable identity ('$STABLE_AUTHORITY') — TCC will persist."
 else
-    warn "App is unsigned or has a different bundle-id ('$SIGNED_ID'). Signing locally ..."
+    info "Signing with the stable identity (so TCC survives updates) ..."
     SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo ".")"
     SIGN_SH="$SCRIPT_DIR/scripts/sign.sh"
+    if [ ! -f "$SIGN_SH" ] && command -v curl >/dev/null 2>&1; then
+        # `curl … | sh` path: no local checkout, so fetch the signer from the
+        # repo. Without this we'd fall back to ad-hoc and reset TCC every update.
+        SIGN_SH_DL="$(mktemp)"
+        if curl -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/sign.sh" -o "$SIGN_SH_DL" 2>/dev/null \
+           && [ -s "$SIGN_SH_DL" ]; then
+            SIGN_SH="$SIGN_SH_DL"
+        fi
+    fi
     if [ -f "$SIGN_SH" ]; then
         bash "$SIGN_SH" "$APP_SRC"
     else
-        warn "scripts/sign.sh not found; attempting inline self-signed codesign ..."
+        warn "scripts/sign.sh unavailable; falling back to ad-hoc (TCC WILL reset on each update)."
         _inline_sign "$APP_SRC"
     fi
 fi

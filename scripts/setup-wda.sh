@@ -97,7 +97,9 @@ PY
 # moment WARP reconnects). This was the #1 cause of the whole "Device is busy /
 # Waiting for developer services" nightmare. Detect it up front.
 WARP_WAS_ON=0
-_warp_on() { command -v warp-cli >/dev/null 2>&1 && warp-cli status 2>/dev/null | grep -qi "Connected"; }
+# -w (whole word): plain "Connected" also matches "Dis-Connected" as a substring,
+# which mis-read WARP-off as WARP-on and blocked WDA for no reason (user-reported).
+_warp_on() { command -v warp-cli >/dev/null 2>&1 && warp-cli status 2>/dev/null | grep -qiw "Connected"; }
 _warp_restore() { [ "$WARP_WAS_ON" = 1 ] && { warn "restoring WARP ..."; warp-cli connect >/dev/null 2>&1 || true; }; }
 _warp_check() {
     _warp_on || return 0
