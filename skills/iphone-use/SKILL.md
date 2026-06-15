@@ -51,7 +51,7 @@ act now" signal (WDA is up, or the mirror is showing live content).
 | Call | Purpose |
 |---|---|
 | `GET /agent/status` | `{ok, phone_target, wda, drivable, mirror_state, hint, mode, viewer_count, …}` — gate on **`drivable`**; `wda:true` unlocks the element layer below |
-| `GET /agent/elements` | **(wda) The UI as text**: `{"elements":[{kind,label,rect,depth},…]}` — prefer this over screenshots |
+| `GET /agent/elements` | **(wda) The UI as text**: `{"elements":[{kind,label,rect,depth,value?},…]}` — prefer this over screenshots. `value` carries a Switch's `"0"/"1"`, a Slider fraction, a PickerWheel's current option (issue #20) so you can drive toggles/pickers without vision |
 | `GET /agent/screenshot` | Current phone screen as PNG (falls back to on-device capture when Mirroring is gone) |
 | `POST /agent/input` | One action (JSON body, below) |
 
@@ -90,12 +90,13 @@ Hard-won facts (hardware-validated — trust these):
 
 - **Scroll**: `dy < 0` scrolls content up (reveals what's below). A swipe is a
   scroll, NOT a drag — drags are for sliders/reorder via `longpress`+`up`.
-- **Text routing depends on `wda`.** With `wda:true`, `{"type":"text"}` goes
-  through the on-phone element layer and **any Unicode (incl. CJK) lands
-  cleanly** — just make sure a text field has focus. Without WDA it falls back
-  to US keycodes: a Chinese/Pinyin IME then eats digits as candidate-selectors
-  (`a1b2c3` → `啊不c3`) — switch the phone to the English ABC keyboard for
-  literal ASCII, and don't attempt CJK at all.
+- **Text input** — focus a field first, then `{"type":"text"}`. With `wda:true`
+  it goes through the on-phone element layer (cleanest). Without WDA the daemon
+  now pastes via the clipboard by default (issue #15), so **plain ASCII (IPs,
+  ports, search terms) and CJK both land reliably** through the mirror too — the
+  old "Mirroring drops keycodes / Pinyin IME eats digits" failure is gone, and
+  the Mac clipboard is saved+restored so yours isn't clobbered. (Set
+  `PHONE_REMOTE_TEXT_KEYCODE=1` to force the legacy char-by-char keycode path.)
 - **WDA and iPhone Mirroring are mutually exclusive** (A/B-tested on hardware):
   the on-phone XCUITest runner monopolizes the device's remote session, so
   while `wda:true` the Mirroring window shows "Connection Interrupted" and the

@@ -642,7 +642,18 @@ impl EventSink for CgEventSink {
         //   NOTE: the Mac clipboard is clobbered; not restored (acceptable trade-off;
         //   clipboard restore is left as a future enhancement).
         //   Hardware validation pending (targets the Pinyin digit-hijack in issue #10).
-        if needs_clipboard_paste(s) {
+        // iPhone Mirroring forwards synthetic keycodes UNRELIABLY — issue #15:
+        // even plain ASCII (an IP, a port) sometimes never lands. Clipboard
+        // paste (real Cmd+V) is the one input method Mirroring accepts
+        // dependably, so it is the DEFAULT for all text on this L3 path, and it
+        // is now non-destructive (the Mac clipboard is saved + restored around
+        // the paste). When WDA is up the daemon types via WDA's clean on-device
+        // path and never reaches here. `PHONE_REMOTE_TEXT_KEYCODE=1` forces the
+        // legacy char-by-char keycode path (still needed for CJK, which has no
+        // US keycodes and always goes clipboard regardless).
+        let force_keycode =
+            std::env::var("PHONE_REMOTE_TEXT_KEYCODE").is_ok_and(|v| v == "1");
+        if !s.is_empty() && (!force_keycode || needs_clipboard_paste(s)) {
             self.text_via_clipboard(s);
             return;
         }
@@ -808,6 +819,15 @@ impl CgEventSink {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
+        // 0. Save the current clipboard so the paste is non-destructive — the
+        // user's clipboard is theirs, and an agent typing should not clobber it.
+        // pbpaste captures TEXT only (image/file clipboards aren't preserved —
+        // an acceptable edge), empty string if the clipboard is empty/non-text.
+        let saved = Command::new("/usr/bin/pbpaste")
+            .output()
+            .ok()
+            .map(|o| o.stdout);
+
         // 1. Write to clipboard via pbcopy
         match Command::new("/usr/bin/pbcopy")
             .stdin(Stdio::piped())
@@ -884,6 +904,19 @@ impl CgEventSink {
             Err(e) => eprintln!("text_via_clipboard: {e}; skipping cmd-up"),
         }
         gap();
+
+        // 4. Restore the saved clipboard. Wait for the paste to be consumed by
+        // the phone first (the Cmd+V is async over the Mirroring boundary), then
+        // put the user's original content back via pbcopy.
+        if let Some(prev) = saved {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            if let Ok(mut child) = Command::new("/usr/bin/pbcopy").stdin(Stdio::piped()).spawn() {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(&prev);
+                }
+                let _ = child.wait();
+            }
+        }
     }
 }
 

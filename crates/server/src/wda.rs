@@ -391,15 +391,22 @@ pub struct ElementRow {
     pub rect: [f64; 4],
     /// Tree depth (purely presentational).
     pub depth: u32,
+    /// Current value/state, when the element has one (issue #20): a Switch's
+    /// `"0"`/`"1"`, a Slider's fraction, a PickerWheel's selected option, a
+    /// TextField's current text. `None` for elements without a value (most
+    /// Buttons/Cells) so the JSON stays lean. This is what makes pickers /
+    /// switches / sliders drivable without vision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Recursively flatten a WDA `/source?format=json` tree, keeping only rows an
 /// agent can act on or learn from: anything with a non-empty label, or an
 /// interactive type. Order is document order (roughly top-to-bottom).
 fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>) {
-    const INTERACTIVE: [&str; 8] = [
+    const INTERACTIVE: [&str; 11] = [
         "Button", "Cell", "TextField", "SecureTextField", "SearchField", "Switch", "Slider",
-        "TextView",
+        "TextView", "PickerWheel", "Picker", "Stepper",
     ];
     let kind = node
         .get("type")
@@ -417,11 +424,21 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
     if !label.is_empty() || INTERACTIVE.contains(&kind.as_str()) {
         let r = node.get("rect").cloned().unwrap_or_default();
         let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // Current value/state (issue #20). WDA reports `value` as a string
+        // ("1"/"0" for a Switch), a number (Slider fraction), or a bool —
+        // normalize to a non-empty string, else None.
+        let value = node.get("value").and_then(|v| match v {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        });
         out.push(ElementRow {
             kind,
             label,
             rect: [g("x"), g("y"), g("width"), g("height")],
             depth,
+            value,
         });
     }
     if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
@@ -537,5 +554,38 @@ mod tests {
         assert_eq!(rows[0].label, "新备忘录");
         assert_eq!(rows[0].rect, [369.0, 885.0, 38.0, 38.0]);
         assert_eq!(rows[1].label, "你好世界");
+        // Plain button has no value
+        assert_eq!(rows[0].value, None);
+    }
+
+    #[test]
+    fn flatten_captures_value_for_switch_slider_picker() {
+        // issue #20: switches/sliders/pickers must carry their value/state so an
+        // agent can drive them without vision. Includes a value-bearing element
+        // with NO label (a Switch) to prove INTERACTIVE inclusion + value.
+        let tree: serde_json::Value = serde_json::from_str(
+            r#"{
+              "type":"XCUIElementTypeApplication","label":"",
+              "children":[
+                {"type":"XCUIElementTypeSwitch","label":"Wi-Fi","value":"1",
+                 "rect":{"x":300,"y":100,"width":51,"height":31}},
+                {"type":"XCUIElementTypeSwitch","label":"","value":0,
+                 "rect":{"x":300,"y":160,"width":51,"height":31}},
+                {"type":"XCUIElementTypeSlider","label":"亮度","value":"45%",
+                 "rect":{"x":20,"y":200,"width":380,"height":30}},
+                {"type":"XCUIElementTypePickerWheel","label":"","value":"March",
+                 "rect":{"x":40,"y":300,"width":120,"height":200}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        flatten_tree(&tree, 0, &mut rows);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].value.as_deref(), Some("1")); // string switch
+        assert_eq!(rows[1].kind, "Switch"); // unlabeled but interactive → kept
+        assert_eq!(rows[1].value.as_deref(), Some("0")); // numeric → "0"
+        assert_eq!(rows[2].value.as_deref(), Some("45%")); // slider
+        assert_eq!(rows[3].value.as_deref(), Some("March")); // picker wheel
     }
 }
