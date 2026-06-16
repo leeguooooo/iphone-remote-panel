@@ -596,7 +596,11 @@ async function pollAgentMode() {
     agentMode = (s.mode === 'agent');
     if (agentMode) {
       startStills();                          // MJPEG (WDA device) overlays the WebRTC track
-      if (overlayState === 'gone') hideOverlay(); // the mirror is meant to be gone — no overlay
+      // The MJPEG <img> needs no autoplay gesture, and it's per-viewer (independent
+      // of the WebRTC single-viewer lease). So the "轻触以开始" play gesture and the
+      // "会话占用中"(queued)/mirror-gone overlays would all wrongly block a live picture.
+      playOverlay.classList.add('hidden');
+      if (overlayState === 'gone' || overlayState === 'queued') hideOverlay();
     } else {
       stopStills();                           // mirror mode → show the WebRTC video
     }
@@ -1035,7 +1039,9 @@ async function connectWs() {
     }
     else if (msg.type === 'session_status') {
       // issue #8 (queue + notify): another viewer holds the live session.
-      if (msg.state === 'queued') { queuedAhead = msg.ahead || 0; showOverlay('queued'); }
+      // In agent mode video is MJPEG (per-viewer, no single-viewer lease), so a
+      // queued WebRTC session must NOT block the picture.
+      if (msg.state === 'queued') { queuedAhead = msg.ahead || 0; if (!agentMode) showOverlay('queued'); }
       else if (msg.state === 'active') { if (overlayState === 'queued') hideOverlay(); }
     }
   };
@@ -1205,7 +1211,7 @@ video.addEventListener('emptied', () => { _stopStallWatch(); _stopStallChecker()
 /* ── Boot ─────────────────────────────────────────────────────── */
 document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
 document.addEventListener('contextmenu', e => e.preventDefault());
-video.addEventListener('pause', () => { if (!frozen) playOverlay.classList.remove('hidden'); });
+video.addEventListener('pause', () => { if (!frozen && !agentMode) playOverlay.classList.remove('hidden'); });
 video.addEventListener('playing', () => { playOverlay.classList.add('hidden'); });
 video.addEventListener('stalled', tryPlay);
 video.addEventListener('waiting', tryPlay);
