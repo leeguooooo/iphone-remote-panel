@@ -566,10 +566,20 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     let phone_target = core::capture::find_mirroring_geometry().is_ok();
     #[cfg(not(target_os = "macos"))]
     let phone_target = false;
-    // L2 liveness: configured AND answering /status right now.
-    let wda = match &state.wda {
-        Some(w) => w.lock().await.is_up().await,
-        None => false,
+    // L2 health — action-level, not just /status (which lies: it reports
+    // `ready` even when every UI action fails Code=41 because the phone is
+    // locked or the test session was severed). `wda` stays "runner reachable"
+    // for back-compat; `wda_actionable` is the honest "can it act right now".
+    let health = match &state.wda {
+        Some(w) => w.lock().await.probe_health().await,
+        None => crate::wda::WdaHealth::down(),
+    };
+    let wda = health.up;
+    let wda_actionable = health.actionable;
+    let wda_locked = match health.locked {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
     };
     // Derived mode (see `agent_mode`): WDA up wins — while the on-phone
     // XCUITest runner is alive, Mirroring CANNOT connect (hardware-verified
@@ -587,7 +597,10 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // honest "can an agent act right now" signal: WDA always can (on-device);
     // the mirror path can only when the window isn't paused.
     let (mirror_state, drivable) = if wda {
-        ("active", true) // WDA injects on-device regardless of the mirror window
+        // WDA injects on-device regardless of the mirror window — but only if
+        // it can actually act. A "zombie ready" runner (locked / severed) is up
+        // yet undrivable, so gate drivable on the action-level probe.
+        ("active", wda_actionable)
     } else if phone_target {
         let s = mirror_state_cached(&state).await;
         (s.as_str(), s.drivable())
@@ -621,7 +634,16 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // When not drivable, tell the caller HOW to recover (the recovery differs by
     // state, and auto-recovery is blocked by macOS while the phone is in use).
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
-    let hint = if !drivable {
+    let hint = if wda && !wda_actionable {
+        // "Zombie ready": runner answers /status but UI actions fail Code=41.
+        // Almost always the phone is locked/asleep; otherwise the test session
+        // was severed (sleep / WARP toggle / CoreDevice tunnel).
+        if wda_locked == "true" {
+            "WDA is up but the phone is LOCKED — XCUITest cannot act on a locked screen (every action fails Code=41). Unlock the phone and keep it awake (set Auto-Lock to Never for long agent sessions)."
+        } else {
+            "WDA answers /status but cannot perform UI actions (Code=41) — the test session was severed (phone sleep / WARP toggle / CoreDevice tunnel), a 'zombie ready' runner. Restart WDA via POST /agent/mode mode=agent (with the phone unlocked and awake)."
+        }
+    } else if !drivable {
         match mirror_state {
             "paused" => "Mirroring needs reconnecting (paused / interrupted / timed out) — tap the Resume/Connect/Try Again button (x=0.5, y=0.64), once, then wait 45s+; do NOT loop",
             "in_use" => "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
@@ -651,7 +673,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // blind. Only honored while fresh (< 5 min) so a stale file isn't reported.
     let setup_blocked_on = read_setup_blocked_on();
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")

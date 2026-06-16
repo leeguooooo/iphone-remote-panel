@@ -49,6 +49,55 @@ impl WdaClient {
         }
     }
 
+    /// Device screen lock state (`GET /wda/locked`). XCUITest cannot drive a
+    /// locked phone, so this disambiguates a "ready but won't act" WDA (locked,
+    /// recoverable by unlocking) from a genuinely wedged one.
+    pub async fn locked(&mut self) -> Result<bool> {
+        let sid = self.ensure_session().await?.to_string();
+        let v: Envelope<serde_json::Value> = self
+            .http
+            .get(format!("{}/session/{}/wda/locked", self.base, sid))
+            .send()
+            .await
+            .context("GET /wda/locked")?
+            .json()
+            .await
+            .context("parse /wda/locked")?;
+        Ok(v.value.as_bool().unwrap_or(false))
+    }
+
+    /// Probe WDA at the ACTION level, not just `/status`. `GET /status` lies:
+    /// it keeps reporting `ready` even when every UI action fails Code=41 "Not
+    /// authorized for performing UI testing actions" — the "zombie ready" state
+    /// caused by a locked phone, sleep, or a severed testmanagerd/CoreDevice
+    /// connection (e.g. after a WARP toggle). To catch that, additionally run a
+    /// cheap real action (`wda/activeAppInfo`, which needs the live test
+    /// connection); only if THAT succeeds is the runner actually drivable.
+    /// Home-screen safe: activeAppInfo returns ok (bundleId null) with no
+    /// foreground app, so a healthy idle phone never false-negatives.
+    pub async fn probe_health(&mut self) -> WdaHealth {
+        if !self.is_up().await {
+            return WdaHealth::down();
+        }
+        let sid = match self.ensure_session().await {
+            Ok(s) => s.to_string(),
+            Err(_) => return WdaHealth { up: true, actionable: false, locked: None },
+        };
+        let locked = self.locked().await.ok();
+        let actionable = matches!(
+            self.http
+                .get(format!("{}/session/{}/wda/activeAppInfo", self.base, sid))
+                .send()
+                .await,
+            Ok(r) if r.status().is_success()
+        );
+        if !actionable {
+            // Drop the severed session so the next caller re-creates one.
+            self.invalidate_session();
+        }
+        WdaHealth { up: true, actionable, locked }
+    }
+
     /// Ensure a session exists, creating one if needed. WDA accepts an empty
     /// capabilities match and returns a session id (mirrored at top level and
     /// under `value.sessionId` across versions — we accept either).
@@ -539,6 +588,27 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
         for c in children {
             flatten_tree(c, depth + 1, out);
         }
+    }
+}
+
+/// Action-level WDA health (see [`WdaClient::probe_health`]). Distinguishes a
+/// runner that merely answers `/status` from one that can actually act.
+#[derive(Debug, Clone, Copy)]
+pub struct WdaHealth {
+    /// `/status` answered 2xx (runner process + HTTP server alive).
+    pub up: bool,
+    /// A real UI-test action succeeded — the testmanagerd connection is live.
+    /// `up && !actionable` is the "zombie ready" state (locked phone / revoked
+    /// automation / wedged tunnel) that `/status` alone cannot see.
+    pub actionable: bool,
+    /// Device lock state, when it could be read.
+    pub locked: Option<bool>,
+}
+
+impl WdaHealth {
+    /// Nothing reachable — WDA not configured or `/status` down.
+    pub fn down() -> Self {
+        Self { up: false, actionable: false, locked: None }
     }
 }
 
