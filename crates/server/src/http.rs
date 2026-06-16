@@ -985,10 +985,58 @@ async fn wda_swipe(
     w.swipe(x1, y1, x2, y2, dur).await
 }
 
+/// Resolve the CoreDevice identifier of the currently-connected iPhone by
+/// parsing `devicectl list devices` (the `connected` row). Needed because
+/// `devicectl` requires an explicit `--device` and the daemon doesn't otherwise
+/// track the UDID.
+#[cfg(target_os = "macos")]
+fn detect_connected_device() -> Option<String> {
+    let out = std::process::Command::new("xcrun")
+        .args(["devicectl", "list", "devices"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        // States seen: "connected", "available (paired)", "unavailable".
+        // Only the live one contains the bare word "connected".
+        if line.contains("connected") {
+            for tok in line.split_whitespace() {
+                // CoreDevice identifier is a 36-char UUID (8-4-4-4-12).
+                if tok.len() == 36 && tok.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Uninstall an app (and its data container) from a paired device via
+/// CoreDevice. This is the reliable "Delete App" primitive: WDA cannot remove
+/// apps, and UI-driven deletion (Settings → Storage, or a home-screen
+/// long-press) is flaky to automate. `udid` defaults to the connected device.
+#[cfg(target_os = "macos")]
+fn devicectl_uninstall(udid: Option<&str>, bundle: &str) -> Result<(), String> {
+    let device = match udid {
+        Some(u) => u.to_string(),
+        None => detect_connected_device().ok_or_else(|| "no connected device".to_string())?,
+    };
+    let out = std::process::Command::new("xcrun")
+        .args(["devicectl", "device", "uninstall", "app", "--device", &device, bundle])
+        .output()
+        .map_err(|e| format!("spawn devicectl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// `POST /agent/input` — inject one control message (same JSON shape as the
 /// WebRTC control channel): `{"type":"tap","x":0.5,"y":0.5}`,
 /// `{"type":"text","text":"hi"}`, `{"type":"scroll","x":..,"y":..,"dx":..,"dy":..}`,
-/// `{"type":"shortcut","name":"home"}`, `{"type":"key","name":"return"}`, etc.
+/// `{"type":"shortcut","name":"home"}`, `{"type":"key","name":"return"}`,
+/// `{"type":"uninstall","bundle":"com.example.app"}` (via devicectl), etc.
 ///
 /// Coordinates are normalized `[0,1]` over the phone content rect (geometry-agnostic,
 /// like the web client). Acquiring an `Agent` control lease makes the injector gate
@@ -1007,6 +1055,57 @@ async fn agent_input(
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         ),
         AgentAuth::Ok => {}
+    }
+    // App uninstall via CoreDevice (`devicectl`) — WDA can't remove apps and
+    // UI-driven deletion is unreliable to automate, so this is the dependable
+    // "Delete App (with data)" primitive (e.g. resetting a wedged app to its
+    // login state). `{"type":"uninstall","bundle":"com.example.app"}`; optional
+    // `"udid"` targets a specific paired phone, else the connected one is used.
+    // Destructive — gated behind agent auth like every action here.
+    #[cfg(target_os = "macos")]
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        if v.get("type").and_then(|t| t.as_str()) == Some("uninstall") {
+            let bundle = v.get("bundle").and_then(|b| b.as_str()).unwrap_or("");
+            // Bundle ids are reverse-DNS — letters/digits/dot/hyphen only.
+            // Reject anything else so it can't inject into the spawned command.
+            let bundle_ok = !bundle.is_empty()
+                && bundle.len() <= 200
+                && bundle
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if !bundle_ok {
+                return with_security_headers(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "uninstall needs a valid \"bundle\" (reverse-DNS id)",
+                    )
+                        .into_response(),
+                );
+            }
+            let udid = v
+                .get("udid")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                .map(String::from);
+            let bundle = bundle.to_string();
+            let r = tokio::task::spawn_blocking(move || {
+                devicectl_uninstall(udid.as_deref(), &bundle)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("join error: {e}")));
+            return match r {
+                Ok(()) => {
+                    with_security_headers((StatusCode::OK, "ok (uninstalled)").into_response())
+                }
+                Err(e) => {
+                    tracing::warn!("devicectl uninstall failed: {e}");
+                    with_security_headers(
+                        (StatusCode::BAD_GATEWAY, format!("uninstall failed: {e}"))
+                            .into_response(),
+                    )
+                }
+            };
+        }
     }
     // ── L2 auto-routing (WebDriverAgent) ──────────────────────────────────
     // When WDA is configured, prefer it for the actions where it is strictly
