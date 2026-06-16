@@ -330,12 +330,29 @@ for OLD_LABEL in work.pwtk.iphone-remote; do
 done
 pkill -f "iPhoneRemote.app/Contents/MacOS" 2>/dev/null || true
 
-# Unload OUR label if already running (idempotent)
+# Unload OUR label if already running (idempotent). `bootout` is ASYNCHRONOUS —
+# it returns before the service is fully torn down, so a bootstrap fired right
+# after races the teardown and fails "Bootstrap failed: 5: Input/output error"
+# (the exact failure an upgrade hit). Wait for the label to actually disappear.
 launchctl bootout "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "gui/$UID_NUM/$PLIST_LABEL" >/dev/null 2>&1 || break
+    sleep 0.5
+done
 
-# Bootstrap from the new plist
-launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST"
-ok "LaunchAgent bootstrapped"
+# Bootstrap from the new plist; retry once if it still raced the teardown.
+if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST" 2>/dev/null; then
+    sleep 1
+    launchctl bootout "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null || true
+    sleep 1
+    if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST" 2>/dev/null; then
+        warn "bootstrap failed — load it manually: launchctl bootstrap gui/$UID_NUM \"$PLIST_DST\""
+    else
+        ok "LaunchAgent bootstrapped (after retry)"
+    fi
+else
+    ok "LaunchAgent bootstrapped"
+fi
 
 # Enable (persist across reboots)
 launchctl enable "gui/$UID_NUM/$PLIST_LABEL"
