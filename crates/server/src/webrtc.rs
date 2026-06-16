@@ -161,6 +161,14 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
+    // Seed the agent/mirror flag from WDA's ACTUAL state at connect, so the very
+    // first gesture already routes correctly. Without this the flag starts false
+    // and only flips true after the first successful WDA control event — so an
+    // opening scroll/drag (before any tap) would hit L3 and pop iPhone Mirroring.
+    if let Some(w) = &wda {
+        let actionable = w.lock().await.probe_health().await.actionable;
+        wda_actionable.store(actionable, std::sync::atomic::Ordering::Relaxed);
+    }
     wire_control_channel(control_ch, wda.clone(), wda_actionable.clone(), injector.clone());
 
     let move_ch = pc
