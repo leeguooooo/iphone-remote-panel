@@ -245,6 +245,27 @@ else
     info "  tree, run scripts/setup-wda.sh, then export PHONE_REMOTE_WDA_URL and re-run."
 fi
 
+# Keep ~/.iphone-use/setup-wda.sh fresh on EVERY install. The daemon's
+# POST /agent/mode runs this copy to build/relaunch WDA (and relay its MJPEG
+# video port). Without this step the script only ever self-installs the OLD copy
+# the daemon re-spawns, so setup-wda.sh fixes never reach upgraders. Prefer a
+# local checkout, else fetch from the repo (same pattern as scripts/sign.sh).
+SETUP_WDA_DST="$HOME/.iphone-use/setup-wda.sh"
+mkdir -p "$HOME/.iphone-use" 2>/dev/null || true
+SETUP_WDA_SRC="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo ".")/scripts/setup-wda.sh"
+if [ -f "$SETUP_WDA_SRC" ]; then
+    cp -f "$SETUP_WDA_SRC" "$SETUP_WDA_DST" 2>/dev/null && chmod +x "$SETUP_WDA_DST" 2>/dev/null \
+        && ok "WDA setup script updated (local)"
+elif command -v curl >/dev/null 2>&1; then
+    SETUP_WDA_DL="$(mktemp)"
+    if curl -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/setup-wda.sh" -o "$SETUP_WDA_DL" 2>/dev/null \
+       && [ -s "$SETUP_WDA_DL" ]; then
+        cp -f "$SETUP_WDA_DL" "$SETUP_WDA_DST" 2>/dev/null && chmod +x "$SETUP_WDA_DST" 2>/dev/null \
+            && ok "WDA setup script updated (fetched latest)"
+    fi
+    rm -f "$SETUP_WDA_DL" 2>/dev/null || true
+fi
+
 # Optional Cloudflare TURN (cross-network access). If both are exported, embed
 # them so the daemon mints ephemeral relay credentials. Absent → STUN-only
 # (LAN/same-network works; cellular/remote needs these).
