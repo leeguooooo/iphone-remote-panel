@@ -1217,9 +1217,68 @@ async fn agent_input(
                         }
                     };
                 }
+                // Go to the Home screen on-device (`{"type":"home"}`). WDA-only
+                // so it works in agent mode; the L3 `shortcut` path needs the
+                // mirror frontmost.
+                ("home", _) => {
+                    let mut w = wda.lock().await;
+                    if w.press_home().await.is_ok() {
+                        return with_security_headers(
+                            (StatusCode::OK, "ok (wda home)").into_response(),
+                        );
+                    }
+                    // One stale-session retry (the session can expire / be
+                    // reclaimed between calls).
+                    w.invalidate_session();
+                    return match w.press_home().await {
+                        Ok(()) => with_security_headers(
+                            (StatusCode::OK, "ok (wda home)").into_response(),
+                        ),
+                        Err(e) => {
+                            w.invalidate_session();
+                            tracing::warn!("wda home failed: {e:#}");
+                            with_security_headers(
+                                (StatusCode::BAD_GATEWAY, format!("wda home: {e}")).into_response(),
+                            )
+                        }
+                    };
+                }
+                // Navigate back via the universal iOS left-edge swipe
+                // (`{"type":"back"}`). Reliable across apps, unlike a nav-bar
+                // button whose label/position varies.
+                ("back", _) => {
+                    let mut w = wda.lock().await;
+                    if w.back().await.is_ok() {
+                        return with_security_headers(
+                            (StatusCode::OK, "ok (wda back)").into_response(),
+                        );
+                    }
+                    w.invalidate_session();
+                    return match w.back().await {
+                        Ok(()) => with_security_headers(
+                            (StatusCode::OK, "ok (wda back)").into_response(),
+                        ),
+                        Err(e) => {
+                            w.invalidate_session();
+                            tracing::warn!("wda back failed: {e:#}");
+                            with_security_headers(
+                                (StatusCode::BAD_GATEWAY, format!("wda back: {e}")).into_response(),
+                            )
+                        }
+                    };
+                }
                 ("text", None) => {
                     if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                         let mut w = wda.lock().await;
+                        // `{"type":"text","clear":true}` empties the focused
+                        // field first so the text REPLACES rather than appends
+                        // (the "ClaudeClaude" search-box bug). Best-effort — a
+                        // failed clear still lets the type proceed.
+                        if v.get("clear").and_then(|c| c.as_bool()).unwrap_or(false) {
+                            if let Err(e) = w.clear_active().await {
+                                tracing::warn!("wda clear_active before text: {e:#}");
+                            }
+                        }
                         match w.keys(text).await {
                             Ok(()) => {
                                 return with_security_headers(

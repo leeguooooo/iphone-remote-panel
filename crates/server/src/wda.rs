@@ -325,6 +325,60 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Press the Home button on-device (`POST /wda/pressButton` `{name:home}`).
+    /// Works in agent mode regardless of the Mirroring window — the `shortcut`
+    /// path routes through L3 and needs the mirror frontmost, so this is the
+    /// reliable "go home".
+    pub async fn press_home(&mut self) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/wda/pressButton", self.base, sid))
+            .json(&serde_json::json!({ "name": "home" }))
+            .send()
+            .await
+            .context("POST /wda/pressButton home")?
+            .error_for_status()
+            .context("/wda/pressButton status")?;
+        Ok(())
+    }
+
+    /// Navigate back via the universal iOS edge-swipe-from-left gesture (works
+    /// in almost every app, unlike a nav-bar back button whose label/position
+    /// varies). A short swipe from the very left edge to ~55% width at mid
+    /// height.
+    pub async fn back(&mut self) -> Result<()> {
+        let (sw, sh) = self.window_size().await?;
+        let y = sh * 0.5;
+        self.swipe(1.0, y, sw * 0.55, y, 250).await
+    }
+
+    /// Clear the currently-focused text field (`GET /element/active` →
+    /// `POST /element/:id/clear`). Lets `text` REPLACE a field's contents
+    /// instead of appending to stale text (the "ClaudeClaude" search-box bug).
+    pub async fn clear_active(&mut self) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let body = self
+            .http
+            .get(format!("{}/session/{}/element/active", self.base, sid))
+            .send()
+            .await
+            .context("GET /element/active")?
+            .error_for_status()
+            .context("/element/active status")?
+            .text()
+            .await
+            .context("/element/active body")?;
+        let id = parse_element_id(&body)?;
+        self.http
+            .post(format!("{}/session/{}/element/{}/clear", self.base, sid, id))
+            .send()
+            .await
+            .context("POST /element/clear")?
+            .error_for_status()
+            .context("/element/clear status")?;
+        Ok(())
+    }
+
     /// Window (screen) size in WDA points — needed to map our normalized
     /// `[0,1]` agent coordinates onto [`Self::tap_point`]'s absolute points.
     pub async fn window_size(&mut self) -> Result<(f64, f64)> {
