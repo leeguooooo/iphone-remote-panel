@@ -312,6 +312,7 @@ async fn build_pc(
         ice_servers,
         state.pipeline.clone(),
         state.injector.clone(),
+        state.wda.clone(),
     )
     .await?;
 

@@ -965,7 +965,7 @@ async fn agent_mode(
 /// `dx` reveals content to the right). The delta is scaled into a finger travel
 /// that is always a visible swipe (≥15% of the axis) yet stays on-screen (≤75%);
 /// the finger moves opposite to the content reveal.
-async fn wda_swipe(
+pub(crate) async fn wda_swipe(
     w: &mut crate::wda::WdaClient,
     nx: f64,
     ny: f64,
@@ -1037,6 +1037,64 @@ fn devicectl_uninstall(udid: Option<&str>, bundle: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Route a web-client control message (the WebRTC `control` data-channel JSON)
+/// to WDA when it's up, so the BROWSER drives the phone on-device in agent mode
+/// — like `/agent/input`, but for the live data channel. Returns true if WDA
+/// handled it; false → the caller falls back to the L3 (mirror) injector, which
+/// drives whatever the Mac mirrors and steals Mac focus. Covers the common
+/// interactions (tap/scroll/text/home); rarer events (drag down/up,
+/// spotlight/switcher, key) fall through to L3.
+pub(crate) async fn wda_control_from_json(
+    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+    v: &serde_json::Value,
+) -> bool {
+    let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let mut w = wda.lock().await;
+    let r: anyhow::Result<()> = match typ {
+        "tap" | "longpress" => {
+            match (
+                v.get("x").and_then(|x| x.as_f64()),
+                v.get("y").and_then(|y| y.as_f64()),
+            ) {
+                (Some(x), Some(y)) => {
+                    async {
+                        let (sw, sh) = w.window_size().await?;
+                        w.tap_point(x * sw, y * sh).await
+                    }
+                    .await
+                }
+                _ => return false,
+            }
+        }
+        "scroll" => {
+            let nx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
+            let ny = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
+            let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let dy = v.get("dy").and_then(|y| y.as_f64()).unwrap_or(0.0);
+            if dx == 0.0 && dy == 0.0 {
+                return false;
+            }
+            wda_swipe(&mut w, nx, ny, dx, dy).await
+        }
+        "text" => match v.get("text").and_then(|t| t.as_str()) {
+            Some(t) => w.keys(t).await,
+            None => return false,
+        },
+        "shortcut" if v.get("name").and_then(|n| n.as_str()) == Some("home") => {
+            w.press_home().await
+        }
+        _ => return false,
+    };
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            w.invalidate_session();
+            tracing::warn!("wda data-channel control ({typ}): {e:#}");
+            false
+        }
     }
 }
 

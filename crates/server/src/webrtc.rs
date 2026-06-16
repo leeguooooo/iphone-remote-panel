@@ -51,6 +51,7 @@ pub async fn build_viewer_pc(
     ice_servers: Vec<RTCIceServer>,
     pipeline: Arc<dyn VideoPipeline>,
     injector: InputInjector,
+    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -159,7 +160,7 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
-    wire_control_channel(control_ch, injector.clone());
+    wire_control_channel(control_ch, wda, injector.clone());
 
     let move_ch = pc
         .create_data_channel(
@@ -211,13 +212,28 @@ async fn feed_loop(pipeline: Arc<dyn VideoPipeline>, track: Arc<TrackLocalStatic
     }
 }
 
-/// Route control-channel JSON messages to the injector.
-fn wire_control_channel(ch: Arc<RTCDataChannel>, injector: InputInjector) {
+/// Route control-channel JSON messages. In agent mode (WDA up) the browser
+/// drives the phone ON-DEVICE via WDA — correct device, no Mac focus steal.
+/// Falls back to the L3 (mirror) injector when WDA is absent or can't handle the
+/// event (the injector drives whatever the Mac mirrors and yanks it frontmost).
+fn wire_control_channel(
+    ch: Arc<RTCDataChannel>,
+    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    injector: InputInjector,
+) {
     ch.on_message(Box::new(move |msg| {
+        let wda = wda.clone();
         let injector = injector.clone();
         Box::pin(async move {
             // Control channel is JSON text.
             if let Ok(text) = std::str::from_utf8(&msg.data) {
+                if let Some(w) = &wda {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                        if crate::http::wda_control_from_json(w, &v).await {
+                            return;
+                        }
+                    }
+                }
                 if let Some(ev) = decode_control(text) {
                     injector.send(ev);
                 }

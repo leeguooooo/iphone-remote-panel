@@ -581,6 +581,24 @@ function showOverlay(kind) {
   } catch (_) { /* best-effort */ }
 })();
 
+/* ── Agent-mode video source ─────────────────────────────────────
+   When WDA drives the phone (mode=agent), the WebRTC video track is the Mac's
+   iPhone-Mirroring capture — which is a DIFFERENT device than WDA's target (or a
+   stale frame), so it must NOT be shown. Force the live MJPEG of the actual WDA
+   target on top instead. Mirror mode keeps the WebRTC video. Poll cheaply; the
+   startStills/stopStills calls are idempotent. */
+async function pollAgentMode() {
+  try {
+    const r = await fetch('/agent/status', { cache: 'no-store' });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.mode === 'agent') startStills();   // MJPEG (WDA device) overlays the WebRTC track
+    else stopStills();                        // mirror mode → show the WebRTC video
+  } catch (_) { /* best-effort */ }
+}
+pollAgentMode();
+setInterval(pollAgentMode, 3000);
+
 /* ── L2 stills fallback ──────────────────────────────────────────
    When Mirroring dies (phone in use / disconnected) the WebRTC track has no
    real pixels, but the daemon's /agent/screenshot can still capture via WDA
