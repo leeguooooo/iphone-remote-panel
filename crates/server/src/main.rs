@@ -78,13 +78,48 @@ fn serve() -> Result<()> {
     let secret = load_or_make_secret(&dir, &cfg)?;
     write_pid(&dir)?;
 
-    // 5. Start the capture/encode pipeline.
-    let pipeline = core::encode::start_pipeline(core::encode::PipelineConfig::default())
-        .context("start_pipeline (capture + VideoToolbox H.264)")?;
+    // Is WebDriverAgent configured? If so, the daemon can run in WDA-only mode
+    // (video via WDA MJPEG `/agent/mjpeg`, control via WDA) and does NOT require
+    // an iPhone Mirroring window. Mirroring and WDA are mutually exclusive, so
+    // when WDA is the chosen control path the Mirroring window is legitimately
+    // gone — the daemon must still start. Without WDA we keep the old strict
+    // behavior (pure L3 mirror mode genuinely needs the window).
+    let wda_configured = std::env::var("PHONE_REMOTE_WDA_URL")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
 
-    // 6. Input geometry from the Mirroring window.
-    let geometry = core::capture::find_mirroring_geometry()
-        .context("find iPhone Mirroring window geometry for input mapping")?;
+    // 5. Start the capture/encode pipeline. Fall back to a null pipeline when the
+    //    Mirroring window is absent but WDA can drive the phone.
+    let pipeline: Arc<dyn core::encode::VideoPipeline> =
+        match core::encode::start_pipeline(core::encode::PipelineConfig::default()) {
+            Ok(p) => p,
+            Err(e) if wda_configured => {
+                tracing::warn!(
+                    "no Mirroring capture pipeline ({e:#}); starting in WDA-only mode \
+                     (video via /agent/mjpeg, control via WDA)"
+                );
+                Arc::new(core::encode::NullPipeline::new())
+            }
+            Err(e) => return Err(e).context("start_pipeline (capture + VideoToolbox H.264)"),
+        };
+
+    // 6. Input geometry from the Mirroring window. Falls back to a placeholder in
+    //    WDA-only mode — L3 CGEvent injection isn't used when WDA handles control,
+    //    so this geometry is never consulted for agent input.
+    let geometry = match core::capture::find_mirroring_geometry() {
+        Ok(g) => g,
+        Err(e) if wda_configured => {
+            tracing::warn!("no Mirroring geometry ({e:#}); using placeholder (WDA-only mode)");
+            core::coords::SessionGeometry {
+                content_rect: core::coords::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
+                scale: 1.0,
+                orientation: core::coords::Orientation::Portrait,
+            }
+        }
+        Err(e) => {
+            return Err(e).context("find iPhone Mirroring window geometry for input mapping")
+        }
+    };
     tracing::info!(
         "input geometry: content_rect={:?} scale={:.2} orientation={:?}",
         geometry.content_rect,

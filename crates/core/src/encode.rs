@@ -113,6 +113,44 @@ pub trait VideoPipeline: Send + Sync {
     }
 }
 
+/// A pipeline that never produces frames and reports the phone as absent.
+///
+/// Used when the daemon starts with no iPhone Mirroring window but WebDriverAgent
+/// is configured: video is served out-of-band via WDA's MJPEG stream (`/agent/mjpeg`)
+/// and control goes through WDA, so the SCK capture pipeline isn't needed. This lets
+/// the daemon come up in WDA-only mode instead of crash-looping on `start_pipeline`
+/// (Mirroring and WDA are mutually exclusive, so the window is legitimately gone).
+pub struct NullPipeline {
+    /// Held so `subscribe()` receivers stay open (blocked) rather than seeing the
+    /// channel close immediately. No frames are ever sent.
+    tx: tokio::sync::broadcast::Sender<EncodedFrame>,
+}
+
+impl NullPipeline {
+    pub fn new() -> Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        Self { tx }
+    }
+}
+
+impl Default for NullPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VideoPipeline for NullPipeline {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EncodedFrame> {
+        self.tx.subscribe()
+    }
+
+    fn request_keyframe(&self) {}
+
+    fn phone_present(&self) -> bool {
+        false
+    }
+}
+
 const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
 /// Convert an AVCC elementary stream (`[4-byte BE length][NALU]` repeated) into
