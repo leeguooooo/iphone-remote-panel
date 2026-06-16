@@ -176,6 +176,7 @@ fn serve() -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .map(|_| "http://127.0.0.1:9100".to_string())
             }),
+        wda_actionable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     run_server(cfg, state)

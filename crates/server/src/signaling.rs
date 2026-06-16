@@ -313,6 +313,7 @@ async fn build_pc(
         state.pipeline.clone(),
         state.injector.clone(),
         state.wda.clone(),
+        state.wda_actionable.clone(),
     )
     .await?;
 

@@ -197,6 +197,13 @@ pub struct AppState {
     /// Defaults to `127.0.0.1:9100` (the relay target), override via
     /// `PHONE_REMOTE_WDA_MJPEG_URL`.
     pub mjpeg_url: Option<String>,
+    /// Last-known "WDA can act on-device" flag, updated by every WebRTC
+    /// data-channel control event ([`wda_control_from_json`]). The control/move
+    /// channel handlers read it to decide: when true (agent mode), route to WDA
+    /// and DROP anything WDA can't take, so L3 never fires and iPhone Mirroring
+    /// is never yanked frontmost (no Mac focus steal). When false (mirror mode),
+    /// fall through to the L3 injector as before.
+    pub wda_actionable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -1049,8 +1056,10 @@ fn devicectl_uninstall(udid: Option<&str>, bundle: &str) -> Result<(), String> {
 /// spotlight/switcher, key) fall through to L3.
 pub(crate) async fn wda_control_from_json(
     wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+    actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
 ) -> bool {
+    use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let mut w = wda.lock().await;
     let r: anyhow::Result<()> = match typ {
@@ -1086,11 +1095,20 @@ pub(crate) async fn wda_control_from_json(
         "shortcut" if v.get("name").and_then(|n| n.as_str()) == Some("home") => {
             w.press_home().await
         }
+        // Not a WDA-routable type (down/up/key/spotlight/switcher). Leave the
+        // actionable flag as-is and let the caller decide based on it.
         _ => return false,
     };
     match r {
-        Ok(()) => true,
+        Ok(()) => {
+            actionable.store(true, Ordering::Relaxed);
+            true
+        }
         Err(e) => {
+            // A WDA call that should have worked failed → WDA is down (mirror
+            // mode / locked / wedged). Mark it so the move channel falls back to
+            // L3 instead of silently dropping.
+            actionable.store(false, Ordering::Relaxed);
             w.invalidate_session();
             tracing::warn!("wda data-channel control ({typ}): {e:#}");
             false

@@ -52,6 +52,7 @@ pub async fn build_viewer_pc(
     pipeline: Arc<dyn VideoPipeline>,
     injector: InputInjector,
     wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    wda_actionable: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -160,7 +161,7 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
-    wire_control_channel(control_ch, wda, injector.clone());
+    wire_control_channel(control_ch, wda.clone(), wda_actionable.clone(), injector.clone());
 
     let move_ch = pc
         .create_data_channel(
@@ -172,7 +173,7 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
-    wire_move_channel(move_ch, injector);
+    wire_move_channel(move_ch, wda, wda_actionable, injector);
 
     // Request a keyframe right away so the very first frames after handshake are
     // decodable (covers viewer-join per the encode contract).
@@ -212,24 +213,31 @@ async fn feed_loop(pipeline: Arc<dyn VideoPipeline>, track: Arc<TrackLocalStatic
     }
 }
 
-/// Route control-channel JSON messages. In agent mode (WDA up) the browser
-/// drives the phone ON-DEVICE via WDA — correct device, no Mac focus steal.
-/// Falls back to the L3 (mirror) injector when WDA is absent or can't handle the
-/// event (the injector drives whatever the Mac mirrors and yanks it frontmost).
+/// Route control-channel JSON. In agent mode (WDA actionable) the browser drives
+/// the phone ON-DEVICE via WDA — correct device, no Mac focus steal — and
+/// anything WDA can't take is DROPPED (never L3, so iPhone Mirroring is never
+/// yanked frontmost). Only when WDA is down (mirror mode) do events fall to the
+/// L3 injector.
 fn wire_control_channel(
     ch: Arc<RTCDataChannel>,
     wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    actionable: Arc<std::sync::atomic::AtomicBool>,
     injector: InputInjector,
 ) {
     ch.on_message(Box::new(move |msg| {
         let wda = wda.clone();
+        let actionable = actionable.clone();
         let injector = injector.clone();
         Box::pin(async move {
-            // Control channel is JSON text.
             if let Ok(text) = std::str::from_utf8(&msg.data) {
                 if let Some(w) = &wda {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                        if crate::http::wda_control_from_json(w, &v).await {
+                        // WDA handled it → done. Not handled but WDA is up →
+                        // drop (don't pop Mirroring). WDA down → L3 below.
+                        if crate::http::wda_control_from_json(w, &actionable, &v).await {
+                            return;
+                        }
+                        if actionable.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
                     }
@@ -242,12 +250,34 @@ fn wire_control_channel(
     }));
 }
 
-/// Route move-channel binary packets (5-byte) to the injector.
-fn wire_move_channel(ch: Arc<RTCDataChannel>, injector: InputInjector) {
+/// Route move-channel binary packets (scroll + drag). In agent mode, a scroll is
+/// re-issued as an on-device WDA swipe and a drag is dropped (no L3 → no
+/// Mirroring popup). In mirror mode (WDA down) both go to the L3 injector.
+fn wire_move_channel(
+    ch: Arc<RTCDataChannel>,
+    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    actionable: Arc<std::sync::atomic::AtomicBool>,
+    injector: InputInjector,
+) {
     ch.on_message(Box::new(move |msg| {
+        let wda = wda.clone();
+        let actionable = actionable.clone();
         let injector = injector.clone();
         Box::pin(async move {
-            if let Some(ev) = decode_move(&msg.data) {
+            let Some(ev) = decode_move(&msg.data) else { return };
+            let agent = wda.is_some() && actionable.load(std::sync::atomic::Ordering::Relaxed);
+            if agent {
+                if let (Some(w), core::input::InputEvent::Scroll { x, y, dx, dy }) =
+                    (&wda, &ev)
+                {
+                    let mut g = w.lock().await;
+                    if crate::http::wda_swipe(&mut g, *x, *y, *dx, *dy).await.is_err() {
+                        g.invalidate_session();
+                        actionable.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                // Drag moves are dropped in agent mode (no L3 focus steal).
+            } else {
                 injector.send(ev);
             }
         })

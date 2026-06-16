@@ -86,6 +86,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         mjpeg_url: None,
+        wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -133,6 +134,7 @@ fn build_state_with_agent_token(
         viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         mjpeg_url: None,
+        wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 

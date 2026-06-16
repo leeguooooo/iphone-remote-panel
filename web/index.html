@@ -726,8 +726,15 @@ window.addEventListener('resize', () => { if (gridOn) drawGrid(); });
 
 /* ── Content-rect coord mapping [iOS §Touch] ──────────────────── */
 function pointerToNormalized(clientX, clientY) {
-  const rect = video.getBoundingClientRect();
-  const vw = video.videoWidth, vh = video.videoHeight;
+  // Map against whichever source is actually on screen: the live MJPEG still
+  // (agent/WDA mode — the real target phone) or the WebRTC video (mirror mode).
+  // In agent mode the WebRTC track is the Mac's mirror — a DIFFERENT device — so
+  // its size/letterboxing would map taps to the wrong place.
+  const usingStill = mjpegLive && stillFrame.classList.contains('active');
+  const el = usingStill ? stillFrame : video;
+  const rect = el.getBoundingClientRect();
+  const vw = usingStill ? el.naturalWidth  : el.videoWidth;
+  const vh = usingStill ? el.naturalHeight : el.videoHeight;
   if (!vw || !vh) return null;
   const elAR = rect.width / rect.height, vidAR = vw / vh;
   let contentW, contentH, offX, offY;
