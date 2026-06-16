@@ -516,6 +516,7 @@ let frozen = false, gridOn = false, wakeLock = null;
 let iceRestartTimer = null, reconnectTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS, statsInterval = null;
 let lastRtt = '--', connState = 'new';
+let agentMode = false; // true when the daemon reports mode=agent (WDA on-device drive + MJPEG video)
 
 /* ── Overlay state: 'hidden' | 'stalled' | 'disconnected' ────── */
 let overlayState = 'hidden';
@@ -592,8 +593,13 @@ async function pollAgentMode() {
     const r = await fetch('/agent/status', { cache: 'no-store' });
     if (!r.ok) return;
     const s = await r.json();
-    if (s.mode === 'agent') startStills();   // MJPEG (WDA device) overlays the WebRTC track
-    else stopStills();                        // mirror mode → show the WebRTC video
+    agentMode = (s.mode === 'agent');
+    if (agentMode) {
+      startStills();                          // MJPEG (WDA device) overlays the WebRTC track
+      if (overlayState === 'gone') hideOverlay(); // the mirror is meant to be gone — no overlay
+    } else {
+      stopStills();                           // mirror mode → show the WebRTC video
+    }
   } catch (_) { /* best-effort */ }
 }
 pollAgentMode();
@@ -1017,8 +1023,15 @@ async function connectWs() {
       // Daemon-side truth about the Mirroring window. Keepalive frames keep
       // flowing when the window vanishes, so this signal (not frame flow)
       // drives the "phone gone" overlay.
-      if (msg.present === false) { showOverlay('gone'); startStills(); }
-      else { if (overlayState === 'gone') hideOverlay(); stopStills(); }
+      // In agent/WDA mode the Mirroring window is INTENTIONALLY gone (we drive
+      // on-device + show the MJPEG), so the "phone disconnected — reconnect
+      // mirror" overlay would be wrong and misleading. Only show it in mirror
+      // mode. Agent mode keeps the live MJPEG with no overlay.
+      if (msg.present === false) {
+        if (agentMode) { startStills(); hideOverlay(); }
+        else { showOverlay('gone'); startStills(); }
+      }
+      else { if (overlayState === 'gone') hideOverlay(); if (!agentMode) stopStills(); }
     }
     else if (msg.type === 'session_status') {
       // issue #8 (queue + notify): another viewer holds the live session.
