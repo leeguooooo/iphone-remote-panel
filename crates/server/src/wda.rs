@@ -151,7 +151,19 @@ impl WdaClient {
                 wheels.len()
             )
         })?;
-        self.type_into(id, value).await
+        // POST a BARE value array (not type_into's {value,text} — the extra
+        // `text` makes WDA keyboard-type instead of calling
+        // adjustToPickerWheelValue, so the wheel reported ok but never moved).
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/element/{}/value", self.base, sid, id))
+            .json(&serde_json::json!({ "value": [value] }))
+            .send()
+            .await
+            .context("POST pickerwheel value")?
+            .error_for_status()
+            .context("pickerwheel value status")?;
+        Ok(())
     }
 
     /// Tap an element by id (`POST .../element/:id/click`). Lands on the element
@@ -225,6 +237,42 @@ impl WdaClient {
             .context("POST /actions")?
             .error_for_status()
             .context("/actions status")?;
+        Ok(())
+    }
+
+    /// Swipe/scroll gesture via the W3C Actions API — a single touch that
+    /// presses at `(x1,y1)`, drags to `(x2,y2)` over `duration_ms`, and lifts.
+    /// Synthesized on the phone like [`Self::tap_point`], so it works in agent
+    /// mode regardless of whether the Mirroring window is frontmost (issue #27:
+    /// `scroll` used to fall back to the L3/CGEvent path, which the OS drops
+    /// when a human holds the Mac's foreground). Coords are WDA points
+    /// (top-left origin), NOT normalized — convert via [`Self::window_size`].
+    ///
+    /// A short press-pause before the move makes XCUITest register a drag
+    /// rather than a flick, so the content tracks the finger predictably.
+    pub async fn swipe(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, duration_ms: u64) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/actions", self.base, sid))
+            .json(&serde_json::json!({
+                "actions": [{
+                    "type": "pointer",
+                    "id": "finger1",
+                    "parameters": { "pointerType": "touch" },
+                    "actions": [
+                        { "type": "pointerMove", "duration": 0, "x": x1, "y": y1 },
+                        { "type": "pointerDown", "button": 0 },
+                        { "type": "pause", "duration": 80 },
+                        { "type": "pointerMove", "duration": duration_ms, "x": x2, "y": y2 },
+                        { "type": "pointerUp", "button": 0 }
+                    ]
+                }]
+            }))
+            .send()
+            .await
+            .context("POST /actions (swipe)")?
+            .error_for_status()
+            .context("/actions swipe status")?;
         Ok(())
     }
 

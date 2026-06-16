@@ -929,6 +929,40 @@ async fn agent_mode(
     }
 }
 
+/// Perform a WDA on-device scroll/swipe (issue #27). `nx`/`ny` are the
+/// normalized `[0,1]` gesture anchor; `dx`/`dy` are scroll deltas whose sign
+/// matches the L3 convention (positive `dy` reveals content below, positive
+/// `dx` reveals content to the right). The delta is scaled into a finger travel
+/// that is always a visible swipe (≥15% of the axis) yet stays on-screen (≤75%);
+/// the finger moves opposite to the content reveal.
+async fn wda_swipe(
+    w: &mut crate::wda::WdaClient,
+    nx: f64,
+    ny: f64,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<()> {
+    let travel = |d: f64, axis: f64| -> f64 {
+        if d == 0.0 {
+            0.0
+        } else {
+            (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
+        }
+    };
+    let (sw, sh) = w.window_size().await?;
+    let cx = (nx * sw).clamp(1.0, sw - 1.0);
+    let cy = (ny * sh).clamp(1.0, sh - 1.0);
+    let tx = travel(dx, sw);
+    let ty = travel(dy, sh);
+    let x1 = (cx + tx / 2.0).clamp(1.0, sw - 1.0);
+    let x2 = (cx - tx / 2.0).clamp(1.0, sw - 1.0);
+    let y1 = (cy + ty / 2.0).clamp(1.0, sh - 1.0);
+    let y2 = (cy - ty / 2.0).clamp(1.0, sh - 1.0);
+    let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+    let dur = (dist * 1.2).clamp(120.0, 600.0) as u64;
+    w.swipe(x1, y1, x2, y2, dur).await
+}
+
 /// `POST /agent/input` — inject one control message (same JSON shape as the
 /// WebRTC control channel): `{"type":"tap","x":0.5,"y":0.5}`,
 /// `{"type":"text","text":"hi"}`, `{"type":"scroll","x":..,"y":..,"dx":..,"dy":..}`,
@@ -1142,7 +1176,40 @@ async fn agent_input(
                         ),
                     };
                 }
-                _ => {} // scroll/key/shortcut/down/up → L3 (mirroring) below
+                // Scroll/swipe on-device via WDA (issue #27) — like tap/text,
+                // independent of whether the Mirroring window is frontmost.
+                // `{"type":"scroll","x":0.5,"y":0.5,"dy":300}` (x/y optional,
+                // default screen center). Sign matches the L3 convention:
+                // positive `dy` reveals content further down (finger swipes up),
+                // positive `dx` reveals content to the right. On WDA error we
+                // reset the session, retry once, then fall through to L3.
+                ("scroll", _) | ("swipe", _) => {
+                    let nx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
+                    let ny = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
+                    let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let dy = v.get("dy").and_then(|y| y.as_f64()).unwrap_or(0.0);
+                    if dx != 0.0 || dy != 0.0 {
+                        let mut w = wda.lock().await;
+                        match wda_swipe(&mut w, nx, ny, dx, dy).await {
+                            Ok(()) => {
+                                return with_security_headers(
+                                    (StatusCode::OK, "ok (wda swipe)").into_response(),
+                                );
+                            }
+                            Err(e) => {
+                                // One stale-session retry, then fall through to L3.
+                                w.invalidate_session();
+                                if wda_swipe(&mut w, nx, ny, dx, dy).await.is_ok() {
+                                    return with_security_headers(
+                                        (StatusCode::OK, "ok (wda swipe)").into_response(),
+                                    );
+                                }
+                                tracing::warn!("wda swipe failed, falling back to L3: {e:#}");
+                            }
+                        }
+                    }
+                }
+                _ => {} // key/shortcut/down/up → L3 (mirroring) below
             }
         }
     }
