@@ -587,7 +587,7 @@ function showOverlay(kind) {
    on the phone. Poll it as stills so the page never goes blank. The endpoint
    accepts the login session cookie, so no extra credential is needed. */
 const stillFrame = document.getElementById('stillFrame');
-let stillsTimer = null, stillsUrl = null, stillsBusy = false;
+let stillsTimer = null, stillsUrl = null, stillsBusy = false, mjpegLive = false;
 async function fetchStill() {
   if (stillsBusy) return;
   stillsBusy = true;
@@ -605,13 +605,29 @@ async function fetchStill() {
   } catch (_) { /* offline poll is best-effort */ }
   stillsBusy = false;
 }
+/* Mirror is offline (agent/WDA mode). Prefer the LIVE MJPEG stream — WDA serves
+   it on-device in the same XCUITest session as control, so it coexists with
+   driving (Mirroring can't). The browser renders multipart/x-mixed-replace
+   directly in the <img> at ~28fps; the session cookie rides along automatically.
+   If MJPEG is unavailable (no relay / no WDA), fall back to 2.5s screenshots. */
 function startStills() {
-  if (stillsTimer) return;
-  fetchStill();
-  stillsTimer = setInterval(fetchStill, 2500);
+  if (mjpegLive || stillsTimer) return;
+  mjpegLive = true;
+  stillFrame.onerror = () => {
+    if (!mjpegLive) return;          // already torn down
+    mjpegLive = false;
+    stillFrame.onerror = null;
+    if (!stillsTimer) { fetchStill(); stillsTimer = setInterval(fetchStill, 2500); }
+  };
+  stillFrame.src = '/agent/mjpeg?t=' + Date.now();
+  stillFrame.classList.add('active');
+  olSub.textContent = '镜像离线 — 实时画面(WDA 设备端,可点按操作)';
 }
 function stopStills() {
+  mjpegLive = false;
+  stillFrame.onerror = null;
   if (stillsTimer) { clearInterval(stillsTimer); stillsTimer = null; }
+  stillFrame.src = '';               // close the MJPEG connection / drop the still
   stillFrame.classList.remove('active');
 }
 
