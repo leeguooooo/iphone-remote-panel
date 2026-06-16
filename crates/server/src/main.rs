@@ -164,6 +164,18 @@ fn serve() -> Result<()> {
         latest_release: Arc::new(Mutex::new(None)),
         viewers: Arc::new(Mutex::new(server::signaling::ViewerRegistry::default())),
         mirror_paused_cache: Arc::new(Mutex::new(None)),
+        // WDA's MJPEG stream for live video in agent mode (see /agent/mjpeg).
+        // Only when WDA is configured; the relay forwards it to 127.0.0.1:9100
+        // (override with PHONE_REMOTE_WDA_MJPEG_URL).
+        mjpeg_url: std::env::var("PHONE_REMOTE_WDA_MJPEG_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("PHONE_REMOTE_WDA_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| "http://127.0.0.1:9100".to_string())
+            }),
     });
 
     run_server(cfg, state)

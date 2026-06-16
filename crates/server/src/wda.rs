@@ -379,6 +379,33 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Tune WDA's built-in MJPEG screen stream (`POST /appium/settings`). The
+    /// defaults cap at ~9 fps; bumping `mjpegServerFramerate` and shrinking the
+    /// frame (`mjpegScalingFactor` %, `mjpegServerScreenshotQuality` %) lifts it
+    /// to ~28 fps with a still-legible image. The stream itself is served on the
+    /// device's MJPEG port (9100) — see `/agent/mjpeg`.
+    pub async fn set_mjpeg_settings(
+        &mut self,
+        framerate: u32,
+        scaling: u32,
+        quality: u32,
+    ) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        self.http
+            .post(format!("{}/session/{}/appium/settings", self.base, sid))
+            .json(&serde_json::json!({ "settings": {
+                "mjpegServerFramerate": framerate,
+                "mjpegScalingFactor": scaling,
+                "mjpegServerScreenshotQuality": quality,
+            }}))
+            .send()
+            .await
+            .context("POST /appium/settings (mjpeg)")?
+            .error_for_status()
+            .context("/appium/settings status")?;
+        Ok(())
+    }
+
     /// Window (screen) size in WDA points — needed to map our normalized
     /// `[0,1]` agent coordinates onto [`Self::tap_point`]'s absolute points.
     pub async fn window_size(&mut self) -> Result<(f64, f64)> {

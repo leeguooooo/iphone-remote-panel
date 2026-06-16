@@ -190,6 +190,13 @@ pub struct AppState {
     /// state)`. Detection runs `screencapture`, so `/agent/status` reuses a
     /// recent result instead of re-capturing on every poll.
     pub mirror_paused_cache: Arc<Mutex<Option<(Instant, core::capture::MirrorState)>>>,
+    /// WDA's on-device MJPEG stream URL (e.g. `http://127.0.0.1:9100`), if WDA
+    /// is configured. The `/agent/mjpeg` endpoint proxies it so agent mode gets
+    /// LIVE video without iPhone Mirroring — the MJPEG server runs inside the
+    /// same XCUITest session as control, so the two coexist (Mirroring can't).
+    /// Defaults to `127.0.0.1:9100` (the relay target), override via
+    /// `PHONE_REMOTE_WDA_MJPEG_URL`.
+    pub mjpeg_url: Option<String>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -220,6 +227,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/mode", post(agent_mode))
         .route("/agent/input", post(agent_input))
         .route("/agent/screenshot", get(agent_screenshot))
+        .route("/agent/mjpeg", get(agent_mjpeg))
         .route("/agent/elements", get(agent_elements))
         // Shortcuts RPC return path: the phone POSTs structured results here;
         // an agent GETs (and drains) them. See `AppState::inbox`.
@@ -1626,6 +1634,84 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
     with_security_headers(
         (StatusCode::SERVICE_UNAVAILABLE, "no valid screenshot frame available").into_response(),
     )
+}
+
+/// `GET /agent/mjpeg` — LIVE video in agent mode by proxying WDA's on-device
+/// MJPEG stream (`multipart/x-mixed-replace`). The MJPEG server runs inside the
+/// same XCUITest session as control, so video and driving coexist — unlike
+/// iPhone Mirroring, which is mutually exclusive with WDA. A browser renders
+/// this directly in an `<img src="/agent/mjpeg">`. ~28 fps at the tuned
+/// settings applied here (framerate/scaling/quality), regardless of USB vs Wi-Fi
+/// (the cap is WDA's screenshot rate, not the transport).
+async fn agent_mjpeg(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // Same cookie-or-bearer rule as `agent_screenshot`.
+    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
+    if !cookie_ok {
+        match agent_auth(&state, &headers) {
+            AgentAuth::Locked => {
+                return with_security_headers(
+                    (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+                )
+            }
+            AgentAuth::Denied => {
+                return with_security_headers(
+                    (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+                )
+            }
+            AgentAuth::Ok => {}
+        }
+    }
+    let Some(url) = state.mjpeg_url.clone() else {
+        return with_security_headers(
+            (StatusCode::SERVICE_UNAVAILABLE, "no WDA MJPEG configured").into_response(),
+        );
+    };
+    // Best-effort: tune the stream for a smooth feed (idempotent). A failure
+    // here just leaves WDA's defaults (~9 fps) — still usable.
+    if let Some(wda) = &state.wda {
+        let _ = wda.lock().await.set_mjpeg_settings(30, 50, 60).await;
+    }
+    // Proxy the upstream MJPEG stream straight through. A fresh client with no
+    // timeout — the stream is intentionally long-lived (one frame after another
+    // forever), so a request timeout would cut it off.
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match client.get(&url).send().await {
+        Ok(up) if up.status().is_success() => {
+            let content_type = up
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("multipart/x-mixed-replace; boundary=--BoundaryString")
+                .to_string();
+            let body = Body::from_stream(up.bytes_stream());
+            Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(body)
+                .map(with_security_headers)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Ok(up) => with_security_headers(
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("WDA MJPEG upstream {}", up.status()),
+            )
+                .into_response(),
+        ),
+        Err(e) => {
+            tracing::warn!("mjpeg proxy to {url} failed: {e}");
+            with_security_headers(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "WDA MJPEG unreachable — is the :9100 relay up? (restart WDA via mode=agent)",
+                )
+                    .into_response(),
+            )
+        }
+    }
 }
 
 /// True when `bytes` is a plausibly-decodable PNG: the 8-byte signature plus

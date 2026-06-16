@@ -147,6 +147,7 @@ cmd_stop() {
     info "Stopping WDA runner + relay"
     _kill_pidfile "$RUNNER_PID_FILE"
     _kill_pidfile "$RELAY_PID_FILE"
+    _kill_pidfile "$STATE_DIR/wda-mjpeg-relay.pid"
     pkill -f "xcodebuild.*WebDriverAgentRunner" 2>/dev/null || true
     ok "stopped"
 }
@@ -319,6 +320,28 @@ sleep 1
 curl -s -m 5 "http://127.0.0.1:$WDA_PORT/status" >/dev/null \
     || die "relay up but WDA not answering through it — check $STATE_DIR/wda-relay.log"
 ok "WDA reachable at http://127.0.0.1:$WDA_PORT"
+
+# ── 5b. MJPEG relay (live video for agent mode — /agent/mjpeg) ─────────────────
+# WDA serves an MJPEG screen stream on the device's :9100, INSIDE the same
+# XCUITest session as control — so live video and driving coexist (iPhone
+# Mirroring can't run alongside WDA, this can). Forward it to 127.0.0.1:9100 so
+# the daemon's /agent/mjpeg can proxy it. Best-effort: a missing MJPEG relay
+# only loses live video, never control — so we never `die` here.
+MJPEG_PORT="${MJPEG_PORT:-9100}"; PHONE_MJPEG_PORT=9100
+MJPEG_RELAY_PID_FILE="$STATE_DIR/wda-mjpeg-relay.pid"
+_kill_pidfile "$MJPEG_RELAY_PID_FILE"
+if command -v iproxy >/dev/null && _usb_udids | grep -q "$WDA_UDID"; then
+    nohup iproxy "$MJPEG_PORT" "$PHONE_MJPEG_PORT" -u "$WDA_UDID" > "$STATE_DIR/wda-mjpeg-relay.log" 2>&1 &
+    echo $! > "$MJPEG_RELAY_PID_FILE"
+    ok "MJPEG relay (USB) on 127.0.0.1:$MJPEG_PORT — live video via /agent/mjpeg"
+elif command -v socat >/dev/null; then
+    nohup socat "TCP-LISTEN:$MJPEG_PORT,fork,reuseaddr,bind=127.0.0.1" \
+        "TCP:$PHONE_IP:$PHONE_MJPEG_PORT" > "$STATE_DIR/wda-mjpeg-relay.log" 2>&1 &
+    echo $! > "$MJPEG_RELAY_PID_FILE"
+    ok "MJPEG relay (socat) on 127.0.0.1:$MJPEG_PORT → $PHONE_IP:$PHONE_MJPEG_PORT"
+else
+    warn "no iproxy/socat for the MJPEG relay — live video (/agent/mjpeg) unavailable; control still works"
+fi
 
 # ── 6. Point the daemon at it ─────────────────────────────────────────────────
 PLIST="$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.plist"

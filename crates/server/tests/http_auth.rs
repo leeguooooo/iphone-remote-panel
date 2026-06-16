@@ -85,6 +85,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
         viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        mjpeg_url: None,
     })
 }
 
@@ -131,6 +132,7 @@ fn build_state_with_agent_token(
         latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
         viewers: std::sync::Arc::new(std::sync::Mutex::new(server::signaling::ViewerRegistry::default())),
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        mjpeg_url: None,
     })
 }
 
