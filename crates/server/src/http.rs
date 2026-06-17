@@ -1094,26 +1094,26 @@ pub(crate) async fn wda_control_from_json(
         },
         "shortcut" => match v.get("name").and_then(|n| n.as_str()) {
             Some("home") => w.press_home().await,
-            // Spotlight: swipe down starting over the middle of the Home Screen
-            // (not the top edge — that pulls Notification Center).
+            // Spotlight: the pull-down is a SpringBoard system gesture that WDA's
+            // synthetic touches can't trigger. Instead go Home and TAP the Search
+            // pill above the dock — a normal touch that opens Spotlight reliably.
+            // (Hardware-verified at y≈0.82 on a 956pt-tall device.)
             Some("spotlight") => {
                 async {
                     let (sw, sh) = w.window_size().await?;
-                    w.swipe(sw * 0.5, sh * 0.32, sw * 0.5, sh * 0.85, 300).await
+                    w.press_home().await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                    w.tap_point(sw * 0.5, sh * 0.82).await
                 }
                 .await
             }
-            // App switcher: swipe up from the bottom edge to mid-screen and HOLD
-            // before releasing — the dwell is what summons the switcher (a plain
-            // swipe-up just goes Home).
-            Some("switcher") => {
-                async {
-                    let (sw, sh) = w.window_size().await?;
-                    w.swipe_hold(sw * 0.5, sh * 0.992, sw * 0.5, sh * 0.45, 550, 650)
-                        .await
-                }
-                .await
-            }
+            // App switcher: the swipe-up-from-the-home-indicator is a system
+            // gesture WDA can't synthesize (hardware-verified: from Home it goes
+            // Home, from an app the swipe is absorbed — the switcher never opens).
+            // There is no WDA element to tap either, so it's unreachable in agent
+            // mode. Report unhandled; the web client shows a hint instead of
+            // sending a no-op. (Works in mirror mode via the L3 path.)
+            Some("switcher") => return false,
             _ => return false,
         },
         // A whole swipe gesture as ONE on-device drag (start→end). The web client

@@ -894,7 +894,13 @@ function onPointerCancel(e) {
 /* ── Toolbar handlers (v1 parity) ─────────────────────────────── */
 document.getElementById('btnHome').addEventListener('click', () => { sendControl({ type:'shortcut', name:'home' }); toast('Home'); });
 document.getElementById('btnSearch').addEventListener('click', () => { sendControl({ type:'shortcut', name:'spotlight' }); toast('Spotlight'); });
-document.getElementById('btnSwitcher').addEventListener('click', () => { sendControl({ type:'shortcut', name:'switcher' }); toast('切换器'); });
+document.getElementById('btnSwitcher').addEventListener('click', () => {
+  // The App Switcher is a home-indicator system gesture WDA can't synthesize, so
+  // it's unreachable in agent mode (works in mirror mode via L3). Guide the user
+  // to Spotlight, which IS wired up on-device, instead of sending a no-op.
+  if (agentMode) { toast('切换器在 agent 模式不可用 — 用「搜索」找 app'); return; }
+  sendControl({ type:'shortcut', name:'switcher' }); toast('切换器');
+});
 
 const btnFreeze = document.getElementById('btnFreeze');
 const freezeLbl = btnFreeze.querySelector('.lbl');

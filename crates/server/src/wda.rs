@@ -325,45 +325,6 @@ impl WdaClient {
         Ok(())
     }
 
-    /// Like `swipe` but dwells at the end point before releasing. Gestures such as
-    /// the App Switcher (swipe up from the bottom edge and *hold*) only trigger
-    /// when the finger pauses before lifting — a plain `swipe` releases at once and
-    /// just goes Home.
-    pub async fn swipe_hold(
-        &mut self,
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
-        duration_ms: u64,
-        hold_ms: u64,
-    ) -> Result<()> {
-        let sid = self.ensure_session().await?.to_string();
-        self.http
-            .post(format!("{}/session/{}/actions", self.base, sid))
-            .json(&serde_json::json!({
-                "actions": [{
-                    "type": "pointer",
-                    "id": "finger1",
-                    "parameters": { "pointerType": "touch" },
-                    "actions": [
-                        { "type": "pointerMove", "duration": 0, "x": x1, "y": y1 },
-                        { "type": "pointerDown", "button": 0 },
-                        { "type": "pause", "duration": 80 },
-                        { "type": "pointerMove", "duration": duration_ms, "x": x2, "y": y2 },
-                        { "type": "pause", "duration": hold_ms },
-                        { "type": "pointerUp", "button": 0 }
-                    ]
-                }]
-            }))
-            .send()
-            .await
-            .context("POST /actions (swipe_hold)")?
-            .error_for_status()
-            .context("/actions swipe_hold status")?;
-        Ok(())
-    }
-
     /// Press the Home button on-device (`POST /wda/pressButton` `{name:home}`).
     /// Works in agent mode regardless of the Mirroring window — the `shortcut`
     /// path routes through L3 and needs the mirror frontmost, so this is the
