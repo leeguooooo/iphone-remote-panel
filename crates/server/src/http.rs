@@ -1092,11 +1092,53 @@ pub(crate) async fn wda_control_from_json(
             Some(t) => w.keys(t).await,
             None => return false,
         },
-        "shortcut" if v.get("name").and_then(|n| n.as_str()) == Some("home") => {
-            w.press_home().await
+        "shortcut" => match v.get("name").and_then(|n| n.as_str()) {
+            Some("home") => w.press_home().await,
+            // Spotlight: swipe down starting over the middle of the Home Screen
+            // (not the top edge — that pulls Notification Center).
+            Some("spotlight") => {
+                async {
+                    let (sw, sh) = w.window_size().await?;
+                    w.swipe(sw * 0.5, sh * 0.32, sw * 0.5, sh * 0.85, 300).await
+                }
+                .await
+            }
+            // App switcher: swipe up from the bottom edge to mid-screen and HOLD
+            // before releasing — the dwell is what summons the switcher (a plain
+            // swipe-up just goes Home).
+            Some("switcher") => {
+                async {
+                    let (sw, sh) = w.window_size().await?;
+                    w.swipe_hold(sw * 0.5, sh * 0.992, sw * 0.5, sh * 0.45, 550, 650)
+                        .await
+                }
+                .await
+            }
+            _ => return false,
+        },
+        // A whole swipe gesture as ONE on-device drag (start→end). The web client
+        // sends this on pointer-up in agent mode instead of streaming per-move
+        // scroll deltas (WDA has no scroll-wheel; a delta stream turned into a
+        // storm of discrete swipes that kept scrolling after release — issue: the
+        // screen "kept moving" after the finger stopped).
+        "swipe" => {
+            let g = |k: &str| v.get(k).and_then(|x| x.as_f64());
+            match (g("x1"), g("y1"), g("x2"), g("y2")) {
+                (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                    async {
+                        let (sw, sh) = w.window_size().await?;
+                        let (ax, ay, bx, by) = (x1 * sw, y1 * sh, x2 * sw, y2 * sh);
+                        let dist = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+                        let dur = (dist * 0.9).clamp(120.0, 500.0) as u64;
+                        w.swipe(ax, ay, bx, by, dur).await
+                    }
+                    .await
+                }
+                _ => return false,
+            }
         }
-        // Not a WDA-routable type (down/up/key/spotlight/switcher). Leave the
-        // actionable flag as-is and let the caller decide based on it.
+        // Not a WDA-routable type (down/up/key). Leave the actionable flag as-is
+        // and let the caller decide based on it.
         _ => return false,
     };
     match r {
