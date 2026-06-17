@@ -853,9 +853,13 @@ function onPointerMove(e) {
       // long-press already fired → real mouse-drag (slider/reorder).
       if (coords) sendMove(coords.nx, coords.ny, 1);
     } else if (moved) {
-      // swipe before any hold → scroll. Cancel the long-press timer once.
+      // swipe before any hold. Cancel the long-press timer once.
       if (!pd.scrolling) { clearTimeout(pd.longTimer); pd.scrolling = true; }
-      if (coords) sendScroll(coords.nx, coords.ny, ddx, ddy);
+      // Mirror mode: stream scroll-wheel deltas (the only thing Mirroring scrolls
+      // on). Agent/WDA mode has NO scroll-wheel — a per-move delta stream becomes a
+      // storm of discrete on-device swipes that keep scrolling after release, so
+      // there we accumulate and fire ONE swipe (start→end) on pointer-up instead.
+      if (!agentMode && coords) sendScroll(coords.nx, coords.ny, ddx, ddy);
     }
   }
 }
@@ -867,13 +871,20 @@ function onPointerUp(e) {
   if (pd.pressed) {
     // release the held long-press / drag.
     if (coords) sendControl({ type:'up', x:coords.nx, y:coords.ny });
-  } else if (!pd.scrolling) {
+  } else if (pd.scrolling) {
+    // swipe released. Mirror mode already scrolled per-move (scroll-wheel) — nothing
+    // to do. Agent/WDA mode: emit the whole gesture as ONE on-device drag (start→end).
+    if (agentMode) {
+      const a = pointerToNormalized(pd.startX, pd.startY);
+      const b = pointerToNormalized(e.clientX, e.clientY);
+      if (a && b) sendControl({ type:'swipe', x1:a.nx, y1:a.ny, x2:b.nx, y2:b.ny });
+    }
+  } else {
     // stationary, quick → a tap.
     const dt = performance.now() - pd.startT;
     const dist = Math.hypot(e.clientX - pd.startX, e.clientY - pd.startY);
     if (coords && dist < TAP_SLOP && dt < TAP_MS) { sendControl({ type:'tap', x:coords.nx, y:coords.ny }); showTapDot(e.clientX, e.clientY); }
   }
-  // swipe (scrolling) needs no release event — no mouse button was held.
 }
 function onPointerCancel(e) {
   const pd = pointers.get(e.pointerId); if (pd) clearTimeout(pd.longTimer);
