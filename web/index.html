@@ -555,6 +555,14 @@ function showOverlay(kind) {
       ? `另一个观看者正在使用 — 已排队(前面还有 ${queuedAhead} 位)，对方断开后自动接入`
       : '另一个观看者正在使用 — 已排队，对方断开后将自动接入';
     offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'locked') {
+    /* agent/WDA mode: WDA answers /status but isn't actionable (phone locked or
+       the XCUITest session went zombie), so its MJPEG is dead/stale. Tell the
+       user instead of showing a silent black screen. The daemon's WDA keepalive
+       recovers on its own once the phone is unlocked + awake. */
+    olTitle.textContent = '手机不可用';
+    olSub.textContent   = '手机已锁屏或会话失效 — 请解锁手机并保持唤醒(建议把自动锁定设为「永不」)';
+    offlineOverlay.classList.add('disconnected');
   } else {
     olTitle.textContent = '画面已停止';
     olSub.textContent   = '手机可能已锁屏、断开或镜像已暂停';
@@ -600,7 +608,13 @@ async function pollAgentMode() {
       // of the WebRTC single-viewer lease). So the "轻触以开始" play gesture and the
       // "会话占用中"(queued)/mirror-gone overlays would all wrongly block a live picture.
       playOverlay.classList.add('hidden');
-      if (overlayState === 'gone' || overlayState === 'queued') hideOverlay();
+      if (s.wda_actionable === false) {
+        // WDA up but not actionable (phone locked / zombie session) → MJPEG is
+        // dead/stale. Show an informative overlay instead of a silent black screen.
+        showOverlay('locked');
+      } else if (overlayState === 'locked' || overlayState === 'gone' || overlayState === 'queued') {
+        hideOverlay();                        // recovered → drop the stale overlay
+      }
     } else {
       stopStills();                           // mirror mode → show the WebRTC video
     }
