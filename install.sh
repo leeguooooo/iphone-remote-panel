@@ -455,7 +455,7 @@ printf "${BOLD}━━━ Connect from your iPhone ━━━${RESET}\n"
 printf "  1. Make sure the iPhone is on the same Wi-Fi as this Mac.\n"
 printf "  2. In iPhone Safari open:  ${BOLD}http://%s:%s/phone${RESET}\n" "$LAN_IP" "$PORT"
 printf "  3. Password: ${BOLD}%s${RESET}\n" "$PASSWORD"
-if [ "$GENERATED_PW" = "1" ]; then
+if [ "$PW_SOURCE" = "generated" ]; then
     printf "     ${YELLOW}(generated — save it; it's stored in %s)${RESET}\n" "$PLIST_DST"
 fi
 printf "     Change it later by editing PHONE_REMOTE_PASSWORD in that plist + kickstart.\n"
