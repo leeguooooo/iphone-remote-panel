@@ -146,6 +146,7 @@ npx skills update -g                                                            
 | `PHONE_REMOTE_WDA_URL` | *(无)* | L2 元素树控制：指向可达的 WebDriverAgent（推荐 `http://127.0.0.1:8100`，由 `scripts/setup-wda.sh` 的中继提供）。设置后 agent 的文字/点按自动路由到手机端元素层 —— 中文直通、按标签点按无需坐标、完全不碰 Mac 光标；不设 = 纯像素路径。 |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 静态 TURN 服务器（Cloudflare 的替代方案）。 |
 | `PHONE_REMOTE_AUTO_RESUME` | *(关)* | `1` = 实验性：watchdog 自动点击 Mirroring 的 Resume/Connect 按钮恢复暂停屏。默认关 —— 手机使用中时 macOS 不允许后台 agent 把 Mirroring 置前，无法做到可靠，改用 `mirror_state`/`hint` 提示你何时手动点。 |
+| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | 空闲自动释放（仅 WDA 模式）：连续这么多秒没有任何 `/agent` 操作、也没有人在看实时画面时，守护进程会停掉手机上的 WDA runner 并 bootout 它的 KeepAlive LaunchAgent，把手机**交还给你正常使用** —— 没人远程控制时不再一直占着设备。下一次 `/agent/input`（或网页「重新连接」按钮）会自动重新拉起 WDA（约 30–90s；锁屏的话解锁一次）。空闲释放期间 `/agent/status` 返回 `"released":true`。设为 `0` 关闭（WDA 24/7 常驻，旧行为）。 |
 
 ## 智能体 API
 

@@ -493,12 +493,15 @@ if (reconnectBtn) reconnectBtn.onclick = async () => {
   const orig = reconnectBtn.textContent;
   reconnectBtn.textContent = '连接中…';
   try {
-    // mode=mirror runs the full server-side recovery (lock phone, stop any WDA,
-    // bring Mirroring frontmost, tap Try Again). One click, no blind tapping.
+    // When the phone was idle-released (handed back to its owner), reconnect
+    // means "take the phone back" → restart WDA (mode=agent). Otherwise it's a
+    // stalled mirror: mode=mirror runs the full server-side recovery (lock
+    // phone, stop any WDA, bring Mirroring frontmost, tap Try Again).
+    const mode = (overlayState === 'released') ? 'agent' : 'mirror';
     await fetch('/agent/mode', {
       method: 'POST', cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'mirror' }),
+      body: JSON.stringify({ mode }),
     });
   } catch (_) { /* best-effort */ }
   setTimeout(() => { reconnectBtn.disabled = false; reconnectBtn.textContent = orig; }, 12000);
@@ -555,6 +558,13 @@ function showOverlay(kind) {
       ? `另一个观看者正在使用 — 已排队(前面还有 ${queuedAhead} 位)，对方断开后自动接入`
       : '另一个观看者正在使用 — 已排队，对方断开后将自动接入';
     offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'released') {
+    /* idle auto-release: the daemon stopped WDA after a stretch of no remote
+       activity so the phone is free for hands-on use. Not an error — offer to
+       take it back. The reconnect button posts mode=agent in this state. */
+    olTitle.textContent = '手机已交还给你';
+    olSub.textContent   = '一段时间无远程操作，已自动把手机交还，你可正常使用。需要远程控制时点「重新连接」(约 30-90 秒重启 WDA)';
+    offlineOverlay.classList.add('disconnected');
   } else if (kind === 'locked') {
     /* agent/WDA mode: WDA answers /status but isn't actionable (phone locked or
        the XCUITest session went zombie), so its MJPEG is dead/stale. Tell the
@@ -602,6 +612,16 @@ async function pollAgentMode() {
     if (!r.ok) return;
     const s = await r.json();
     agentMode = (s.mode === 'agent');
+    if (s.released === true) {
+      // Idle auto-release takes priority over mode rendering: WDA is stopped on
+      // purpose so the owner can use the phone. Show the reconnect affordance.
+      stopStills();
+      playOverlay.classList.add('hidden');
+      showOverlay('released');
+      return;
+    } else if (overlayState === 'released') {
+      hideOverlay();   // taken back → drop the released overlay
+    }
     if (agentMode) {
       startStills();                          // MJPEG (WDA device) overlays the WebRTC track
       // The MJPEG <img> needs no autoplay gesture, and it's per-viewer (independent

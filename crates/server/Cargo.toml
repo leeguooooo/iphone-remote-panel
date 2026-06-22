@@ -39,6 +39,10 @@ webrtc = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 arc-swap = "1"
 
+# Stream combinators — attach a live-view drop guard to the proxied MJPEG
+# stream so an open viewer counts as activity for the idle-release watchdog.
+futures-util = "0.3"
+
 # WDA (L2 element-tree control): screenshots arrive base64-encoded.
 base64 = "0.22"
 

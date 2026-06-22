@@ -2999,6 +2999,7 @@ dependencies = [
  "clap",
  "core",
  "core-graphics 0.25.0",
+ "futures-util",
  "http-body-util",
  "libc",
  "objc2-app-kit",

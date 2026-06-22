@@ -165,6 +165,7 @@ the heaviest users make the product better.
 | `PHONE_REMOTE_WDA_URL` | *(none)* | L2 element-tree control: a WebDriverAgent reachable at this URL (use `http://127.0.0.1:8100` via the relay from `scripts/setup-wda.sh`). When set, agent text/taps auto-route through the phone-side element layer — CJK text lands cleanly, label-taps need no coordinates, nothing touches the host cursor. Unset = pure pixel path. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Static TURN server (alternative to Cloudflare). |
 | `PHONE_REMOTE_AUTO_RESUME` | *(off)* | `1` = experimental: a watchdog clicks the Mirroring Resume/Connect button to recover the paused screen unattended. Off by default — macOS blocks a background agent from focusing Mirroring while the phone is in use, so it can't be made reliable; `mirror_state`/`hint` tell you when to click manually instead. |
+| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | Idle auto-release (WDA only): after this many seconds with no `/agent` activity and no viewer streaming, the daemon stops the on-phone WDA runner and boots out its KeepAlive LaunchAgent so the phone is **free for hands-on use** — it doesn't keep occupying the device when nobody's driving it. The next `/agent/input` (or the web "重新连接" button) re-bootstraps WDA (~30–90s; unlock the phone once if locked). `/agent/status` reports `"released":true` while idle-released. Set `0` to disable (keep WDA up 24/7, the old behavior). |
 
 ## Agent API
 

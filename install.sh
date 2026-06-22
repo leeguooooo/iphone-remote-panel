@@ -305,6 +305,12 @@ cat > "$PLIST_DST" <<PLIST
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Cap the relaunch rate: if startup fails (missing TCC grant, port in use)
+         launchd would otherwise relaunch instantly, pegging launchservicesd at
+         100% CPU and ballooning the err log (issue #28). The daemon also backs
+         off ~30s before exiting unattended; this bounds it at the launchd layer. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>${LOG_DIR}/iphone-use.log</string>
     <key>StandardErrorPath</key>

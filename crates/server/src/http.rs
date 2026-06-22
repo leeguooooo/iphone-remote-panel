@@ -204,6 +204,59 @@ pub struct AppState {
     /// is never yanked frontmost (no Mac focus steal). When false (mirror mode),
     /// fall through to the L3 injector as before.
     pub wda_actionable: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic timestamp of the last remote-driving activity — any `/agent`
+    /// control or live-view request, refreshed by [`AppState::touch_activity`].
+    /// The idle-release watchdog ([`spawn_idle_release_watchdog`]) frees the
+    /// phone (stops WDA, boots out its KeepAlive LaunchAgent) once this goes
+    /// stale and nobody is watching, so the owner gets their device back when
+    /// no one is driving it remotely.
+    pub last_activity: Arc<Mutex<Instant>>,
+    /// True while WDA has been auto-released for idle (runner stopped + its
+    /// LaunchAgent booted out). The next `/agent/input` re-bootstraps it.
+    pub released: Arc<std::sync::atomic::AtomicBool>,
+    /// Open `/agent/mjpeg` live-view streams. A connected viewer counts as
+    /// activity for as long as it watches, so passive viewing doesn't get
+    /// released out from under the user.
+    pub live_streams: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AppState {
+    /// Stamp "remote driving happened just now" for the idle-release watchdog.
+    /// Called by every `/agent` action and live-view request (NOT `/agent/status`,
+    /// which the web client polls constantly — counting it would pin the phone
+    /// forever).
+    pub fn touch_activity(&self) {
+        *recover(self.last_activity.lock()) = Instant::now();
+    }
+
+    /// A viewer is actively watching — an MJPEG stream is open or a `/ws`
+    /// WebRTC viewer is connected. The watchdog never releases out from under one.
+    fn viewer_busy(&self) -> bool {
+        self.live_streams.load(std::sync::atomic::Ordering::Relaxed) > 0
+            || recover(self.viewers.lock()).count() > 0
+    }
+
+    /// How long since the last remote-driving activity.
+    fn idle_for(&self) -> std::time::Duration {
+        recover(self.last_activity.lock()).elapsed()
+    }
+}
+
+/// RAII counter for in-flight `/agent/mjpeg` live-view streams. Increments
+/// [`AppState::live_streams`] on creation and decrements on drop — so when the
+/// viewer's connection ends (browser tab closed, network drop) the count falls
+/// and the phone becomes eligible for idle release again.
+struct StreamGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl StreamGuard {
+    fn new(c: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        StreamGuard(c)
+    }
+}
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -687,8 +740,11 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // "warp" | "usb" | "trust" | "ddi" | "" — instead of polling wda:false
     // blind. Only honored while fresh (< 5 min) so a stale file isn't reported.
     let setup_blocked_on = read_setup_blocked_on();
+    // Idle auto-release: surface whether the phone was let go for inactivity, so
+    // the web client can show "released — tap to reconnect" instead of an error.
+    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -794,6 +850,96 @@ fn bootout_wda_agent() {
         .status();
 }
 
+/// Stop the on-phone WDA runner + relay and boot out its KeepAlive LaunchAgent
+/// (FIRST — else KeepAlive would just rebuild the runner we're about to kill).
+/// Shared by `mode=mirror` and the idle-release watchdog. Returns whether the
+/// `setup-wda.sh stop` path ran (vs. the pkill fallback). Blocking — call under
+/// `spawn_blocking`.
+fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
+    bootout_wda_agent();
+    let via_script = std::path::Path::new(setup_sh).exists()
+        && std::process::Command::new("bash")
+            .arg(setup_sh)
+            .arg("stop")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !via_script {
+        for pat in ["xcodebuild.*WebDriverAgentRunner", "socat.*8100", "iproxy 8100"] {
+            let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
+        }
+    }
+    via_script
+}
+
+/// Idle auto-release — the phone belongs to its owner first. When WDA is
+/// configured and nobody has driven it for `PHONE_REMOTE_IDLE_RELEASE_SECS`
+/// (default 300; `0` disables) and no viewer is streaming, stop the on-phone
+/// WDA runner and boot out its KeepAlive LaunchAgent so the device is free for
+/// hands-on use. The next `/agent/input` re-bootstraps WDA (see [`agent_input`]).
+///
+/// Unlike `mode=mirror`, this does NOT bring iPhone Mirroring frontmost — the
+/// goal is to LET GO of the phone, not grab it back for screen viewing.
+///
+/// No-op (and silent) when WDA isn't configured: a pure L3/mirror deployment has
+/// no persistent on-device session to release.
+pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
+    if state.wda.is_none() {
+        return; // nothing persistent to release without WDA
+    }
+    let idle_secs = std::env::var("PHONE_REMOTE_IDLE_RELEASE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+    if idle_secs == 0 {
+        tracing::info!("idle auto-release disabled (PHONE_REMOTE_IDLE_RELEASE_SECS=0)");
+        return;
+    }
+    let window = std::time::Duration::from_secs(idle_secs);
+    tracing::info!("idle auto-release enabled: free the phone after {idle_secs}s idle");
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        const POLL: std::time::Duration = std::time::Duration::from_secs(20);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+        loop {
+            tokio::time::sleep(POLL).await;
+            if state.released.load(Ordering::Relaxed) {
+                continue; // already let go — reconnect is on-demand (agent_input)
+            }
+            if state.viewer_busy() {
+                continue; // someone is watching the live feed
+            }
+            if state.idle_for() < window {
+                continue; // driven recently
+            }
+            // Only release a runner that's actually up — don't fight a bring-up
+            // already in progress, and don't churn launchctl when WDA is down
+            // for some other reason.
+            let up = match &state.wda {
+                Some(w) => w.lock().await.is_up().await,
+                None => false,
+            };
+            if !up {
+                continue;
+            }
+            tracing::info!(
+                "idle {}s with no viewer — releasing the phone (stopping WDA)",
+                state.idle_for().as_secs()
+            );
+            let script = setup_sh.clone();
+            tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+                .await
+                .ok();
+            if let Some(wda) = &state.wda {
+                wda.lock().await.invalidate_session();
+            }
+            state.wda_actionable.store(false, Ordering::Relaxed);
+            state.released.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
 /// `POST /agent/mode` — switch between the two (mutually exclusive) control
 /// modes. Body: `{"mode":"mirror"}` or `{"mode":"agent"}`.
 ///
@@ -861,24 +1007,9 @@ async fn agent_mode(
             //    relay via the script (single source of truth for pidfiles),
             //    falling back to pkill.
             let script = setup_sh.clone();
-            let stopped = tokio::task::spawn_blocking(move || {
-                bootout_wda_agent();
-                let via_script = std::path::Path::new(&script).exists()
-                    && std::process::Command::new("bash")
-                        .arg(&script)
-                        .arg("stop")
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                if !via_script {
-                    for pat in ["xcodebuild.*WebDriverAgentRunner", "socat.*8100", "iproxy 8100"] {
-                        let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
-                    }
-                }
-                via_script
-            })
-            .await
-            .unwrap_or(false);
+            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+                .await
+                .unwrap_or(false);
             // 2) Drop any cached WDA session — it's dead now.
             if let Some(wda) = &state.wda {
                 wda.lock().await.invalidate_session();
@@ -946,6 +1077,11 @@ async fn agent_mode(
             let log = format!("{home}/.iphone-use/wda-agent.log");
             let udid_env = udid.as_deref().unwrap_or("");
             let spawned = write_and_bootstrap_wda_agent(&home, &setup_sh, &log, udid_env);
+            // Explicit bring-up clears any idle-release flag and resets the idle
+            // clock, so the watchdog doesn't immediately tear down the runner we
+            // just asked for.
+            state.released.store(false, std::sync::atomic::Ordering::Relaxed);
+            state.touch_activity();
             let body = format!(
                 r#"{{"ok":{spawned},"mode":"agent","starting":true,"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — the launcher waits for it; WDA now auto-restarts if it drops"}}"#
             );
@@ -1233,6 +1369,32 @@ async fn agent_input(
             };
         }
     }
+    // If the idle watchdog released the phone (WDA stopped so the owner could
+    // use it), a fresh driving request means "I want it back" — re-bootstrap WDA
+    // and tell the caller to retry once it's up (~30-90s). One caller wins the
+    // swap and kicks the bring-up; the rest get the same retry signal.
+    if state.released.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        state.touch_activity();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+        let log = format!("{home}/.iphone-use/wda-agent.log");
+        tokio::task::spawn_blocking(move || {
+            write_and_bootstrap_wda_agent(&home, &setup_sh, &log, "");
+        });
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(
+                    r#"{"ok":false,"reconnecting":true,"hint":"phone was idle-released to free it for hands-on use; WDA is restarting (~30-90s) — retry. If the phone is locked, unlock it once."}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    // Every real driving request resets the idle clock so the watchdog only
+    // fires during genuine inactivity.
+    state.touch_activity();
     // ── L2 auto-routing (WebDriverAgent) ──────────────────────────────────
     // When WDA is configured, prefer it for the actions where it is strictly
     // better: text goes in as Unicode (CJK lands cleanly instead of being
@@ -1611,6 +1773,8 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         ),
         AgentAuth::Ok => {}
     }
+    // Inspecting the element tree is part of driving — keep the phone held.
+    state.touch_activity();
     // Always answer with parseable JSON so a client's `r.json()["elements"]`
     // never throws — even when WDA is absent or mid-transition (issue #18-B:
     // a non-JSON 502/503 body crashed agents' decoders, same class as #15-C).
@@ -1685,6 +1849,8 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
             AgentAuth::Ok => {}
         }
     }
+    // A screenshot means someone is looking at the phone — keep it held.
+    state.touch_activity();
     // Prefer the WDA on-device capture whenever WDA is configured. In agent mode
     // the Mirroring window only shows the "iPhone in Use" interstitial (WDA
     // monopolizes the device), and when WDA targets a *second* phone the mirror
@@ -1779,6 +1945,10 @@ async fn agent_mjpeg(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             AgentAuth::Ok => {}
         }
     }
+    // Opening the live feed counts as watching — stamp now, and hold a stream
+    // guard (below) for the whole connection so the idle watchdog won't release
+    // the phone while a viewer is on it.
+    state.touch_activity();
     let Some(url) = state.mjpeg_url.clone() else {
         return with_security_headers(
             (StatusCode::SERVICE_UNAVAILABLE, "no WDA MJPEG configured").into_response(),
@@ -1804,7 +1974,16 @@ async fn agent_mjpeg(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("multipart/x-mixed-replace; boundary=--BoundaryString")
                 .to_string();
-            let body = Body::from_stream(up.bytes_stream());
+            // Carry a StreamGuard alongside the proxied stream: it increments
+            // live_streams now and decrements when this stream is dropped (the
+            // viewer disconnects), so an open feed keeps the phone from being
+            // idle-released and the count falls cleanly when they leave.
+            use futures_util::StreamExt;
+            let guard = StreamGuard::new(state.live_streams.clone());
+            let body = Body::from_stream(up.bytes_stream().map(move |item| {
+                let _keep = &guard; // hold the guard for the stream's lifetime
+                item
+            }));
             Response::builder()
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CACHE_CONTROL, "no-store")

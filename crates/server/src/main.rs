@@ -27,6 +27,17 @@ use server::http::{self, AppState};
 const PID_FILE: &str = "iphone-use.pid";
 /// Secret file name inside the runtime dir.
 const SECRET_FILE: &str = "secret";
+/// Seconds to sleep before exiting on an unattended startup failure, so a
+/// launchd `KeepAlive` relaunch loop stays gentle instead of spinning (issue #28).
+const STARTUP_BACKOFF_SECS: u64 = 30;
+
+/// Is stderr a terminal? When false we're almost certainly running under launchd
+/// (stderr redirected to the log file), where a fast crash-relaunch loop is
+/// harmful — see the backoff in [`main`].
+fn stderr_is_tty() -> bool {
+    // SAFETY: `isatty` is a pure libc query on a fixed fd, no memory effects.
+    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+}
 
 #[derive(Parser)]
 #[command(name = "iphone-use", about = "iPhone Mirroring → WebRTC remote daemon")]
@@ -53,10 +64,31 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Serve => serve(),
         Command::Stop => stop(),
+    };
+
+    // Issue #28: under launchd `KeepAlive=true`, a startup that fails fast
+    // (missing TCC grant, port already in use) is relaunched instantly — tens
+    // of thousands of times — pegging `launchservicesd` at ~100% CPU and growing
+    // the stderr log to hundreds of MB. When we're running UNATTENDED (stderr is
+    // a file launchd redirected, not a TTY), back off before exiting so the
+    // relaunch cadence is gentle and self-recovers once the user grants
+    // permissions / frees the port. (The plist also carries a ThrottleInterval;
+    // this is belt-and-suspenders and protects even a hand-written plist.) A
+    // human running `iphone-use serve` in a terminal exits immediately as before.
+    if result.is_err() && !stderr_is_tty() {
+        if let Err(e) = &result {
+            tracing::error!(
+                "startup failed: {e:#} — backing off {STARTUP_BACKOFF_SECS}s before exit \
+                 (launchd will relaunch; grant Screen Recording + Accessibility, or free the \
+                 port, to recover)"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(STARTUP_BACKOFF_SECS));
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +244,11 @@ fn serve() -> Result<()> {
                     .map(|_| "http://127.0.0.1:9100".to_string())
             }),
         wda_actionable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Idle auto-release: start the clock now so a daemon that boots with no
+        // one driving releases the phone after the first idle window.
+        last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+        released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        live_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     run_server(cfg, state)
@@ -393,6 +430,10 @@ fn run_server(cfg: Config, state: Arc<AppState>) -> Result<()> {
 
         // Auto-recover the Mirroring "Connection Paused" screen (issue #3).
         spawn_pause_watchdog(state.clone());
+
+        // Idle auto-release: free the phone (stop WDA) after it sits unused, so
+        // its owner can use it normally; the next /agent/input re-bootstraps it.
+        http::spawn_idle_release_watchdog(state.clone());
 
         let app = http::router(state);
         axum::serve(listener, app)

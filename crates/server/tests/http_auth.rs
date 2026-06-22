@@ -87,6 +87,9 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         mjpeg_url: None,
         wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        live_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
 }
 
@@ -135,6 +138,9 @@ fn build_state_with_agent_token(
         mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         mjpeg_url: None,
         wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        live_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
 }
 
