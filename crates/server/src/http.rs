@@ -1735,11 +1735,23 @@ async fn agent_input(
     // it frontmost up front; if that fails, report the drop instead of lying.
     #[cfg(target_os = "macos")]
     {
-        let delivered = tokio::task::spawn_blocking(|| {
-            crate::macos::ensure_mirroring_frontmost(std::time::Duration::from_millis(1200))
-        })
-        .await
-        .unwrap_or(false);
+        // 1200ms was shorter than this same activation path's own documented
+        // reality (input_bridge.rs: "the osascript activation path takes >2s
+        // on first use, so the default deadline is generous" — 4000ms there).
+        // A too-short preflight here meant the very first tap after a fresh
+        // install/permission-grant would be dropped as "could not bring
+        // frontmost" even though activation was still in flight, not actually
+        // denied (issue #29). Match the injector's default so both paths give
+        // activation the same runway; still overridable for tight loops.
+        let front_deadline = std::env::var("PHONE_REMOTE_FRONT_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(4000));
+        let delivered =
+            tokio::task::spawn_blocking(move || crate::macos::ensure_mirroring_frontmost(front_deadline))
+                .await
+                .unwrap_or(false);
         if !delivered {
             return with_security_headers(
                 Response::builder()

@@ -79,25 +79,47 @@ mod imp {
         // works: the Apple Event asks the TARGET app to activate itself, which
         // the system permits. First use pops an Automation consent once
         // ("iPhoneUse" wants to control "iPhone Mirroring") — grant it once.
+        //
+        // We capture stderr/exit code here (previously discarded via
+        // `.status()`) because a TCC/Automation denial fails *silently* from
+        // the caller's point of view otherwise: `osascript` prints
+        // "execution error: Not authorized to send Apple events to iPhone
+        // Mirroring. (-1743)" and exits non-zero, but with only `.status()`
+        // that reason never reaches the logs — every failure looks identical
+        // ("could not bring frontmost") whether the app quit, the name is
+        // localized differently, or Automation consent was denied. Surfacing
+        // it turns an unreproducible report into an actionable one (issue #29).
         for name in MIRRORING_NAMES {
-            let status = std::process::Command::new("/usr/bin/osascript")
+            match std::process::Command::new("/usr/bin/osascript")
                 .args(["-e", &format!(r#"tell application "{name}" to activate"#)])
-                .status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
+                .output()
+            {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => tracing::warn!(
+                    "osascript activate {name:?} failed (exit {:?}): {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => tracing::warn!("osascript activate {name:?} could not run: {e}"),
             }
         }
         // Fallback (helps when Automation consent was denied): open -a still
         // works when the user isn't actively focused elsewhere.
         for name in MIRRORING_NAMES {
-            let status = std::process::Command::new("/usr/bin/open")
+            match std::process::Command::new("/usr/bin/open")
                 .args(["-a", name])
-                .status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
+                .output()
+            {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => tracing::warn!(
+                    "open -a {name:?} failed (exit {:?}): {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => tracing::warn!("open -a {name:?} could not run: {e}"),
             }
         }
-        tracing::debug!("could not bring iPhone Mirroring frontmost via osascript or `open -a`");
+        tracing::warn!("could not bring iPhone Mirroring frontmost via osascript or `open -a`");
     }
 
     /// The known localized names of the iPhone Mirroring app (en + zh-CN).
