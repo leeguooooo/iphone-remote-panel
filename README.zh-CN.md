@@ -357,6 +357,20 @@ WARP 或其他 VPN 可能阻断 CoreDevice 隧道，导致 WDA 无法安装、�
 `setup_message` 会报告当前构建阶段；只有 `drivable:true` 才代表可以操作。
 企业设备应由管理员配置合适的 split tunnel。
 
+**WARP 同样会打挂 iPhone 镜像本身——哪怕本项目一行都没跑。** 镜像走的是接力（Continuity），
+常开 VPN 会同时拖累 Wi-Fi 关联和 CoreDevice 隧道，于是在 daemon 已停、WDA 根本没装的情况下，
+镜像窗口照样卡在「连接中」或直接超时（issue #17，在 macOS 26 与 27.0 beta 上各自独立复现）。
+往这里提 bug 之前先自查：
+
+1. 把我们的东西全停掉 —— `launchctl bootout gui/$(id -u)/com.leeguoo.iphone-use`
+   以及 `.wda` 那个 job —— 并退出镜像窗口。
+2. `warp-cli disconnect`（或彻底退出 VPN 客户端）。
+3. 重新打开 iPhone 镜像。
+
+第 3 步能连上，就说明 daemon 从头到尾没参与，解法与上面的 split tunnel 排除一致。
+注意 Zero Trust 的 *Always On* 策略会自动把 WARP 重新连上，所以长期解法是让管理员配置排除规则，
+手动断开只能顶一时。
+
 ## 路线
 
 - [ ] 按下面的矩阵完成 Direct 浏览器整链路真机验收。

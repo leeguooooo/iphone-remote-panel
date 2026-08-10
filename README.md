@@ -432,6 +432,22 @@ decision. While daemon-owned recovery is affected, `/agent/status` reports
 the generic reconnect wait text. Managed Macs should use an administrator-approved
 split-tunnel rule.
 
+**WARP also breaks iPhone Mirroring itself, with none of this running.** Mirroring
+rides on Continuity, so an always-on VPN that degrades Wi-Fi association and the
+CoreDevice tunnel can leave the Mirroring window stuck at *Connecting* or timing out
+even with the daemon stopped and no WDA installed (issue #17, reproduced independently
+on macOS 26 and 27.0 beta). Confirm before filing a bug here:
+
+1. Stop everything of ours — `launchctl bootout gui/$(id -u)/com.leeguoo.iphone-use`
+   and the `.wda` job — and quit the Mirroring window.
+2. `warp-cli disconnect` (or fully quit the VPN client).
+3. Reopen iPhone Mirroring.
+
+If it connects at step 3, the daemon was never involved and the fix is the same
+split-tunnel exclusion as above. A Zero Trust *Always On* policy will reconnect WARP
+on its own, so a lasting fix needs an administrator exclusion rather than a manual
+disconnect.
+
 ## Roadmap
 
 The product direction is direct-to-device. Current priorities:

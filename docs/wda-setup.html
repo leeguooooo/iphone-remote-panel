@@ -241,6 +241,13 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   <p>排障速记：WDA / 真机装不上时先看 <code>setup-wda.sh doctor</code>、<code>warp-cli settings</code> 和
   <code>warp-cli status</code>。脚本会验证 Traffic only / Include 的有效排除路由，并将 Local proxy mode
   视为路由安全；是否切换 VPN 状态或组织策略由操作者或管理员决定。</p>
+  <p><strong>连 iPhone 镜像本身也会被打挂，跟本项目无关。</strong>镜像走接力（Continuity），
+  常开 VPN 同时拖累 Wi-Fi 关联和 CoreDevice 隧道，所以在 daemon 已停、WDA 根本没装的情况下，
+  镜像窗口照样能卡在「连接中」或直接超时（issue #17，macOS 26 与 27.0 beta 上各自独立复现）。
+  判定方法：<code>launchctl bootout gui/$(id -u)/com.leeguoo.iphone-use</code> 连同 <code>.wda</code>
+  那个 job 全停掉、退出镜像窗口，再 <code>warp-cli disconnect</code>，然后重开镜像——能连上就说明
+  daemon 从头到尾没参与，解法仍是上面那条 split tunnel 排除规则。Zero Trust 的
+  <em>Always On</em> 策略会自动把 WARP 连回来，手动断开只顶一时。</p>
 </div>
 
 <h2>已有真机证据（组件级）</h2>
