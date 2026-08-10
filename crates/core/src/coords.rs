@@ -66,7 +66,12 @@ mod tests {
 
     fn portrait_geo() -> SessionGeometry {
         SessionGeometry {
-            content_rect: Rect { x: 100.0, y: 200.0, w: 300.0, h: 600.0 },
+            content_rect: Rect {
+                x: 100.0,
+                y: 200.0,
+                w: 300.0,
+                h: 600.0,
+            },
             scale: 2.0,
             orientation: Orientation::Portrait,
         }
@@ -121,7 +126,12 @@ mod tests {
     #[test]
     fn landscape_left_center_maps_to_content_rect_center() {
         let geo = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 600.0, h: 300.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 600.0,
+                h: 300.0,
+            },
             scale: 2.0,
             orientation: Orientation::LandscapeLeft,
         };
@@ -133,7 +143,12 @@ mod tests {
     #[test]
     fn landscape_right_center_maps_to_content_rect_center() {
         let geo = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 600.0, h: 300.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 600.0,
+                h: 300.0,
+            },
             scale: 2.0,
             orientation: Orientation::LandscapeRight,
         };
@@ -146,12 +161,22 @@ mod tests {
     #[test]
     fn resize_keeps_normalized_point_proportional() {
         let geo1 = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 200.0,
+                h: 400.0,
+            },
             scale: 1.0,
             orientation: Orientation::Portrait,
         };
         let geo2 = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 400.0, h: 800.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 800.0,
+            },
             scale: 1.0,
             orientation: Orientation::Portrait,
         };
@@ -167,12 +192,22 @@ mod tests {
     #[test]
     fn landscape_left_corner_differs_from_portrait() {
         let geo_p = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 300.0, h: 600.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 300.0,
+                h: 600.0,
+            },
             scale: 1.0,
             orientation: Orientation::Portrait,
         };
         let geo_l = SessionGeometry {
-            content_rect: Rect { x: 0.0, y: 0.0, w: 600.0, h: 300.0 },
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 600.0,
+                h: 300.0,
+            },
             scale: 1.0,
             orientation: Orientation::LandscapeLeft,
         };

@@ -162,10 +162,7 @@ const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 /// unit-tested without VideoToolbox.
 ///
 /// Returns an error if the AVCC framing is corrupt (a length runs past the end).
-pub fn avcc_to_annex_b(
-    avcc: &[u8],
-    param_sets: Option<(&[u8], &[u8])>,
-) -> Result<Vec<u8>, String> {
+pub fn avcc_to_annex_b(avcc: &[u8], param_sets: Option<(&[u8], &[u8])>) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(avcc.len() + 16);
 
     if let Some((sps, pps)) = param_sets {
@@ -177,8 +174,7 @@ pub fn avcc_to_annex_b(
 
     let mut i = 0usize;
     while i + 4 <= avcc.len() {
-        let nal_len =
-            u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
+        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
         i += 4;
         if nal_len == 0 || i + nal_len > avcc.len() {
             return Err(format!(
@@ -315,8 +311,9 @@ mod imp {
                 // Use poison-recovery: a panic across the C boundary is
                 // process-fatal, and a poisoned last_emit means the keepalive
                 // timer never fires (viewers see a frozen frame forever).
-                *ctx.last_emit.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Instant::now();
+                *ctx.last_emit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                 // broadcast::send only errors if there are no receivers — fine.
                 let _ = ctx.tx.send(frame);
             }
@@ -374,7 +371,12 @@ mod imp {
             let mut nal_len: i32 = 0;
             let st0 = unsafe {
                 CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                    &fmt, 0, &mut sps_ptr, &mut sps_size, &mut count, &mut nal_len,
+                    &fmt,
+                    0,
+                    &mut sps_ptr,
+                    &mut sps_size,
+                    &mut count,
+                    &mut nal_len,
                 )
             };
             if st0 != 0 || sps_ptr.is_null() {
@@ -409,9 +411,8 @@ mod imp {
         let mut data_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
         let mut length_at_offset = 0usize;
         let mut total_len = 0usize;
-        let st = unsafe {
-            block.data_pointer(0, &mut length_at_offset, &mut total_len, &mut data_ptr)
-        };
+        let st =
+            unsafe { block.data_pointer(0, &mut length_at_offset, &mut total_len, &mut data_ptr) };
         if st != 0 || data_ptr.is_null() {
             return Err(format!("CMBlockBufferGetDataPointer failed: status={st}"));
         }
@@ -469,9 +470,12 @@ mod imp {
             )
         }
         .ok_or_else(|| anyhow::anyhow!("CFNumberCreate failed"))?;
-        let st = unsafe { VTSessionSetProperty(session.as_ref(), key, Some(num.as_ref() as &CFType)) };
+        let st =
+            unsafe { VTSessionSetProperty(session.as_ref(), key, Some(num.as_ref() as &CFType)) };
         if st != 0 {
-            return Err(anyhow::anyhow!("VTSessionSetProperty(int) failed: status={st}"));
+            return Err(anyhow::anyhow!(
+                "VTSessionSetProperty(int) failed: status={st}"
+            ));
         }
         Ok(())
     }
@@ -481,13 +485,25 @@ mod imp {
         key: &CFString,
         value: bool,
     ) -> anyhow::Result<()> {
-        let b = unsafe { if value { kCFBooleanTrue } else { kCFBooleanFalse } }
-            .ok_or_else(|| anyhow::anyhow!("kCFBoolean missing"))?;
+        let b = unsafe {
+            if value {
+                kCFBooleanTrue
+            } else {
+                kCFBooleanFalse
+            }
+        }
+        .ok_or_else(|| anyhow::anyhow!("kCFBoolean missing"))?;
         let st = unsafe {
-            VTSessionSetProperty(session.as_ref(), key, Some(&*(b as *const _ as *const CFType)))
+            VTSessionSetProperty(
+                session.as_ref(),
+                key,
+                Some(&*(b as *const _ as *const CFType)),
+            )
         };
         if st != 0 {
-            return Err(anyhow::anyhow!("VTSessionSetProperty(bool) failed: status={st}"));
+            return Err(anyhow::anyhow!(
+                "VTSessionSetProperty(bool) failed: status={st}"
+            ));
         }
         Ok(())
     }
@@ -499,7 +515,9 @@ mod imp {
     ) -> anyhow::Result<()> {
         let st = unsafe { VTSessionSetProperty(session.as_ref(), key, Some(value as &CFType)) };
         if st != 0 {
-            return Err(anyhow::anyhow!("VTSessionSetProperty(string) failed: status={st}"));
+            return Err(anyhow::anyhow!(
+                "VTSessionSetProperty(string) failed: status={st}"
+            ));
         }
         Ok(())
     }
@@ -631,7 +649,8 @@ mod imp {
         // capture callback closes over the shared encode state, which we fill in
         // before any frame can arrive.
 
-        let (tx, _rx) = tokio::sync::broadcast::channel::<EncodedFrame>(cfg.channel_capacity.max(2));
+        let (tx, _rx) =
+            tokio::sync::broadcast::channel::<EncodedFrame>(cfg.channel_capacity.max(2));
 
         let ctx = Box::new(OutputContext {
             tx: tx.clone(),
@@ -653,12 +672,16 @@ mod imp {
         let capture_cb = {
             let pending = pending.clone();
             Arc::new(move |frame: Frame<'_>| {
-                let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let guard = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(shared) = guard.as_ref() {
                     // Stash the buffer for keepalive, then encode.
                     if let Some(retained) = retain_image_buffer(frame.image_buffer) {
-                        *shared.last_buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(retained);
+                        *shared
+                            .last_buffer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retained);
                     }
                     shared.encode(frame.image_buffer, frame.pts_micros, false);
                 }
@@ -720,8 +743,10 @@ mod imp {
                         if keepalive_should_fire(idle, period, have_buffer) {
                             // Re-encode the last buffer as a fresh IDR. Synthesize
                             // a wall-clock-derived PTS so timestamps stay monotonic.
-                            let buf =
-                                shared.last_buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let buf = shared
+                                .last_buffer
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(SendPixelBuffer(pb)) = buf.as_ref() {
                                 shared.encode(pb, now_micros(), true);
                             }
@@ -781,13 +806,19 @@ mod imp {
             )
         };
         if st != 0 || session_out.is_null() {
-            return Err(anyhow::anyhow!("VTCompressionSessionCreate failed: status={st}"));
+            return Err(anyhow::anyhow!(
+                "VTCompressionSessionCreate failed: status={st}"
+            ));
         }
         let session = unsafe { CFRetained::from_raw(NonNull::new(session_out).unwrap()) };
 
         unsafe {
             set_bool_property(&session, kVTCompressionPropertyKey_RealTime, true)?;
-            set_bool_property(&session, kVTCompressionPropertyKey_AllowFrameReordering, false)?;
+            set_bool_property(
+                &session,
+                kVTCompressionPropertyKey_AllowFrameReordering,
+                false,
+            )?;
             set_string_property(
                 &session,
                 kVTCompressionPropertyKey_ProfileLevel,

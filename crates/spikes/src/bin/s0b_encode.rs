@@ -168,10 +168,7 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 /// Convert one compressed CMSampleBuffer (AVCC, length-prefixed NALUs) into an
 /// Annex-B byte vector. For keyframes, SPS+PPS (from the format description) are
 /// prepended, each as its own start-code-delimited NALU.
-fn build_annex_b(
-    sample: &CMSampleBuffer,
-    ctx: &OutputContext,
-) -> Result<EncodedUnit, String> {
+fn build_annex_b(sample: &CMSampleBuffer, ctx: &OutputContext) -> Result<EncodedUnit, String> {
     const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
     let keyframe = is_keyframe(sample);
     let mut out: Vec<u8> = Vec::new();
@@ -240,22 +237,15 @@ fn build_annex_b(
 
     // Walk the AVCC block buffer: [4-byte BE length][NALU bytes] repeated.
     // SAFETY: a compressed sample buffer always carries a CMBlockBuffer.
-    let block: CFRetained<CMBlockBuffer> = unsafe { sample.data_buffer() }
-        .ok_or("compressed sample has no data buffer")?;
+    let block: CFRetained<CMBlockBuffer> =
+        unsafe { sample.data_buffer() }.ok_or("compressed sample has no data buffer")?;
 
     let total = unsafe { block.data_length() };
     let mut data_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
     let mut length_at_offset: usize = 0;
     let mut total_len: usize = 0;
     // SAFETY: standard CMBlockBufferGetDataPointer call; out-params are valid.
-    let st = unsafe {
-        block.data_pointer(
-            0,
-            &mut length_at_offset,
-            &mut total_len,
-            &mut data_ptr,
-        )
-    };
+    let st = unsafe { block.data_pointer(0, &mut length_at_offset, &mut total_len, &mut data_ptr) };
     if st != 0 || data_ptr.is_null() {
         return Err(format!("CMBlockBufferGetDataPointer failed: status={st}"));
     }
@@ -418,13 +408,7 @@ fn set_int_property(
         )
     }
     .ok_or("CFNumberCreate failed")?;
-    let st = unsafe {
-        VTSessionSetProperty(
-            session.as_ref(),
-            key,
-            Some(num.as_ref() as &CFType),
-        )
-    };
+    let st = unsafe { VTSessionSetProperty(session.as_ref(), key, Some(num.as_ref() as &CFType)) };
     if st != 0 {
         return Err(format!("VTSessionSetProperty(int) failed: status={st}"));
     }
@@ -438,8 +422,14 @@ fn set_bool_property(
     value: bool,
 ) -> Result<(), String> {
     // SAFETY: reading the immortal kCFBoolean* CF singletons.
-    let b = unsafe { if value { kCFBooleanTrue } else { kCFBooleanFalse } }
-        .ok_or("kCFBoolean missing")?;
+    let b = unsafe {
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
+    }
+    .ok_or("kCFBoolean missing")?;
     let st = unsafe {
         VTSessionSetProperty(
             session.as_ref(),
@@ -460,13 +450,7 @@ fn set_string_property(
     key: &CFString,
     value: &CFString,
 ) -> Result<(), String> {
-    let st = unsafe {
-        VTSessionSetProperty(
-            session.as_ref(),
-            key,
-            Some(value as &CFType),
-        )
-    };
+    let st = unsafe { VTSessionSetProperty(session.as_ref(), key, Some(value as &CFType)) };
     if st != 0 {
         return Err(format!("VTSessionSetProperty(string) failed: status={st}"));
     }
@@ -495,9 +479,8 @@ fn find_mirroring_window(
             || hay.contains("\u{955c}\u{50cf}")
     };
 
-    let size_ok = |w: f64, h: f64| -> bool {
-        (200.0..=900.0).contains(&w) && (400.0..=1600.0).contains(&h)
-    };
+    let size_ok =
+        |w: f64, h: f64| -> bool { (200.0..=900.0).contains(&w) && (400.0..=1600.0).contains(&h) };
 
     let mut candidates = Vec::new();
     for win in windows.iter() {
@@ -511,9 +494,8 @@ fn find_mirroring_window(
     }
 
     if candidates.is_empty() {
-        let mut listing = String::from(
-            "could not find an iPhone Mirroring window. windows seen:\n",
-        );
+        let mut listing =
+            String::from("could not find an iPhone Mirroring window. windows seen:\n");
         for win in windows.iter() {
             let app = win.owning_application();
             let frame = win.get_frame();
@@ -568,7 +550,11 @@ fn find_mirroring_window(
         .or_else(|| {
             candidates
                 .iter()
-                .max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    area(a)
+                        .partial_cmp(&area(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .cloned()
         })
         .or_else(|| candidates.first().cloned())
@@ -649,7 +635,11 @@ fn run() -> Result<(), String> {
     // SAFETY: these are immortal CFString constants exported by VideoToolbox.
     unsafe {
         set_bool_property(&session, kVTCompressionPropertyKey_RealTime, true)?;
-        set_bool_property(&session, kVTCompressionPropertyKey_AllowFrameReordering, false)?;
+        set_bool_property(
+            &session,
+            kVTCompressionPropertyKey_AllowFrameReordering,
+            false,
+        )?;
         set_string_property(
             &session,
             kVTCompressionPropertyKey_ProfileLevel,
@@ -697,8 +687,8 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("start_capture failed: {e:?}"))?;
 
     // 4. Drain encoded units, write the Annex-B file, print per-frame stats.
-    let mut file = std::fs::File::create(OUT_FILE)
-        .map_err(|e| format!("could not create {OUT_FILE}: {e}"))?;
+    let mut file =
+        std::fs::File::create(OUT_FILE).map_err(|e| format!("could not create {OUT_FILE}: {e}"))?;
     let mut written = 0usize;
     let mut keyframes = 0usize;
     let mut total_bytes = 0usize;

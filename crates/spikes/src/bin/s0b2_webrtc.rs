@@ -286,17 +286,15 @@ fn build_annex_b(
 
     // Walk the AVCC block buffer: [4-byte BE length][NALU bytes] repeated.
     // SAFETY: a compressed sample buffer always carries a CMBlockBuffer.
-    let block: CFRetained<CMBlockBuffer> = unsafe { sample.data_buffer() }
-        .ok_or("compressed sample has no data buffer")?;
+    let block: CFRetained<CMBlockBuffer> =
+        unsafe { sample.data_buffer() }.ok_or("compressed sample has no data buffer")?;
 
     let total = unsafe { block.data_length() };
     let mut data_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
     let mut length_at_offset: usize = 0;
     let mut total_len: usize = 0;
     // SAFETY: standard CMBlockBufferGetDataPointer call; out-params are valid.
-    let st = unsafe {
-        block.data_pointer(0, &mut length_at_offset, &mut total_len, &mut data_ptr)
-    };
+    let st = unsafe { block.data_pointer(0, &mut length_at_offset, &mut total_len, &mut data_ptr) };
     if st != 0 || data_ptr.is_null() {
         return Err(format!("CMBlockBufferGetDataPointer failed: status={st}"));
     }
@@ -310,8 +308,7 @@ fn build_annex_b(
 
     let mut i = 0usize;
     while i + 4 <= data.len() {
-        let nal_len =
-            u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
         i += 4;
         if nal_len == 0 || i + nal_len > data.len() {
             return Err(format!(
@@ -457,8 +454,14 @@ fn set_bool_property(
     value: bool,
 ) -> Result<(), String> {
     // SAFETY: reading the immortal kCFBoolean* CF singletons.
-    let b = unsafe { if value { kCFBooleanTrue } else { kCFBooleanFalse } }
-        .ok_or("kCFBoolean missing")?;
+    let b = unsafe {
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
+    }
+    .ok_or("kCFBoolean missing")?;
     let st = unsafe {
         VTSessionSetProperty(
             session.as_ref(),
@@ -521,7 +524,8 @@ fn find_mirroring_window(
     }
 
     if candidates.is_empty() {
-        let mut listing = String::from("could not find an iPhone Mirroring window. windows seen:\n");
+        let mut listing =
+            String::from("could not find an iPhone Mirroring window. windows seen:\n");
         for win in windows.iter() {
             let app = win.owning_application();
             let frame = win.get_frame();
@@ -576,7 +580,11 @@ fn find_mirroring_window(
         .or_else(|| {
             candidates
                 .iter()
-                .max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    area(a)
+                        .partial_cmp(&area(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .cloned()
         })
         .or_else(|| candidates.first().cloned())
@@ -650,7 +658,11 @@ fn start_capture_encode(shared: Arc<EncodeShared>) -> Result<(), String> {
     // SAFETY: these are immortal CFString constants exported by VideoToolbox.
     unsafe {
         set_bool_property(&session, kVTCompressionPropertyKey_RealTime, true)?;
-        set_bool_property(&session, kVTCompressionPropertyKey_AllowFrameReordering, false)?;
+        set_bool_property(
+            &session,
+            kVTCompressionPropertyKey_AllowFrameReordering,
+            false,
+        )?;
         set_string_property(
             &session,
             kVTCompressionPropertyKey_ProfileLevel,

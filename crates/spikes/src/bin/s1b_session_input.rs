@@ -21,9 +21,9 @@
 //!
 //! Sends mouseDown@(x,y) -> 5 dragged steps moving 4px down each -> mouseUp.
 
+use core_graphics::event::CGEventTapLocation;
 use core_graphics::event::{CGEvent, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use core_graphics::event::CGEventTapLocation;
 use core_graphics::geometry::CGPoint;
 use std::thread;
 use std::time::Duration;
@@ -73,7 +73,14 @@ fn main() {
     const STEP_PX: f64 = 4.0;
     for i in 1..=STEPS {
         let dy = y + f64::from(i) * STEP_PX;
-        post_mouse(&source, CGEventType::LeftMouseDragged, x, dy, tap, "mouseDragged");
+        post_mouse(
+            &source,
+            CGEventType::LeftMouseDragged,
+            x,
+            dy,
+            tap,
+            "mouseDragged",
+        );
         thread::sleep(Duration::from_millis(16));
     }
 

@@ -64,11 +64,7 @@ struct CaptureHandler {
 }
 
 impl SCStreamOutputTrait for CaptureHandler {
-    fn did_output_sample_buffer(
-        &self,
-        sample_buffer: CMSampleBuffer,
-        of_type: SCStreamOutputType,
-    ) {
+    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
         if of_type != SCStreamOutputType::Screen {
             return;
         }
@@ -154,7 +150,11 @@ fn luminance_stats(frame: &Frame) -> (f64, u64) {
             nonzero += 1;
         }
     }
-    let avg = if px == 0 { 0.0 } else { lum_sum as f64 / px as f64 };
+    let avg = if px == 0 {
+        0.0
+    } else {
+        lum_sum as f64 / px as f64
+    };
     (avg, nonzero)
 }
 
@@ -181,9 +181,8 @@ fn find_mirroring_window(
             || hay.contains("\u{955c}\u{50cf}") // 镜像
     };
 
-    let size_ok = |w: f64, h: f64| -> bool {
-        (200.0..=900.0).contains(&w) && (400.0..=1600.0).contains(&h)
-    };
+    let size_ok =
+        |w: f64, h: f64| -> bool { (200.0..=900.0).contains(&w) && (400.0..=1600.0).contains(&h) };
 
     let mut candidates = Vec::new();
     for win in windows.iter() {
@@ -197,9 +196,8 @@ fn find_mirroring_window(
     }
 
     if candidates.is_empty() {
-        let mut listing = String::from(
-            "could not find an iPhone Mirroring window. windows seen:\n",
-        );
+        let mut listing =
+            String::from("could not find an iPhone Mirroring window. windows seen:\n");
         for win in windows.iter() {
             let app = win.owning_application();
             let frame = win.get_frame();
@@ -263,7 +261,11 @@ fn find_mirroring_window(
         .or_else(|| {
             candidates
                 .iter()
-                .max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    area(a)
+                        .partial_cmp(&area(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .cloned()
         })
         .or_else(|| candidates.first().cloned())
@@ -282,8 +284,9 @@ fn run() -> Result<(), String> {
     println!("s0_capture — ScreenCaptureKit iPhone Mirroring capture probe");
 
     // 1. Enumerate + find the window.
-    let content = SCShareableContent::get()
-        .map_err(|e| format!("SCShareableContent::get failed: {e:?} — Screen Recording permission granted?"))?;
+    let content = SCShareableContent::get().map_err(|e| {
+        format!("SCShareableContent::get failed: {e:?} — Screen Recording permission granted?")
+    })?;
     let window = find_mirroring_window(&content)?;
 
     let app = window.owning_application();
@@ -332,8 +335,7 @@ fn run() -> Result<(), String> {
     let mut stream = SCStream::new(&filter, &config);
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
 
-    std::fs::create_dir_all(OUT_DIR)
-        .map_err(|e| format!("could not create {OUT_DIR}: {e}"))?;
+    std::fs::create_dir_all(OUT_DIR).map_err(|e| format!("could not create {OUT_DIR}: {e}"))?;
 
     println!("starting capture — target {TARGET_FRAMES} frames into ./{OUT_DIR}/ ...");
     stream

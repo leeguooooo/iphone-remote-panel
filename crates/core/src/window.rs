@@ -19,11 +19,11 @@ pub struct WindowInfo {
 const KEYWORDS: &[&str] = &[
     "iphone mirroring",
     "screencontinuity",
-    "\u{955c}\u{50cf}",  // 镜像
+    "\u{955c}\u{50cf}", // 镜像
 ];
 
 /// Keywords that mark setup/welcome windows (case-insensitive).
-const SETUP_KEYWORDS: &[&str] = &["welcome", "\u{6b22}\u{8fce}"];  // 欢迎
+const SETUP_KEYWORDS: &[&str] = &["welcome", "\u{6b22}\u{8fce}"]; // 欢迎
 
 /// Width range for a "real" phone content window.
 const W_MIN: f64 = 200.0;
@@ -37,9 +37,9 @@ fn is_candidate(w: &WindowInfo) -> bool {
     let app_lc = w.app.to_lowercase();
     let bundle_lc = w.bundle.to_lowercase();
     let title_lc = w.title.to_lowercase();
-    KEYWORDS.iter().any(|kw| {
-        app_lc.contains(kw) || bundle_lc.contains(kw) || title_lc.contains(kw)
-    })
+    KEYWORDS
+        .iter()
+        .any(|kw| app_lc.contains(kw) || bundle_lc.contains(kw) || title_lc.contains(kw))
 }
 
 /// Return `true` if dimensions are in the expected phone-screen range.
@@ -240,10 +240,7 @@ mod tests {
 
     #[test]
     fn picks_largest_when_two_phone_windows() {
-        let windows = vec![
-            phone_window(1, 312.0, 694.0),
-            phone_window(2, 390.0, 844.0),
-        ];
+        let windows = vec![phone_window(1, 312.0, 694.0), phone_window(2, 390.0, 844.0)];
         let sel = select_mirroring(&windows).unwrap();
         assert_eq!(sel.id, 2); // 390*844 > 312*694
     }
@@ -327,7 +324,10 @@ mod tests {
         square.on_screen = false;
         let windows = vec![square, phone_window(10, 312.0, 694.0)];
         let sel = select_mirroring(&windows).unwrap();
-        assert_eq!(sel.id, 10, "must pick the on-screen phone, not the bigger off-screen square");
+        assert_eq!(
+            sel.id, 10,
+            "must pick the on-screen phone, not the bigger off-screen square"
+        );
     }
 
     /// When BOTH windows are on-screen, `is_phone_shaped` is the tiebreak: on

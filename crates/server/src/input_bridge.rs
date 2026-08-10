@@ -35,16 +35,39 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMsg {
-    Down { x: f64, y: f64 },
-    Up { x: f64, y: f64 },
-    Tap { x: f64, y: f64 },
-    Longpress { x: f64, y: f64 },
+    Down {
+        x: f64,
+        y: f64,
+    },
+    Up {
+        x: f64,
+        y: f64,
+    },
+    Tap {
+        x: f64,
+        y: f64,
+    },
+    Longpress {
+        x: f64,
+        y: f64,
+    },
     /// Scroll-wheel gesture. Carried as binary on the move channel for the human
     /// client, but accepted here as JSON too so the agent HTTP API can scroll.
-    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
-    Shortcut { name: String },
-    Text { text: String },
-    Key { name: String },
+    Scroll {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
+    Shortcut {
+        name: String,
+    },
+    Text {
+        text: String,
+    },
+    Key {
+        name: String,
+    },
 }
 
 /// Decode a control-channel JSON string into an [`InputEvent`].
@@ -99,7 +122,12 @@ pub fn decode_move(bytes: &[u8]) -> Option<InputEvent> {
             let ny = u16::from_be_bytes([bytes[2], bytes[3]]) as f64 / 65535.0;
             let dx = (bytes[4] as i8) as f64;
             let dy = (bytes[5] as i8) as f64;
-            Some(InputEvent::Scroll { x: nx, y: ny, dx, dy })
+            Some(InputEvent::Scroll {
+                x: nx,
+                y: ny,
+                dx,
+                dy,
+            })
         }
         _ => None,
     }
@@ -154,10 +182,7 @@ impl InputInjector {
 ///
 /// On non-macOS it drains and discards events (no OS sink available).
 /// Input is fully native (CGEvent) — no external binary required.
-pub fn spawn_injector<F>(
-    geo: core::coords::SessionGeometry,
-    is_allowed: F,
-) -> InputInjector
+pub fn spawn_injector<F>(geo: core::coords::SessionGeometry, is_allowed: F) -> InputInjector
 where
     F: Fn() -> bool + Send + 'static,
 {
@@ -190,19 +215,14 @@ fn injector_loop<F>(
     // The osascript activation path takes >2s on first use, so the default
     // deadline is generous; tune via PHONE_REMOTE_FRONT_DEADLINE_MS without a
     // rebuild (rebuilds invalidate ad-hoc TCC grants — expensive during dev).
-    let front_deadline = std::env::var("PHONE_REMOTE_FRONT_DEADLINE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_millis(4000));
+    // Resolved centrally so the HTTP preflight cannot drift below it (#29).
+    let front_deadline = crate::macos::front_deadline();
     while let Ok(ev) = rx.recv() {
         if !is_allowed() {
             continue;
         }
         if !crate::macos::ensure_mirroring_frontmost(front_deadline) {
-            tracing::warn!(
-                "input dropped {ev:?}: iPhone Mirroring could not be brought frontmost"
-            );
+            tracing::warn!("input dropped {ev:?}: iPhone Mirroring could not be brought frontmost");
             continue;
         }
         if let Err(e) = inject(&ev, &geo, &mut sink) {
@@ -275,8 +295,17 @@ mod tests {
 
     #[test]
     fn decode_control_scroll() {
-        let ev = decode_control(r#"{"type":"scroll","x":0.5,"y":0.5,"dx":0.0,"dy":-12.0}"#).unwrap();
-        assert_eq!(ev, InputEvent::Scroll { x: 0.5, y: 0.5, dx: 0.0, dy: -12.0 });
+        let ev =
+            decode_control(r#"{"type":"scroll","x":0.5,"y":0.5,"dx":0.0,"dy":-12.0}"#).unwrap();
+        assert_eq!(
+            ev,
+            InputEvent::Scroll {
+                x: 0.5,
+                y: 0.5,
+                dx: 0.0,
+                dy: -12.0
+            }
+        );
     }
 
     #[test]

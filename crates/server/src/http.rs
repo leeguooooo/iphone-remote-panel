@@ -2242,7 +2242,7 @@ async fn agent_mode(
                     .args(["-a", "iPhone Mirroring"])
                     .status();
                 tokio::task::spawn_blocking(|| {
-                    crate::macos::ensure_mirroring_frontmost(std::time::Duration::from_secs(4))
+                    crate::macos::ensure_mirroring_frontmost(crate::macos::front_deadline())
                 })
                 .await
                 .ok();
@@ -2848,9 +2848,7 @@ async fn wda_control_with_client(
             }
             Err(SnapshotElementTapError::BeforeDispatch(error)) => {
                 w.invalidate_session();
-                tracing::warn!(
-                    "wda control snapshot tap failed before dispatch: {error:#}"
-                );
+                tracing::warn!("wda control snapshot tap failed before dispatch: {error:#}");
                 return WdaControlOutcome::NotSent;
             }
             Err(SnapshotElementTapError::AfterDispatch(error)) => Err(error),
@@ -3177,9 +3175,7 @@ async fn direct_agent_action(
             }
             Err(SnapshotElementTapError::BeforeDispatch(error)) => {
                 w.invalidate_session();
-                tracing::warn!(
-                    "wda agent snapshot tap failed before dispatch: {error:#}"
-                );
+                tracing::warn!("wda agent snapshot tap failed before dispatch: {error:#}");
                 return WdaControlOutcome::NotSent;
             }
             Err(SnapshotElementTapError::AfterDispatch(error)) => Some(Err(error)),
@@ -4761,8 +4757,12 @@ async fn agent_input(
     // it frontmost up front; if that fails, report the drop instead of lying.
     #[cfg(target_os = "macos")]
     {
+        // Same deadline the injector loop uses (#29). This used to be a
+        // hardcoded 1200ms — under the >2s an osascript activation needs on
+        // first use — so a fresh activation on a completely idle Mac was
+        // reported back to the agent as `dropped: human is using the Mac`.
         let delivered = tokio::task::spawn_blocking(|| {
-            crate::macos::ensure_mirroring_frontmost(std::time::Duration::from_millis(1200))
+            crate::macos::ensure_mirroring_frontmost(crate::macos::front_deadline())
         })
         .await
         .unwrap_or(false);
@@ -4870,8 +4870,7 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                     // rebuilding with a bounded delay until the endpoint's
                     // existing total deadline; no mutation is replayed.
                     w.invalidate_session();
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         anyhow::bail!(
                             "WDA source never recovered; last error: {error}; first error: {}",
@@ -5792,7 +5791,9 @@ mod tests {
         assert!(setup_blocker_hint("").is_none());
         assert!(setup_blocker_hint("surprise").is_none());
         assert!(setup_blocker_hint("warp").unwrap().contains("fd00::/8"));
-        assert!(setup_blocker_hint("warp").unwrap().contains("Traffic only mode"));
+        assert!(setup_blocker_hint("warp")
+            .unwrap()
+            .contains("Traffic only mode"));
     }
 
     #[test]
@@ -5817,10 +5818,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.phase, "building");
         assert_eq!(status.blocked_on, "");
-        assert_eq!(
-            status.message,
-            "building + launching WDA (90s elapsed)"
-        );
+        assert_eq!(status.message, "building + launching WDA (90s elapsed)");
     }
 
     #[test]

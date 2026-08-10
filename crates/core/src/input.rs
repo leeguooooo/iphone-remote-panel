@@ -228,11 +228,7 @@ pub fn inject(
 
 /// Convert normalized `(nx, ny)` to screen coords, mapping `None` → `Err`.
 #[inline]
-fn screen_or_err(
-    nx: f64,
-    ny: f64,
-    geo: &SessionGeometry,
-) -> Result<(f64, f64), InputError> {
+fn screen_or_err(nx: f64, ny: f64, geo: &SessionGeometry) -> Result<(f64, f64), InputError> {
     to_screen((nx, ny), geo).ok_or(InputError::OutOfBounds)
 }
 
@@ -363,9 +359,9 @@ pub struct CgEventSink {
 ///   (macOS 27+ only; harmless no-op on macOS 15/26 which have no ⌘4 binding)
 fn shortcut_keymap(name: &str) -> Option<u16> {
     match name {
-        "home"                             => Some(18), // '1'
-        "switcher"                         => Some(19), // '2'
-        "spotlight"                        => Some(20), // '3'
+        "home" => Some(18),                             // '1'
+        "switcher" => Some(19),                         // '2'
+        "spotlight" => Some(20),                        // '3'
         "controlcenter" | "control_center" => Some(21), // '4' — macOS 27+
         _ => None,
     }
@@ -380,15 +376,15 @@ fn shortcut_keymap(name: &str) -> Option<u16> {
 /// Hardware validation for key() is pending (phone currently offline).
 fn named_key_keycode(name: &str) -> Option<u16> {
     match name {
-        "return" | "enter"      => Some(36),
-        "escape" | "esc"        => Some(53),
-        "space"                 => Some(49),
-        "tab"                   => Some(48),
-        "delete" | "backspace"  => Some(51),
-        "up"                    => Some(126),
-        "down"                  => Some(125),
-        "left"                  => Some(123),
-        "right"                 => Some(124),
+        "return" | "enter" => Some(36),
+        "escape" | "esc" => Some(53),
+        "space" => Some(49),
+        "tab" => Some(48),
+        "delete" | "backspace" => Some(51),
+        "up" => Some(126),
+        "down" => Some(125),
+        "left" => Some(123),
+        "right" => Some(124),
         _ => None,
     }
 }
@@ -419,38 +415,103 @@ fn needs_clipboard_paste(s: &str) -> bool {
 /// keycode (not the Unicode payload), so text input must send real keycodes.
 fn char_to_keycode(c: char) -> Option<(u16, bool)> {
     Some(match c {
-        'a' => (0, false), 'b' => (11, false), 'c' => (8, false), 'd' => (2, false),
-        'e' => (14, false), 'f' => (3, false), 'g' => (5, false), 'h' => (4, false),
-        'i' => (34, false), 'j' => (38, false), 'k' => (40, false), 'l' => (37, false),
-        'm' => (46, false), 'n' => (45, false), 'o' => (31, false), 'p' => (35, false),
-        'q' => (12, false), 'r' => (15, false), 's' => (1, false), 't' => (17, false),
-        'u' => (32, false), 'v' => (9, false), 'w' => (13, false), 'x' => (7, false),
-        'y' => (16, false), 'z' => (6, false),
-        'A' => (0, true), 'B' => (11, true), 'C' => (8, true), 'D' => (2, true),
-        'E' => (14, true), 'F' => (3, true), 'G' => (5, true), 'H' => (4, true),
-        'I' => (34, true), 'J' => (38, true), 'K' => (40, true), 'L' => (37, true),
-        'M' => (46, true), 'N' => (45, true), 'O' => (31, true), 'P' => (35, true),
-        'Q' => (12, true), 'R' => (15, true), 'S' => (1, true), 'T' => (17, true),
-        'U' => (32, true), 'V' => (9, true), 'W' => (13, true), 'X' => (7, true),
-        'Y' => (16, true), 'Z' => (6, true),
-        '0' => (29, false), '1' => (18, false), '2' => (19, false), '3' => (20, false),
-        '4' => (21, false), '5' => (23, false), '6' => (22, false), '7' => (26, false),
-        '8' => (28, false), '9' => (25, false),
-        ')' => (29, true), '!' => (18, true), '@' => (19, true), '#' => (20, true),
-        '$' => (21, true), '%' => (23, true), '^' => (22, true), '&' => (26, true),
-        '*' => (28, true), '(' => (25, true),
-        ' ' => (49, false), '\n' => (36, false), '\t' => (48, false),
-        '-' => (27, false), '_' => (27, true),
-        '=' => (24, false), '+' => (24, true),
-        '[' => (33, false), '{' => (33, true),
-        ']' => (30, false), '}' => (30, true),
-        '\\' => (42, false), '|' => (42, true),
-        ';' => (41, false), ':' => (41, true),
-        '\'' => (39, false), '"' => (39, true),
-        ',' => (43, false), '<' => (43, true),
-        '.' => (47, false), '>' => (47, true),
-        '/' => (44, false), '?' => (44, true),
-        '`' => (50, false), '~' => (50, true),
+        'a' => (0, false),
+        'b' => (11, false),
+        'c' => (8, false),
+        'd' => (2, false),
+        'e' => (14, false),
+        'f' => (3, false),
+        'g' => (5, false),
+        'h' => (4, false),
+        'i' => (34, false),
+        'j' => (38, false),
+        'k' => (40, false),
+        'l' => (37, false),
+        'm' => (46, false),
+        'n' => (45, false),
+        'o' => (31, false),
+        'p' => (35, false),
+        'q' => (12, false),
+        'r' => (15, false),
+        's' => (1, false),
+        't' => (17, false),
+        'u' => (32, false),
+        'v' => (9, false),
+        'w' => (13, false),
+        'x' => (7, false),
+        'y' => (16, false),
+        'z' => (6, false),
+        'A' => (0, true),
+        'B' => (11, true),
+        'C' => (8, true),
+        'D' => (2, true),
+        'E' => (14, true),
+        'F' => (3, true),
+        'G' => (5, true),
+        'H' => (4, true),
+        'I' => (34, true),
+        'J' => (38, true),
+        'K' => (40, true),
+        'L' => (37, true),
+        'M' => (46, true),
+        'N' => (45, true),
+        'O' => (31, true),
+        'P' => (35, true),
+        'Q' => (12, true),
+        'R' => (15, true),
+        'S' => (1, true),
+        'T' => (17, true),
+        'U' => (32, true),
+        'V' => (9, true),
+        'W' => (13, true),
+        'X' => (7, true),
+        'Y' => (16, true),
+        'Z' => (6, true),
+        '0' => (29, false),
+        '1' => (18, false),
+        '2' => (19, false),
+        '3' => (20, false),
+        '4' => (21, false),
+        '5' => (23, false),
+        '6' => (22, false),
+        '7' => (26, false),
+        '8' => (28, false),
+        '9' => (25, false),
+        ')' => (29, true),
+        '!' => (18, true),
+        '@' => (19, true),
+        '#' => (20, true),
+        '$' => (21, true),
+        '%' => (23, true),
+        '^' => (22, true),
+        '&' => (26, true),
+        '*' => (28, true),
+        '(' => (25, true),
+        ' ' => (49, false),
+        '\n' => (36, false),
+        '\t' => (48, false),
+        '-' => (27, false),
+        '_' => (27, true),
+        '=' => (24, false),
+        '+' => (24, true),
+        '[' => (33, false),
+        '{' => (33, true),
+        ']' => (30, false),
+        '}' => (30, true),
+        '\\' => (42, false),
+        '|' => (42, true),
+        ';' => (41, false),
+        ':' => (41, true),
+        '\'' => (39, false),
+        '"' => (39, true),
+        ',' => (43, false),
+        '<' => (43, true),
+        '.' => (47, false),
+        '>' => (47, true),
+        '/' => (44, false),
+        '?' => (44, true),
+        '`' => (50, false),
+        '~' => (50, true),
         _ => return None,
     })
 }
@@ -479,11 +540,7 @@ impl CgEventSink {
     }
 
     /// Post one mouse event. On failure, logs and drops the event; never panics.
-    fn post_mouse(
-        event_type: core_graphics::event::CGEventType,
-        sx: f64,
-        sy: f64,
-    ) {
+    fn post_mouse(event_type: core_graphics::event::CGEventType, sx: f64, sy: f64) {
         use core_graphics::event::{CGEvent, CGEventTapLocation, CGMouseButton};
         use core_graphics::geometry::CGPoint;
         let source = match Self::make_source() {
@@ -494,15 +551,12 @@ impl CgEventSink {
             }
         };
         let pt = CGPoint::new(sx, sy);
-        if let Ok(evt) =
-            CGEvent::new_mouse_event(source, event_type, pt, CGMouseButton::Left)
-        {
+        if let Ok(evt) = CGEvent::new_mouse_event(source, event_type, pt, CGMouseButton::Left) {
             evt.post(CGEventTapLocation::HID);
         } else {
             eprintln!("post_mouse: CGEvent::new_mouse_event failed; dropping event");
         }
     }
-
 }
 
 #[cfg(target_os = "macos")]
@@ -651,8 +705,7 @@ impl EventSink for CgEventSink {
         // path and never reaches here. `PHONE_REMOTE_TEXT_KEYCODE=1` forces the
         // legacy char-by-char keycode path (still needed for CJK, which has no
         // US keycodes and always goes clipboard regardless).
-        let force_keycode =
-            std::env::var("PHONE_REMOTE_TEXT_KEYCODE").is_ok_and(|v| v == "1");
+        let force_keycode = std::env::var("PHONE_REMOTE_TEXT_KEYCODE").is_ok_and(|v| v == "1");
         if !s.is_empty() && (!force_keycode || needs_clipboard_paste(s)) {
             self.text_via_clipboard(s);
             return;
@@ -686,7 +739,10 @@ impl EventSink for CgEventSink {
                             sd.post(CGEventTapLocation::HID);
                         }
                     }
-                    Err(e) => { eprintln!("text: {e}; skipping shift-down for {ch:?}"); continue; }
+                    Err(e) => {
+                        eprintln!("text: {e}; skipping shift-down for {ch:?}");
+                        continue;
+                    }
                 }
                 gap();
             }
@@ -697,7 +753,10 @@ impl EventSink for CgEventSink {
                         down.post(CGEventTapLocation::HID);
                     }
                 }
-                Err(e) => { eprintln!("text: {e}; skipping key-down for {ch:?}"); continue; }
+                Err(e) => {
+                    eprintln!("text: {e}; skipping key-down for {ch:?}");
+                    continue;
+                }
             }
             gap();
             match Self::make_source() {
@@ -756,7 +815,10 @@ impl EventSink for CgEventSink {
                     cmd_down.post(CGEventTapLocation::HID);
                 }
             }
-            Err(e) => { eprintln!("shortcut {name:?}: {e}; skipping"); return; }
+            Err(e) => {
+                eprintln!("shortcut {name:?}: {e}; skipping");
+                return;
+            }
         }
         gap();
         // Digit key down (⌘ held)
@@ -868,7 +930,10 @@ impl CgEventSink {
                     cmd_down.post(CGEventTapLocation::HID);
                 }
             }
-            Err(e) => { eprintln!("text_via_clipboard: {e}; skipping cmd-down"); return; }
+            Err(e) => {
+                eprintln!("text_via_clipboard: {e}; skipping cmd-down");
+                return;
+            }
         }
         gap();
         // 'v' key down (⌘ held)
@@ -910,7 +975,10 @@ impl CgEventSink {
         // put the user's original content back via pbcopy.
         if let Some(prev) = saved {
             std::thread::sleep(std::time::Duration::from_millis(120));
-            if let Ok(mut child) = Command::new("/usr/bin/pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Ok(mut child) = Command::new("/usr/bin/pbcopy")
+                .stdin(Stdio::piped())
+                .spawn()
+            {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(&prev);
                 }
@@ -935,7 +1003,12 @@ mod tests {
     /// → far corner (1.0, 1.0) maps to screen (400.0, 800.0)
     fn portrait_geo() -> SessionGeometry {
         SessionGeometry {
-            content_rect: Rect { x: 100.0, y: 200.0, w: 300.0, h: 600.0 },
+            content_rect: Rect {
+                x: 100.0,
+                y: 200.0,
+                w: 300.0,
+                h: 600.0,
+            },
             scale: 2.0,
             orientation: Orientation::Portrait,
         }
@@ -952,12 +1025,18 @@ mod tests {
         assert_eq!(sink.calls.len(), 2, "Tap must emit exactly 2 calls");
         assert_eq!(
             sink.calls[0],
-            SinkCall::MouseDown { sx: 250.0, sy: 500.0 },
+            SinkCall::MouseDown {
+                sx: 250.0,
+                sy: 500.0
+            },
             "first call must be MouseDown at content-rect center"
         );
         assert_eq!(
             sink.calls[1],
-            SinkCall::MouseUp { sx: 250.0, sy: 500.0 },
+            SinkCall::MouseUp {
+                sx: 250.0,
+                sy: 500.0
+            },
             "second call must be MouseUp at the same point"
         );
     }
@@ -969,7 +1048,12 @@ mod tests {
         let geo = portrait_geo(); // content_rect x=100,y=200,w=300,h=600
         let mut sink = RecordingSink::default();
         inject(
-            &InputEvent::Scroll { x: 0.5, y: 0.5, dx: 3.0, dy: -7.0 },
+            &InputEvent::Scroll {
+                x: 0.5,
+                y: 0.5,
+                dx: 3.0,
+                dy: -7.0,
+            },
             &geo,
             &mut sink,
         )
@@ -978,7 +1062,12 @@ mod tests {
         assert_eq!(sink.calls.len(), 1, "Scroll must emit exactly 1 call");
         assert_eq!(
             sink.calls[0],
-            SinkCall::Scroll { sx: 250.0, sy: 500.0, dx: 3.0, dy: -7.0 },
+            SinkCall::Scroll {
+                sx: 250.0,
+                sy: 500.0,
+                dx: 3.0,
+                dy: -7.0
+            },
             "anchor mapped to content center, deltas passed through untouched"
         );
     }
@@ -988,12 +1077,20 @@ mod tests {
         let geo = portrait_geo();
         let mut sink = RecordingSink::default();
         let err = inject(
-            &InputEvent::Scroll { x: 1.5, y: 0.5, dx: 0.0, dy: -5.0 },
+            &InputEvent::Scroll {
+                x: 1.5,
+                y: 0.5,
+                dx: 0.0,
+                dy: -5.0,
+            },
             &geo,
             &mut sink,
         );
         assert_eq!(err, Err(InputError::OutOfBounds));
-        assert!(sink.calls.is_empty(), "nothing emitted on out-of-bounds anchor");
+        assert!(
+            sink.calls.is_empty(),
+            "nothing emitted on out-of-bounds anchor"
+        );
     }
 
     #[test]
@@ -1024,7 +1121,10 @@ mod tests {
         assert_eq!(sink.calls.len(), 1);
         assert_eq!(
             sink.calls[0],
-            SinkCall::MouseDragged { sx: 250.0, sy: 500.0 }
+            SinkCall::MouseDragged {
+                sx: 250.0,
+                sy: 500.0
+            }
         );
     }
 
@@ -1041,11 +1141,17 @@ mod tests {
         assert_eq!(sink.calls.len(), 2);
         assert_eq!(
             sink.calls[0],
-            SinkCall::MouseDown { sx: 100.0, sy: 200.0 }
+            SinkCall::MouseDown {
+                sx: 100.0,
+                sy: 200.0
+            }
         );
         assert_eq!(
             sink.calls[1],
-            SinkCall::MouseUp { sx: 400.0, sy: 800.0 }
+            SinkCall::MouseUp {
+                sx: 400.0,
+                sy: 800.0
+            }
         );
     }
 
@@ -1150,22 +1256,26 @@ mod tests {
     fn shortcut_spotlight_routes_to_sink_shortcut() {
         let geo = portrait_geo();
         let mut sink = RecordingSink::default();
-        inject(&InputEvent::Shortcut("spotlight".to_owned()), &geo, &mut sink).unwrap();
-        assert_eq!(
-            sink.calls,
-            vec![SinkCall::Shortcut("spotlight".to_owned())]
-        );
+        inject(
+            &InputEvent::Shortcut("spotlight".to_owned()),
+            &geo,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.calls, vec![SinkCall::Shortcut("spotlight".to_owned())]);
     }
 
     #[test]
     fn shortcut_switcher_routes_to_sink_shortcut() {
         let geo = portrait_geo();
         let mut sink = RecordingSink::default();
-        inject(&InputEvent::Shortcut("switcher".to_owned()), &geo, &mut sink).unwrap();
-        assert_eq!(
-            sink.calls,
-            vec![SinkCall::Shortcut("switcher".to_owned())]
-        );
+        inject(
+            &InputEvent::Shortcut("switcher".to_owned()),
+            &geo,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.calls, vec![SinkCall::Shortcut("switcher".to_owned())]);
     }
 
     // ── Key/Text/Shortcut are coordinate-free — always Ok ────────────────────
@@ -1210,7 +1320,10 @@ mod tests {
         // Must be short enough to not trigger iOS long-press (< ~60 ms empirical)
         // but non-zero so the system registers it.
         assert!(TAP_DWELL_MS > 0, "dwell must be positive");
-        assert!(TAP_DWELL_MS <= 50, "dwell must be ≤50 ms to avoid jiggle/edit-mode");
+        assert!(
+            TAP_DWELL_MS <= 50,
+            "dwell must be ≤50 ms to avoid jiggle/edit-mode"
+        );
     }
 
     // ── InputError display ───────────────────────────────────────────────────
@@ -1229,17 +1342,17 @@ mod tests {
     #[test]
     fn shortcut_keymap_matches_iphone_act() {
         // home=⌘1, switcher=⌘2, spotlight=⌘3 — iPhone Mirroring View-menu shortcuts
-        assert_eq!(shortcut_keymap("home"),      Some(18_u16)); // '1' keycode
-        assert_eq!(shortcut_keymap("switcher"),  Some(19_u16)); // '2' keycode
+        assert_eq!(shortcut_keymap("home"), Some(18_u16)); // '1' keycode
+        assert_eq!(shortcut_keymap("switcher"), Some(19_u16)); // '2' keycode
         assert_eq!(shortcut_keymap("spotlight"), Some(20_u16)); // '3' keycode
-        assert_eq!(shortcut_keymap("nope"),      None);
+        assert_eq!(shortcut_keymap("nope"), None);
     }
 
     #[test]
     fn shortcut_keymap_controlcenter_both_spellings() {
         // controlcenter = ⌘4 (macOS 27+ Mirroring View menu)
         // Both spellings must resolve to keycode 21 ('4')
-        assert_eq!(shortcut_keymap("controlcenter"),  Some(21_u16));
+        assert_eq!(shortcut_keymap("controlcenter"), Some(21_u16));
         assert_eq!(shortcut_keymap("control_center"), Some(21_u16));
     }
 
@@ -1274,27 +1387,27 @@ mod tests {
 
     #[test]
     fn named_key_keycode_covers_required_keys() {
-        assert_eq!(named_key_keycode("return"),    Some(36_u16));
-        assert_eq!(named_key_keycode("enter"),     Some(36_u16)); // alias
-        assert_eq!(named_key_keycode("escape"),    Some(53_u16));
-        assert_eq!(named_key_keycode("esc"),       Some(53_u16)); // alias
-        assert_eq!(named_key_keycode("space"),     Some(49_u16));
-        assert_eq!(named_key_keycode("tab"),       Some(48_u16));
-        assert_eq!(named_key_keycode("delete"),    Some(51_u16));
+        assert_eq!(named_key_keycode("return"), Some(36_u16));
+        assert_eq!(named_key_keycode("enter"), Some(36_u16)); // alias
+        assert_eq!(named_key_keycode("escape"), Some(53_u16));
+        assert_eq!(named_key_keycode("esc"), Some(53_u16)); // alias
+        assert_eq!(named_key_keycode("space"), Some(49_u16));
+        assert_eq!(named_key_keycode("tab"), Some(48_u16));
+        assert_eq!(named_key_keycode("delete"), Some(51_u16));
         assert_eq!(named_key_keycode("backspace"), Some(51_u16)); // alias
-        assert_eq!(named_key_keycode("up"),        Some(126_u16));
-        assert_eq!(named_key_keycode("down"),      Some(125_u16));
-        assert_eq!(named_key_keycode("left"),      Some(123_u16));
-        assert_eq!(named_key_keycode("right"),     Some(124_u16));
-        assert_eq!(named_key_keycode("unknown"),   None);
-        assert_eq!(named_key_keycode(""),          None);
+        assert_eq!(named_key_keycode("up"), Some(126_u16));
+        assert_eq!(named_key_keycode("down"), Some(125_u16));
+        assert_eq!(named_key_keycode("left"), Some(123_u16));
+        assert_eq!(named_key_keycode("right"), Some(124_u16));
+        assert_eq!(named_key_keycode("unknown"), None);
+        assert_eq!(named_key_keycode(""), None);
     }
 
     #[test]
     fn named_key_keycode_arrow_keys_are_distinct() {
-        let up    = named_key_keycode("up").unwrap();
-        let down  = named_key_keycode("down").unwrap();
-        let left  = named_key_keycode("left").unwrap();
+        let up = named_key_keycode("up").unwrap();
+        let down = named_key_keycode("down").unwrap();
+        let left = named_key_keycode("left").unwrap();
         let right = named_key_keycode("right").unwrap();
         // All four arrow key codes must be different from each other
         assert_ne!(up, down);
@@ -1317,5 +1430,4 @@ mod tests {
         assert_eq!(char_to_keycode('_'), Some((27, true)));
         assert_eq!(char_to_keycode('中'), None); // non-ASCII → skipped
     }
-
 }

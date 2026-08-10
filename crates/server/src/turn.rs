@@ -47,7 +47,11 @@ impl CfTurnConfig {
 
     /// Testable core of [`from_env`] — `get` resolves an env var by name.
     pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let nonempty = |k: &str| get(k).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        let nonempty = |k: &str| {
+            get(k)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        };
         let key_id = nonempty("PHONE_REMOTE_CF_TURN_KEY_ID")?;
         let api_token = nonempty("PHONE_REMOTE_CF_TURN_API_TOKEN")?;
         let ttl_secs = nonempty("PHONE_REMOTE_CF_TURN_TTL_SECS")
@@ -88,8 +92,8 @@ struct CfIceServers {
 ///
 /// Pulled out so it is unit-testable without a live HTTP call.
 fn parse_response(body: &str) -> Result<RTCIceServer> {
-    let parsed: CfResponse =
-        serde_json::from_str(body).with_context(|| format!("parse Cloudflare TURN response: {body}"))?;
+    let parsed: CfResponse = serde_json::from_str(body)
+        .with_context(|| format!("parse Cloudflare TURN response: {body}"))?;
     if parsed.ice_servers.urls.is_empty() {
         anyhow::bail!("Cloudflare TURN response had no urls: {body}");
     }
@@ -166,7 +170,9 @@ mod tests {
             ("PHONE_REMOTE_CF_TURN_TTL_SECS", "999999999"),
         ]);
         assert_eq!(
-            CfTurnConfig::from_getter(getter(&too_big)).unwrap().ttl_secs,
+            CfTurnConfig::from_getter(getter(&too_big))
+                .unwrap()
+                .ttl_secs,
             MAX_TTL_SECS
         );
 
@@ -176,7 +182,9 @@ mod tests {
             ("PHONE_REMOTE_CF_TURN_TTL_SECS", "1"),
         ]);
         assert_eq!(
-            CfTurnConfig::from_getter(getter(&too_small)).unwrap().ttl_secs,
+            CfTurnConfig::from_getter(getter(&too_small))
+                .unwrap()
+                .ttl_secs,
             MIN_TTL_SECS
         );
     }

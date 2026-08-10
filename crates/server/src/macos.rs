@@ -79,25 +79,62 @@ mod imp {
         // works: the Apple Event asks the TARGET app to activate itself, which
         // the system permits. First use pops an Automation consent once
         // ("iPhoneUse" wants to control "iPhone Mirroring") — grant it once.
+        //
+        // Capture output rather than just the exit status (issue #29): a TCC
+        // Automation denial exits non-zero with "Not authorized to send Apple
+        // events to iPhone Mirroring. (-1743)" on stderr, which is a one-time
+        // user-fixable grant. Discarding stderr collapsed that into the same
+        // silent debug line as "app isn't running" and "name is localized
+        // differently", so the one failure the user CAN fix looked identical
+        // to the ones they can't.
         for name in MIRRORING_NAMES {
-            let status = std::process::Command::new("/usr/bin/osascript")
+            let out = std::process::Command::new("/usr/bin/osascript")
                 .args(["-e", &format!(r#"tell application "{name}" to activate"#)])
-                .status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
+                .output();
+            match out {
+                Ok(o) if o.status.success() => return,
+                Ok(o) => log_activation_failure("osascript", name, o.status.code(), &o.stderr),
+                Err(e) => tracing::warn!("activate {name} via osascript: could not spawn: {e}"),
             }
         }
         // Fallback (helps when Automation consent was denied): open -a still
         // works when the user isn't actively focused elsewhere.
         for name in MIRRORING_NAMES {
-            let status = std::process::Command::new("/usr/bin/open")
+            let out = std::process::Command::new("/usr/bin/open")
                 .args(["-a", name])
-                .status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
+                .output();
+            match out {
+                Ok(o) if o.status.success() => return,
+                Ok(o) => log_activation_failure("open -a", name, o.status.code(), &o.stderr),
+                Err(e) => tracing::warn!("activate {name} via `open -a`: could not spawn: {e}"),
             }
         }
-        tracing::debug!("could not bring iPhone Mirroring frontmost via osascript or `open -a`");
+        tracing::warn!("could not bring iPhone Mirroring frontmost via osascript or `open -a`");
+    }
+
+    /// Log one failed activation attempt with the exit code and stderr intact.
+    ///
+    /// `warn`, not `debug`: by the time this fires, agent input is about to be
+    /// reported as dropped, and this line is the only place the real cause
+    /// (Automation consent denied, app missing, localized name) is visible.
+    fn log_activation_failure(via: &str, name: &str, code: Option<i32>, stderr: &[u8]) {
+        let detail = String::from_utf8_lossy(stderr);
+        let detail = detail.trim();
+        let hint = if detail.contains("-1743") || detail.contains("Not authorized") {
+            "  (grant System Settings > Privacy & Security > Automation > iPhoneUse > iPhone Mirroring)"
+        } else {
+            ""
+        };
+        tracing::warn!(
+            "activate {name} via {via} failed (exit {}): {}{hint}",
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            if detail.is_empty() {
+                "no stderr"
+            } else {
+                detail
+            },
+        );
     }
 
     /// The known localized names of the iPhone Mirroring app (en + zh-CN).
@@ -200,4 +237,84 @@ pub fn mirroring_is_frontmost() -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn ensure_mirroring_frontmost(_deadline: std::time::Duration) -> bool {
     false
+}
+
+// ---------------------------------------------------------------------------
+// Activation deadline — one source of truth for every caller
+// ---------------------------------------------------------------------------
+
+/// Default wait for iPhone Mirroring to actually come frontmost.
+///
+/// The osascript activation path takes >2s on first use (it round-trips an
+/// Apple Event and may pop the Automation consent sheet), so anything near a
+/// second is not a timeout — it is a coin flip.
+pub const FRONT_DEADLINE_DEFAULT_MS: u64 = 4000;
+
+/// How long [`ensure_mirroring_frontmost`] should wait, honouring the
+/// `PHONE_REMOTE_FRONT_DEADLINE_MS` override.
+///
+/// Every caller goes through here. Issue #29 was exactly what happens when
+/// they don't: the injector loop waited 4000ms while `POST /agent/input`'s
+/// own preflight waited a hardcoded 1200ms, so a perfectly idle Mac reported
+/// `dropped:true, human_active:true` because activation had simply not
+/// finished yet. Two literals for one physical process will drift again;
+/// a function will not.
+pub fn front_deadline() -> std::time::Duration {
+    parse_front_deadline(
+        std::env::var("PHONE_REMOTE_FRONT_DEADLINE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`front_deadline`], split out so it is testable without env.
+///
+/// A malformed or zero override falls back to the default rather than
+/// producing a 0ms deadline, which would reintroduce the #29 drop.
+fn parse_front_deadline(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(FRONT_DEADLINE_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn front_deadline_defaults_to_the_activation_reality() {
+        // >2s on first use; the old 1200ms preflight is below that floor.
+        assert_eq!(FRONT_DEADLINE_DEFAULT_MS, 4000);
+        assert_eq!(
+            parse_front_deadline(None),
+            std::time::Duration::from_millis(4000)
+        );
+    }
+
+    #[test]
+    fn front_deadline_honours_the_override() {
+        assert_eq!(
+            parse_front_deadline(Some("9000")),
+            std::time::Duration::from_millis(9000)
+        );
+        assert_eq!(
+            parse_front_deadline(Some("  6500  ")),
+            std::time::Duration::from_millis(6500)
+        );
+    }
+
+    #[test]
+    fn front_deadline_rejects_junk_and_zero() {
+        // A 0ms or unparseable deadline would drop input instantly — the exact
+        // failure mode issue #29 reported. Fall back instead.
+        for raw in ["", "0", "abc", "-1", "4000ms", "4.5"] {
+            assert_eq!(
+                parse_front_deadline(Some(raw)),
+                std::time::Duration::from_millis(FRONT_DEADLINE_DEFAULT_MS),
+                "input {raw:?} should fall back to the default"
+            );
+        }
+    }
 }

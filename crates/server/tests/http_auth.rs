@@ -2054,8 +2054,7 @@ fn agent_actions_wait_for_retries_one_stale_source_read() {
                 "wait_for retries only its read-only source observation: {request}"
             );
             let body = if observed_sources.fetch_add(1, Ordering::SeqCst) == 0 {
-                r#"{"value":{"error":"invalid session id","message":"stale source"}}"#
-                    .to_string()
+                r#"{"value":{"error":"invalid session id","message":"stale source"}}"#.to_string()
             } else {
                 r#"{"value":{
                         "type":"XCUIElementTypeApplication",

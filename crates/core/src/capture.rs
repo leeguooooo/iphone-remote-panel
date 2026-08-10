@@ -206,13 +206,10 @@ mod imp {
     pub fn screenshot_mirroring_png() -> anyhow::Result<Vec<u8>> {
         // Unique temp path: pid + monotonic counter avoids collisions between
         // concurrent callers (e.g., two agent requests racing).
-        static SHOT_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static SHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let out_path = std::env::temp_dir().join(format!(
-            "iphone-use-shot-{}-{seq}.png",
-            std::process::id()
-        ));
+        let out_path =
+            std::env::temp_dir().join(format!("iphone-use-shot-{}-{seq}.png", std::process::id()));
         let out_str = out_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("temp path is not valid UTF-8: {out_path:?}"))?
@@ -388,7 +385,8 @@ mod imp {
                 std::thread::Builder::new()
                     .name("capture-watcher".into())
                     .spawn(move || {
-                        let poll = std::time::Duration::from_millis(cfg.window_poll_millis.max(100));
+                        let poll =
+                            std::time::Duration::from_millis(cfg.window_poll_millis.max(100));
                         while !stop.load(Ordering::Relaxed) {
                             std::thread::sleep(poll);
                             if stop.load(Ordering::Relaxed) {
@@ -598,13 +596,18 @@ fn classify_mirror_png(bytes: &[u8]) -> anyhow::Result<MirrorState> {
 /// color (markedly blue: `b>120 && b-r>40 && b-g>20`).
 fn sample_fractions(bytes: &[u8]) -> anyhow::Result<(f32, f32)> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| anyhow::anyhow!("png header: {e}"))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader
         .next_frame(&mut buf)
         .map_err(|e| anyhow::anyhow!("png decode: {e}"))?;
     if info.bit_depth != png::BitDepth::Eight {
-        return Err(anyhow::anyhow!("unsupported PNG bit depth {:?}", info.bit_depth));
+        return Err(anyhow::anyhow!(
+            "unsupported PNG bit depth {:?}",
+            info.bit_depth
+        ));
     }
     let channels = match info.color_type {
         png::ColorType::Rgb => 3usize,
@@ -871,7 +874,10 @@ mod tests {
         };
         let p1 = make();
         let p2 = make();
-        assert_ne!(p1, p2, "two consecutive temp paths must differ: {p1:?} == {p2:?}");
+        assert_ne!(
+            p1, p2,
+            "two consecutive temp paths must differ: {p1:?} == {p2:?}"
+        );
         // Both must share the same directory.
         assert_eq!(p1.parent(), p2.parent());
         // Both must end with .png.
@@ -914,15 +920,27 @@ mod tests {
     #[test]
     fn classify_distinguishes_active_paused_in_use() {
         // Live content (white): below the gray threshold → Active.
-        assert_eq!(classify_mirror_png(&solid_png(120, 200, [255, 255, 255])).unwrap(), MirrorState::Active);
+        assert_eq!(
+            classify_mirror_png(&solid_png(120, 200, [255, 255, 255])).unwrap(),
+            MirrorState::Active
+        );
         // Uniform interstitial gray, no blue glyph → Connection Paused (dark + light).
-        assert_eq!(classify_mirror_png(&solid_png(120, 200, [46, 50, 52])).unwrap(), MirrorState::Paused);
-        assert_eq!(classify_mirror_png(&solid_png(120, 200, [233, 235, 237])).unwrap(), MirrorState::Paused);
+        assert_eq!(
+            classify_mirror_png(&solid_png(120, 200, [46, 50, 52])).unwrap(),
+            MirrorState::Paused
+        );
+        assert_eq!(
+            classify_mirror_png(&solid_png(120, 200, [233, 235, 237])).unwrap(),
+            MirrorState::Paused
+        );
         // Same gray plus a blue phone glyph (~1% area) → iPhone in Use (dark + light).
         let in_use = png_with_glyph(160, 280, [46, 50, 52], [90, 150, 235], 0.01);
         assert_eq!(classify_mirror_png(&in_use).unwrap(), MirrorState::InUse);
         let in_use_light = png_with_glyph(160, 280, [233, 235, 237], [90, 150, 235], 0.01);
-        assert_eq!(classify_mirror_png(&in_use_light).unwrap(), MirrorState::InUse);
+        assert_eq!(
+            classify_mirror_png(&in_use_light).unwrap(),
+            MirrorState::InUse
+        );
         // State helpers.
         assert!(MirrorState::Active.drivable());
         assert!(!MirrorState::Paused.drivable());

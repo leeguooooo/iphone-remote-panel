@@ -76,7 +76,11 @@ mod tests {
 
     #[test]
     fn move_roundtrip() {
-        let msg = ClientMsg::Move { x: 0.1, y: 0.9, seq: 42 };
+        let msg = ClientMsg::Move {
+            x: 0.1,
+            y: 0.9,
+            seq: 42,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
@@ -92,7 +96,9 @@ mod tests {
 
     #[test]
     fn key_roundtrip() {
-        let msg = ClientMsg::Key { name: "Home".to_string() };
+        let msg = ClientMsg::Key {
+            name: "Home".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
@@ -100,7 +106,9 @@ mod tests {
 
     #[test]
     fn text_roundtrip() {
-        let msg = ClientMsg::Text { s: "Hello, 世界".to_string() };
+        let msg = ClientMsg::Text {
+            s: "Hello, 世界".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
@@ -108,7 +116,9 @@ mod tests {
 
     #[test]
     fn shortcut_roundtrip() {
-        let msg = ClientMsg::Shortcut { name: "cmd+c".to_string() };
+        let msg = ClientMsg::Shortcut {
+            name: "cmd+c".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
@@ -165,9 +175,9 @@ mod tests {
     fn dropper_out_of_order_keeps_newest() {
         let mut d = MoveDropper::new();
         assert!(d.accept(5));
-        assert!(!d.accept(3));   // out-of-order old, dropped
-        assert!(d.accept(6));    // new seq accepted
-        assert!(!d.accept(4));   // still older than 6
+        assert!(!d.accept(3)); // out-of-order old, dropped
+        assert!(d.accept(6)); // new seq accepted
+        assert!(!d.accept(4)); // still older than 6
     }
 
     #[test]
