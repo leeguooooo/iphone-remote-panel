@@ -367,6 +367,7 @@ fn serve() -> Result<()> {
         mjpeg_url,
         wda_actionable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         wda_health: Arc::new(Mutex::new(server::wda::WdaHealth::down())),
+        wda_death: Arc::new(Mutex::new(Default::default())),
         wda_health_probe: Arc::new(Mutex::new(None)),
         wda_control_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         // Idle auto-release: start the clock now so a daemon that boots with no

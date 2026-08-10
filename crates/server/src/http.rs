@@ -380,6 +380,10 @@ pub struct AppState {
     /// the control client is busy, so a slow health check never queues behind or
     /// blocks a time-sensitive browser gesture indefinitely.
     pub wda_health: Arc<Mutex<crate::wda::WdaHealth>>,
+    /// Why WDA last stopped being drivable, captured at the transition (#26 §2).
+    /// Without this, a mid-session `wda:true -> false` is indistinguishable from
+    /// a human picking the phone up, and agents blame the wrong thing.
+    pub wda_death: Arc<Mutex<WdaDeath>>,
     /// Single in-flight background health probe. Status requests return the
     /// cache immediately; a control request aborts this task before taking the
     /// WDA mutex so a cold/slow probe cannot delay an input action.
@@ -1040,6 +1044,8 @@ async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
     let health_cache = state.wda_health.clone();
     let actionable = state.wda_actionable.clone();
     let released = state.released.clone();
+    let death = state.wda_death.clone();
+    let releasing = state.wda_lifecycle.is_releasing();
     *probe_slot = Some(tokio::spawn(async move {
         let Ok(mut client) = wda.try_lock() else {
             return;
@@ -1047,7 +1053,14 @@ async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
         match tokio::time::timeout(std::time::Duration::from_secs(15), client.probe_health()).await
         {
             Ok(health) => {
-                apply_wda_health_probe(&health_cache, &actionable, &released, health);
+                apply_wda_health_probe_tracked(
+                    &health_cache,
+                    &actionable,
+                    &released,
+                    releasing,
+                    Some(&death),
+                    health,
+                );
             }
             Err(_) => {
                 // Preserve the last completed observation. A timeout is not an
@@ -1057,6 +1070,84 @@ async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
         }
     }));
     cached
+}
+
+// ---------------------------------------------------------------------------
+// wda_died_reason — who actually killed it (issue #26 §2)
+// ---------------------------------------------------------------------------
+
+/// Why WDA last stopped being drivable, and when.
+///
+/// `reason` is empty when WDA has never gone down in this daemon's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WdaDeath {
+    pub reason: &'static str,
+    /// Unix seconds of the transition; 0 when there hasn't been one.
+    pub at: u64,
+}
+
+/// Classify a WDA up→down transition from the two observations around it.
+///
+/// Deliberately reasons from *signatures we can observe* rather than probing
+/// the network stack. `warp-cli` is frequently absent even on machines running
+/// WARP (the GUI install ships no CLI), so a warp-cli check would report
+/// "no WARP" on exactly the machines this issue is about. What is always
+/// observable is the shape of the death:
+///
+/// * `up && !actionable` — the runner still answers `/status` but every action
+///   fails Code=41. That is the severed-testmanagerd-session signature: a WARP
+///   reconnect, a sleep, or a lock tore down the session under a live runner.
+/// * `!up` — nothing answers at all: the runner exited, the relay died, or the
+///   phone's Wi-Fi DHCP lease moved and the 8100 relay is pointing at a stale
+///   address.
+///
+/// Neither is a human picking up the phone, which is what the old status
+/// implied by staying silent. Returns `None` when this is not a death (no
+/// previous drivable state, or still drivable).
+fn classify_wda_death(
+    prev: crate::wda::WdaHealth,
+    new: crate::wda::WdaHealth,
+    released: bool,
+    releasing: bool,
+) -> Option<&'static str> {
+    // Only a fall from "was working" counts. A probe that was already down and
+    // stays down is not a new death, and must not overwrite the real cause.
+    if !prev.actionable || new.actionable {
+        return None;
+    }
+    // The daemon stopped it on purpose — this is the one case that is nobody's
+    // fault, and conflating it with a crash sends agents into pointless repair.
+    if released || releasing {
+        return Some("idle_release");
+    }
+    if new.up {
+        if new.locked == Some(true) {
+            return Some("device_locked");
+        }
+        return Some("session_severed");
+    }
+    Some("unreachable")
+}
+
+/// Recovery guidance per death reason. Empty when there is nothing to say.
+fn wda_death_hint(reason: &str) -> &'static str {
+    match reason {
+        "idle_release" => {
+            "WDA was released on purpose after idle — the next control request re-bootstraps it; nothing is broken"
+        }
+        "device_locked" => {
+            "the iPhone locked while WDA was driving it — unlock it and keep it awake"
+        }
+        // Named in likelihood order from what has actually caused this in the
+        // field; the daemon cannot see which of them fired.
+        "session_severed" => {
+            "WDA still answers but its test session was torn down — a WARP/VPN reconnect, Mac sleep, or a phone lock does this; restart the direct device service, and if WARP is on, exclude the CoreDevice tunnel"
+        }
+        "unreachable" => {
+            "WDA stopped answering entirely — the runner exited, the 8100/9100 relay died, or the phone's Wi-Fi address changed; re-run setup-wda.sh and check the relay"
+        }
+        _ => "",
+    }
 }
 
 /// Commit one completed WDA health observation to every readiness cache.
@@ -1070,7 +1161,44 @@ fn apply_wda_health_probe(
     released: &std::sync::atomic::AtomicBool,
     health: crate::wda::WdaHealth,
 ) -> bool {
+    apply_wda_health_probe_tracked(health_slot, actionable, released, false, None, health)
+}
+
+/// [`apply_wda_health_probe`] plus death attribution.
+///
+/// Split so the plain call sites stay unchanged while the probe path can
+/// record *why* WDA stopped being drivable. This is the single choke point
+/// every completed observation passes through, so it is the only place that
+/// sees both sides of a transition.
+fn apply_wda_health_probe_tracked(
+    health_slot: &Mutex<crate::wda::WdaHealth>,
+    actionable: &std::sync::atomic::AtomicBool,
+    released: &std::sync::atomic::AtomicBool,
+    releasing: bool,
+    death_slot: Option<&Mutex<WdaDeath>>,
+    health: crate::wda::WdaHealth,
+) -> bool {
     use std::sync::atomic::Ordering;
+
+    let prev = *recover(health_slot.lock());
+    let was_released = released.load(Ordering::Acquire);
+    if let Some(slot) = death_slot {
+        if let Some(reason) = classify_wda_death(prev, health, was_released, releasing) {
+            tracing::warn!(
+                reason,
+                "WDA stopped being drivable: {}",
+                wda_death_hint(reason)
+            );
+            *recover(slot.lock()) = WdaDeath {
+                reason,
+                at: now_secs(),
+            };
+        } else if health.actionable {
+            // Recovered — clear the epitaph so a stale cause can't be read as
+            // the current state.
+            *recover(slot.lock()) = WdaDeath::default();
+        }
+    }
 
     *recover(health_slot.lock()) = health;
     actionable.store(health.actionable, Ordering::Release);
@@ -1333,6 +1461,14 @@ async fn agent_status(
             .unwrap_or(""),
     )
     .unwrap_or_else(|_| "\"\"".to_string());
+    // Death attribution (#26 §2). Only meaningful while WDA is actually down;
+    // a stale cause next to a healthy runner would read as a live problem.
+    let death = *recover(state.wda_death.lock());
+    let (wda_died_reason, wda_died_at) = if wda_actionable || death.reason.is_empty() {
+        ("", 0)
+    } else {
+        (death.reason, death.at)
+    };
     // Build progress (#26 §1). Read raw — unlike `setup_status`, a *stale*
     // status is meaningful here: it means the helper died mid-build rather
     // than that the blocker went away.
@@ -1372,6 +1508,10 @@ async fn agent_status(
     } else if direct && wda && !wda_actionable {
         if wda_locked == "true" {
             "WDA is reachable but the iPhone is locked — unlock it and keep it awake; direct control never falls back to iPhone Mirroring"
+        } else if !wda_died_reason.is_empty() {
+            // We watched it die; say what took it down instead of the generic
+            // "cannot act" that made a severed session look like interference.
+            wda_death_hint(wda_died_reason)
         } else {
             "WDA is reachable but cannot act — restart the direct device service; direct control is fail-closed and will not inject into the Mac"
         }
@@ -1417,7 +1557,7 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
         state.device_udid.is_some(),
         state.managed_wda,
@@ -5960,6 +6100,129 @@ mod tests {
         assert!(setup_blocker_hint("warp")
             .unwrap()
             .contains("Traffic only mode"));
+    }
+
+    // --- wda_died_reason (#26 §2) ------------------------------------------
+
+    fn health(up: bool, actionable: bool, locked: Option<bool>) -> crate::wda::WdaHealth {
+        crate::wda::WdaHealth {
+            up,
+            actionable,
+            locked,
+        }
+    }
+
+    #[test]
+    fn a_severed_session_is_not_blamed_on_a_human() {
+        // The reported symptom: WDA still answers /status but every action
+        // fails Code=41 after a WARP reconnect or a sleep.
+        let reason = classify_wda_death(
+            health(true, true, Some(false)),
+            health(true, false, Some(false)),
+            false,
+            false,
+        );
+        assert_eq!(reason, Some("session_severed"));
+        assert!(wda_death_hint("session_severed").contains("WARP"));
+    }
+
+    #[test]
+    fn death_reasons_separate_the_four_real_causes() {
+        let alive = health(true, true, Some(false));
+        // Runner/relay gone entirely, or the phone's Wi-Fi address moved.
+        assert_eq!(
+            classify_wda_death(alive, health(false, false, None), false, false),
+            Some("unreachable")
+        );
+        // Phone locked under a live runner.
+        assert_eq!(
+            classify_wda_death(alive, health(true, false, Some(true)), false, false),
+            Some("device_locked")
+        );
+        // We stopped it ourselves — nobody needs to go repair anything.
+        assert_eq!(
+            classify_wda_death(alive, health(false, false, None), true, false),
+            Some("idle_release")
+        );
+        assert_eq!(
+            classify_wda_death(alive, health(false, false, None), false, true),
+            Some("idle_release")
+        );
+    }
+
+    #[test]
+    fn only_a_fall_from_working_counts_as_a_death() {
+        let alive = health(true, true, Some(false));
+        let dead = health(false, false, None);
+        // Still fine → not a death.
+        assert_eq!(classify_wda_death(alive, alive, false, false), None);
+        // Was already down → not a NEW death; must not overwrite the real cause
+        // recorded at the original transition with a later generic one.
+        assert_eq!(classify_wda_death(dead, dead, false, false), None);
+        // Coming back up is not a death either.
+        assert_eq!(classify_wda_death(dead, alive, false, false), None);
+    }
+
+    #[test]
+    fn intentional_release_outranks_the_crash_signatures() {
+        // An idle release also presents as "up:false" — reporting that as
+        // `unreachable` would send agents chasing a phantom outage.
+        let alive = health(true, true, Some(false));
+        assert_eq!(
+            classify_wda_death(alive, health(true, false, Some(true)), true, false),
+            Some("idle_release")
+        );
+    }
+
+    #[test]
+    fn every_death_reason_carries_recovery_guidance() {
+        for reason in [
+            "idle_release",
+            "device_locked",
+            "session_severed",
+            "unreachable",
+        ] {
+            assert!(
+                !wda_death_hint(reason).is_empty(),
+                "{reason} has no recovery hint"
+            );
+        }
+        assert_eq!(wda_death_hint(""), "");
+        assert_eq!(wda_death_hint("something-new"), "");
+    }
+
+    #[test]
+    fn recovery_clears_the_recorded_cause() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let slot = Mutex::new(health(true, true, Some(false)));
+        let actionable = AtomicBool::new(true);
+        let released = AtomicBool::new(false);
+        let death = Mutex::new(WdaDeath::default());
+
+        // Dies...
+        apply_wda_health_probe_tracked(
+            &slot,
+            &actionable,
+            &released,
+            false,
+            Some(&death),
+            health(true, false, Some(false)),
+        );
+        assert_eq!(recover(death.lock()).reason, "session_severed");
+        assert!(!actionable.load(Ordering::Acquire));
+
+        // ...and comes back. A stale epitaph next to a healthy runner would be
+        // read as a live problem.
+        apply_wda_health_probe_tracked(
+            &slot,
+            &actionable,
+            &released,
+            false,
+            Some(&death),
+            health(true, true, Some(false)),
+        );
+        assert_eq!(recover(death.lock()).reason, "");
+        assert!(actionable.load(Ordering::Acquire));
     }
 
     // --- wda_build (#26 §1) ------------------------------------------------
