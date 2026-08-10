@@ -134,7 +134,12 @@ for binary in "$DAEMON_BINARY" "$MCP_BINARY"; do
 done
 
 # ── Sign nested binaries first, then the outer bundle ─────────────────────────
-for binary in "$DAEMON_BINARY" "$MCP_BINARY"; do
+# $MCP_BINARY leads deliberately. $DAEMON_BINARY is the bundle's main
+# executable, so codesign folds bundle validation into signing it and rejects
+# the still-unsigned nested helper ("code object is not signed at all / In
+# subcomponent: .../iphone-use-mcp"). The comment above was always right; the
+# order underneath it was not.
+for binary in "$MCP_BINARY" "$DAEMON_BINARY"; do
     echo "Signing binary: $binary ..."
     codesign \
         --force \

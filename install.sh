@@ -26,10 +26,18 @@ umask 077
 # Direct mode uses this only when the supplied app has no valid signature. It
 # creates no certificate and never changes the user's keychain search list.
 # Mirror may use it as a degraded fallback when the stable signer is unavailable.
+#
+# Order matters and is not obvious: `iphone-use` is the bundle's MAIN
+# executable, so codesign treats signing it as signing the bundle and validates
+# nested code as it goes. With `iphone-use-mcp` still only linker-signed at
+# that point, that validation fails with "code object is not signed at all /
+# In subcomponent: .../iphone-use-mcp" and the whole install rolls back. The
+# nested helper must be signed BEFORE anything that pulls in bundle
+# validation. Covered by scripts/test-install-adhoc-signing.sh.
 _inline_sign() {
     local app="$1"
-    codesign --force --sign - "$app/Contents/MacOS/iphone-use"
     codesign --force --sign - "$app/Contents/MacOS/iphone-use-mcp"
+    codesign --force --sign - "$app/Contents/MacOS/iphone-use"
     codesign --force --sign - "$app"
     ok "Ad-hoc signed without creating a certificate or changing keychain state"
 }
