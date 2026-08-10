@@ -113,8 +113,15 @@ impl Config {
         let password = get("PHONE_REMOTE_PASSWORD").filter(|s| !s.is_empty());
         let secret = get("PHONE_REMOTE_SECRET").filter(|s| !s.is_empty());
 
+        // A zero TTL signs tokens that are already expired when issued, which
+        // locks the operator out of their own web UI with no error to read —
+        // the login just never sticks. Treat it as the typo it always is and
+        // fall back, the same way the activation deadline does (#29/#30).
+        // Unlike PHONE_REMOTE_IDLE_RELEASE_SECS, zero has no "disabled"
+        // meaning here: there is no such thing as a session that never ends.
         let session_ttl_secs = get("PHONE_REMOTE_SESSION_TTL")
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
             .unwrap_or(DEFAULT_SESSION_TTL_SECS);
 
         let state_dir = get("PHONE_REMOTE_STATE_DIR")
@@ -195,6 +202,24 @@ mod tests {
     fn session_ttl_override() {
         let cfg = map_cfg(&[("PHONE_REMOTE_SESSION_TTL", "3600")]);
         assert_eq!(cfg.session_ttl_secs, 3600);
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_SESSION_TTL", " 3600 ")]).session_ttl_secs,
+            3600
+        );
+    }
+
+    #[test]
+    fn session_ttl_never_signs_an_already_expired_token() {
+        // A 0 TTL issues tokens that expire the instant they are minted, so
+        // login silently never sticks and the operator is locked out of their
+        // own UI with nothing to read. Junk deserves the same fallback.
+        for raw in ["0", "", "abc", "-1", "3600s", "1.5"] {
+            assert_eq!(
+                map_cfg(&[("PHONE_REMOTE_SESSION_TTL", raw)]).session_ttl_secs,
+                DEFAULT_SESSION_TTL_SECS,
+                "PHONE_REMOTE_SESSION_TTL={raw:?} must fall back, not lock the user out"
+            );
+        }
     }
 
     #[test]
