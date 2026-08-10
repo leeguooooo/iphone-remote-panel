@@ -44,19 +44,13 @@
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
 
-    <!--
-      Required for ScreenCaptureKit / CGDisplayStream access.
-      macOS shows this string in the Screen Recording permission dialog.
-    -->
+    <!-- Only used by the explicit legacy mirror compatibility backend. -->
     <key>NSScreenCaptureUsageDescription</key>
-    <string>iphone-use needs to capture the iPhone Mirroring window to stream it to your iPhone over WebRTC.</string>
+    <string>When you explicitly select the legacy Mirror compatibility backend, iphone-use needs Screen Recording access to capture the iPhone Mirroring window.</string>
 
-    <!--
-      Required for CGEventPost (Accessibility) used to drive pointer input
-      into the iPhone Mirroring window.
-    -->
+    <!-- Only used by the explicit legacy mirror compatibility backend. -->
     <key>NSAppleEventsUsageDescription</key>
-    <string>iphone-use needs Accessibility access to inject touch events into iPhone Mirroring.</string>
+    <string>When you explicitly select the legacy Mirror compatibility backend, iphone-use needs Accessibility access to control the iPhone Mirroring window.</string>
 
     <!-- Suppress Dock icon — daemon runs in background -->
     <key>LSUIElement</key>

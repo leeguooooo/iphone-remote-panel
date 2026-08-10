@@ -1,11 +1,11 @@
 {
   "$comment": "Single source of truth for the Shortcuts RPC bridge. Agents read THIS to know what native iPhone capabilities are reachable — never 'whatever shortcuts happen to be on the phone'. One bridge shortcut (iU Bridge) dispatches on `verb` and POSTs results to the daemon's /agent/inbox. Adding a capability = add a branch to the bridge + add an entry here. Keep it small and curated.",
-  "version": 1,
+  "version": 2,
   "bridge_shortcut": {
     "name": "iU Bridge",
-    "install": "Add the one bridge shortcut (iCloud link in the README); it is the only shortcut you install. It reads a JSON request from the clipboard, dispatches on `verb`, runs the native action, and POSTs the result to http://<mac>:44321/agent/inbox with the Authorization: Bearer header.",
+    "install": "Add the one bridge shortcut (iCloud link in the README); it is the only shortcut you install. It reads a JSON request from the clipboard, dispatches on `verb`, runs the native action, and POSTs the result to http://<mac>:44321/agent/inbox with both Authorization: Bearer <token> and X-Phone-Control: 1 headers.",
     "request": "Daemon writes {\"verb\":\"...\",\"id\":\"<correlation>\",\"args\":{...}} to the Mac clipboard, then triggers 'iU Bridge' by name via Spotlight.",
-    "response": "POST {\"id\":\"<correlation>\",\"verb\":\"...\",\"ok\":true,\"data\":{...}} to /agent/inbox; the agent GETs /agent/inbox and matches on id."
+    "response": "POST {\"id\":\"<correlation>\",\"verb\":\"...\",\"ok\":true,\"data\":{...}} to /agent/inbox; the agent POSTs /agent/inbox/drain with bearer auth and X-Phone-Control: 1, then matches on id. GET /agent/inbox is read-only peek."
   },
   "verbs": [
     {

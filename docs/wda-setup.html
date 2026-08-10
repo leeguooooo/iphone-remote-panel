@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebDriverAgent (元素树控制) 接入与踩坑 · iphone-use</title>
+<title>Direct/WDA 主路径接入与真机验收 · iphone-use</title>
 <style>
   :root {
     --fg: #1a1a1a; --muted: #6b6b6b; --bg: #fbfbfa; --card: #ffffff;
@@ -41,37 +41,60 @@
 </head>
 <body>
 <header>
-  <h1>WebDriverAgent 元素树控制 — 接入指南与踩坑</h1>
-  <p class="lede">iphone-use 的 <strong>L2 元素层</strong>:通过 iOS 自己的辅助功能树按「元素」操作 App,
-  事件由手机自己合成 —— 不抢 Mac 光标、不靠视觉猜坐标、中文输入直通。这是对镜像+CGEvent(L3 像素层)的升级,
-  不是替代。本页记录在真机上验证出的全部坑。</p>
+  <h1>Direct/WDA 主路径 — 接入、边界与真机验收</h1>
+  <p class="lede">iphone-use 默认用 WebDriverAgent 直接连接 iPhone：控制走
+  <code>127.0.0.1:8100</code>，手机端 MJPEG 画面走 <code>127.0.0.1:9100</code>。
+  浏览器看 <code>/agent/mjpeg</code>、控 <code>/control</code>，agent 走 <code>/agent/*</code>。
+  默认不打开 iPhone 镜像，也不申请 Mac 的录屏或辅助功能权限。</p>
 </header>
 
-<h2>为什么要这一层</h2>
-<p>镜像窗口对 macOS 来说只是一块视频,iOS 的按钮不在 Mac 的辅助功能树里,所以现状(L3)只能<strong>看图猜坐标 + 用 Mac 的真实光标代点</strong>:慢、随布局/语言/分辨率漂移、且和正在用电脑的人抢同一颗光标。WebDriverAgent(WDA,Appium 的底座)作为一个测试 runner 跑<strong>在手机上</strong>,能直接拿到 iOS 的元素树并由手机自己合成事件。</p>
+<h2>为什么把它设成主路径</h2>
+<p>WebDriverAgent（WDA，Appium 的 iOS 底座）作为 XCUITest runner 跑在<strong>手机上</strong>：
+能读 iOS 元素树、直接送 Unicode 文本，并由手机合成点按和手势。画面来自同一个 WDA 会话的
+MJPEG 服务，不再依赖 Mac 上的镜像窗口、前台焦点或真实光标。WDA 不可达时，direct 模式会明确失败，
+不会悄悄回退去操作 Mac。</p>
 
 <table>
-  <tr><th>层</th><th>通道</th><th>本质</th><th>短板</th></tr>
-  <tr><td>L1 动词</td><td>Shortcuts / App Intents</td><td>调 App 暴露的类型化动作,最快最确定</td><td>只覆盖 App 愿意暴露的</td></tr>
-  <tr><td><strong>L2 元素</strong></td><td><strong>WebDriverAgent</strong></td><td>读 iOS 元素树,按元素点击,手机自己合成事件</td><td>需 Xcode 签名装 runner</td></tr>
-  <tr><td>L3 像素</td><td>镜像 + CGEvent</td><td>看图猜坐标,Mac 光标代点 —— 万能兜底</td><td>慢、脆、抢光标</td></tr>
+  <tr><th>能力</th><th>Direct/WDA 默认</th><th>Legacy mirror</th></tr>
+  <tr><td>画面</td><td>WDA MJPEG → <code>/agent/mjpeg</code>；失败时可降级 PNG 静帧</td><td>iPhone 镜像 → ScreenCaptureKit → WebRTC</td></tr>
+  <tr><td>浏览器控制</td><td><code>POST /control</code>，每条命令有成功/失败响应</td><td>WebRTC data channel → CGEvent</td></tr>
+  <tr><td>Agent 控制</td><td><code>/agent/input</code>、<code>/agent/elements</code>、<code>/agent/screenshot</code></td><td>Mac 侧像素/键码兜底</td></tr>
+  <tr><td>Mac 权限</td><td>不需要 iPhone 镜像、录屏、辅助功能</td><td>三者都需要</td></tr>
+  <tr><td>前置成本</td><td>完整 Xcode、开发团队签名、开发者模式、配对/信任</td><td>iPhone 镜像可用且保持可连接</td></tr>
 </table>
 
-<h2>一键安装(推荐)</h2>
-<pre><code># 前置:Xcode 已装且登录了 Apple ID(Settings → Accounts);
-#       手机已配对、开发者模式已开;brew install socat(或 libimobiledevice)
-./scripts/setup-wda.sh doctor    # ★ 先跑这个:一行行检查 WARP/USB/证书,告诉你卡在哪
-./scripts/setup-wda.sh           # 编译装机 → 守护运行 → localhost 中继 → 配置 daemon
-./scripts/setup-wda.sh status    # 看 WDA + 中继状态
-./scripts/setup-wda.sh stop      # 停掉
+<h2>首次接入（安装 daemon，再接真机）</h2>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+
+# 保持手机 USB 连接、已信任、已解锁且亮屏
+~/.iphone-use/setup-wda.sh doctor
+~/.iphone-use/setup-wda.sh
+~/.iphone-use/setup-wda.sh status
 </code></pre>
-<p><strong>装不上先跑 <code>doctor</code></strong> —— 它按顺序检查 Xcode/开发团队/<strong>WARP</strong>/USB 设备/中继工具,直接指出第一个拦路项,不用再盯着「转圈等待」猜。脚本本身也把本页所有坑都编码进去了:开机先验 WARP(<strong>#1 杀手</strong>)、等 DDI 挂载会提示你解锁、撞到证书信任会给出指路、自动优先选 USB 上的手机、自动选 iproxy(USB)或 socat(Wi-Fi)做 localhost 中继、最后把 <code>PHONE_REMOTE_WDA_URL</code> 写进 daemon 的 LaunchAgent。整个过程把结构化进度写进 <code>~/.iphone-use/wda-setup-status.json</code>,daemon 的 <code>/agent/status</code> 用 <code>setup_blocked_on</code> 字段透出来(<code>warp|usb|trust|ddi</code>),所以 <code>POST /agent/mode {"mode":"agent"}</code> 卡住时你一眼知道为什么。</p>
+<p><code>install.sh</code> 负责 daemon、LaunchAgent 和默认 direct 配置；它<strong>不等于真机已跑通</strong>。
+<code>setup-wda.sh</code> 才负责 WDA 编译/签名/装机、runner、8100 控制中继和 9100 MJPEG 中继。
+浏览器打开 <code>/setup</code> 可看到产品内的四步连接向导和实时首要阻塞项；只有
+<code>backend:"direct"</code> 且 <code>drivable:true</code> 时才开放进入控制页。
+向导只读状态，不会替操作者修改 VPN/代理、选择设备、绕过系统信任或执行设置脚本。
+<code>doctor</code> 会检查 Xcode、开发团队、WARP/VPN、macOS 系统代理、设备、信任和中继工具。
+它只报告网络阻塞，不会自动断开 WARP/VPN，也不会修改 HTTP/HTTPS/SOCKS 代理。
+进度写入 <code>~/.iphone-use/wda-setup-status.json</code>，daemon 通过
+<code>/agent/status</code> 的 <code>setup_blocked_on</code> 暴露
+<code>warp|proxy|usb|trust|ddi|wda</code> 等首要阻塞点。KeepAlive 下一次重试开始时
+保留上一次 blocker，直到对应检查确实通过或被新的原因替换，避免状态在真实故障与空值之间闪烁。</p>
 
 <h2>前置条件</h2>
 <ul>
-  <li>Mac:Xcode(命令行套件),并在 <em>Xcode → Settings → Accounts</em> 登录 Apple ID(免费 Personal Team 即可)。</li>
-  <li>iPhone:开启<strong>开发者模式</strong>(设置 → 隐私与安全性 → 开发者模式 → 开 → 重启)。</li>
-  <li>中继工具:<code>brew install socat</code>(Wi-Fi)或 <code>brew install libimobiledevice</code>(USB 的 iproxy)。</li>
+  <li>Mac：安装<strong>完整 Xcode.app</strong>，仅 Command Line Tools 不够；在
+  <em>Xcode → Settings → Accounts</em> 登录 Apple ID 并选定 Apple 开发团队（免费 Personal Team 可用，但签名通常需周期性续装）。</li>
+  <li>iPhone：开启<strong>开发者模式</strong>（设置 → 隐私与安全性 → 开发者模式 → 开 → 重启）。</li>
+  <li>连接：首次优先 USB；Mac 与 iPhone 已配对，手机上点过<strong>信任</strong>。</li>
+  <li>运行：编译、启动和控制期间保持手机<strong>解锁、亮屏、唤醒</strong>；WDA 不能绕过 Face ID/密码。</li>
+  <li>中继工具：普通路径使用 USB <code>iproxy</code>，安装命令为
+  <code>brew install libimobiledevice</code>。脚本不会在 USB 不可用时自动切到 Wi-Fi/
+  <code>socat</code>；后者只属于操作者明确配置的手动实验。</li>
+  <li>多设备 Mac：daemon 固定 <code>PHONE_REMOTE_UDID</code>，运行 setup 时把同一个 classic UDID 传为
+  <code>WDA_UDID</code>，避免恢复时换错手机。</li>
 </ul>
 
 <h2>手动跑(理解原理用)</h2>
@@ -85,18 +108,30 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 # 成功标志:日志出现 ServerURLHere -&gt; http://&lt;phone-ip&gt;:8100/
 # 注意 xcodebuild 不能退出 —— 它退了 WDA 就死(setup-wda.sh 帮你守护)。</code></pre>
 
-<h2>统一 API:daemon 的自动路由</h2>
-<p>给 daemon 设 <code>PHONE_REMOTE_WDA_URL=http://127.0.0.1:8100</code>(setup 脚本自动配)后,<strong>同一套 agent API 自动选最优路径</strong>,调用方零改动:</p>
+<h2>Direct API：同一条手机端链路</h2>
+<p>direct 安装默认配置
+<code>PHONE_REMOTE_WDA_URL=http://127.0.0.1:8100</code> 和
+<code>PHONE_REMOTE_WDA_MJPEG_URL=http://127.0.0.1:9100</code>。
+两者都由 setup 脚本建立本地中继；控制失败不会回退到镜像/CGEvent。</p>
 <table>
   <tr><th>调用</th><th>路由</th><th>说明</th></tr>
-  <tr><td><code>POST /agent/input {"type":"text","text":"你好"}</code></td><td>L2 → 失败回退 L3</td><td><strong>中文直通</strong>(Unicode 进文本框,不被 IME 吃)</td></tr>
-  <tr><td><code>POST /agent/input {"type":"tap","label":"新备忘录"}</code></td><td>仅 L2</td><td><strong>按元素点</strong>:无坐标、无漂移、不碰 Mac 光标(L3 无此能力)</td></tr>
-  <tr><td><code>POST /agent/input {"type":"tap","x":0.5,"y":0.5}</code></td><td>L2 → 失败回退 L3</td><td>归一化坐标,手机端合成,无需镜像窗口在最前</td></tr>
-  <tr><td><code>GET /agent/elements</code></td><td>仅 L2</td><td>扁平元素树 <code>{kind,label,rect,depth}</code> —— 文本,比截图便宜一个量级</td></tr>
-  <tr><td><code>GET /agent/screenshot</code></td><td>L3 → 无窗口时回退 L2</td><td>镜像断开(人拿着手机)时仍能看到屏幕</td></tr>
-  <tr><td><code>scroll / key / shortcut</code></td><td>仅 L3</td><td>仍走镜像 + CGEvent</td></tr>
+  <tr><td><code>GET /agent/mjpeg</code></td><td>9100 → daemon → 浏览器</td><td>手机端实时画面；中继失败时 UI 应明确降级或离线</td></tr>
+  <tr><td><code>POST /control</code></td><td>浏览器 → 8100 WDA</td><td>cookie 鉴权 + <code>X-Phone-Control: 1</code>；每条命令返回确认</td></tr>
+  <tr><td><code>POST /agent/input {"type":"text","text":"你好"}</code></td><td>8100 WDA</td><td><strong>中文直通</strong>（Unicode 进入文本框，不被 Mac 键码/IME 吃）</td></tr>
+  <tr><td><code>POST /agent/input {"type":"tap","label":"新备忘录"}</code></td><td>8100 WDA</td><td>精确标签唯一时才点；零匹配或重名返回 422 且不发送动作</td></tr>
+  <tr><td><code>POST /agent/input {"type":"tap","x":0.5,"y":0.5}</code></td><td>8100 WDA</td><td>归一化坐标，由手机合成</td></tr>
+  <tr><td>Home / Spotlight / named key</td><td>8100 WDA</td><td>设备端按钮、主屏幕 Search 入口和 WebDriver key；不触发 Mac 键码</td></tr>
+  <tr><td>long-press / swipe / drag</td><td>8100 WDA Actions</td><td>完整手势一次提交并等待 HTTP 确认，不依赖 WebRTC move channel</td></tr>
+  <tr><td><code>GET /agent/elements</code></td><td>8100 WDA</td><td>带 snapshot 的扁平元素树；包含 label、identifier、kind、rect 和稀疏状态字段</td></tr>
+  <tr><td><code>GET /agent/screenshot</code></td><td>8100 WDA</td><td>手机端 PNG 截图；无需镜像窗口</td></tr>
+  <tr><td>App Switcher / Control Center / Shortcuts bridge</td><td>Direct 暂不支持</td><td>旧实现依赖镜像、Mac 光标/剪贴板；必须有设备端实现并真机验收后再宣称支持</td></tr>
 </table>
-<p><code>GET /agent/status</code> 返回 <code>{"ok","phone_target","wda"}</code> —— <code>wda:true</code> 表示 L2 实时可用。</p>
+<p>自动化应以 <code>GET /agent/status</code> 的
+<code>backend:"direct"</code>、<code>wda:true</code>、
+<code>wda_actionable:true</code>、<code>drivable:true</code> 为门槛。
+<code>device_state</code> 还会暴露 <code>releasing</code> 和
+<code>reconnecting</code>，调用方应等待它回到 <code>ready</code>。
+<code>phone_target</code> / <code>mirror_state</code> 属于 legacy mirror 语义，不能证明 direct 可控。</p>
 
 <h2>踩坑清单(真机验证)</h2>
 
@@ -137,28 +172,41 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
 <div class="pit">
   <h3>⑦ macOS「本地网络」隐私会静默拦截 daemon 直连手机 <span class="tag block">必须走 localhost 中继</span></h3>
   <p>真机实测:终端里 <code>curl http://&lt;phone-ip&gt;:8100/status</code> 通,但 <strong>daemon(后台 LaunchAgent)发同样的请求失败</strong>、不弹任何授权框 —— macOS 15+/26 的「本地网络」隐私对后台进程访问私网地址是<strong>静默拒绝</strong>。</p>
-  <p>解法:让 daemon 访问 <strong><code>127.0.0.1</code>(localhost 豁免本地网络权限)</strong>,由一个终端上下文的中继进程把流量转给手机:USB 在时用 <code>iproxy 8100 8100 -u &lt;UDID&gt;</code>(最稳,手机换 Wi-Fi 也不断);否则 <code>socat TCP-LISTEN:8100,fork,reuseaddr,bind=127.0.0.1 TCP:&lt;phone-ip&gt;:8100</code>。setup-wda.sh 自动选择。顺带的好处:daemon 配置永远是 <code>http://127.0.0.1:8100</code>,手机 IP 变了只动中继。</p>
-  <p>注:<code>iproxy</code> 走 usbmuxd,只在 USB(或 usbmuxd 级 Wi-Fi 配对)下可用 —— CoreDevice 的 Wi-Fi 隧道(devicectl 那套)usbmuxd 看不见,那种情况用 socat。</p>
+  <p>普通路径让 daemon 只访问 <strong><code>127.0.0.1</code></strong>，由 USB
+  <code>iproxy</code> 把 8100/9100 固定转发到 <code>WDA_UDID</code>。这样能稳定选择目标，
+  也不依赖变化的手机 IP。脚本不会自动改用 Wi-Fi/<code>socat</code>；需要那条路径时，
+  操作者必须自己评估网络和暴露面后手动配置。</p>
+  <aside><strong>loopback 不是认证或防火墙。</strong> WDA 在 iPhone 上的 8100/9100
+  没有认证。<code>iproxy</code> 只保护 Mac 侧 relay 的目标选择，不能阻止同一局域网里的机器
+  直接访问手机 IP 上的 WDA。Phase 1 只适合可信、隔离网络；真正的设备传输认证要由 Phase 2
+  companion app 或受控 tunnel 提供。</aside>
 </div>
 
 <div class="pit">
-  <h3>⑧ 跨子网也能直连;手机频繁锁屏挡操作</h3>
-  <p>WDA 监听手机的 <code>0.0.0.0:8100</code>,日志打印 <code>ServerURLHere-&gt;http://&lt;phone-ip&gt;:8100&lt;-ServerURLHere</code>。实测<strong>手机和 Mac 不在同一 /24 子网也能直连</strong>(只要可路由);否则用 <code>iproxy 8100 8100</code> 走 USB 转发。<br>另:很多操作(启动 app、输入)要求手机解锁,默认「自动锁定 30 秒」会反复打断 —— 把它设成<strong>永不</strong>。讽刺的是 <strong>agent 自己就能用 WDA 设</strong>:按标签点 <em>设置 → 显示与亮度 → 自动锁定 → 永不</em>(本项目已这么验证过)。但首次解锁仍需真人(Face ID/密码),WDA 不能解锁。</p>
+  <h3>⑧ WDA 端口会暴露到可路由网络；锁屏也会阻断操作</h3>
+  <p>WDA 监听手机的 <code>0.0.0.0:8100</code>，MJPEG 使用 9100，二者都无认证。
+  日志打印 <code>ServerURLHere-&gt;http://&lt;phone-ip&gt;:8100&lt;-ServerURLHere</code>。
+  只要网络可路由，同 LAN/跨子网主机可能绕过 daemon 登录直接访问 WDA。不要在访客 Wi-Fi、
+  公共网络或不受控办公网运行 Phase 1；用 USB 时可关闭手机 Wi-Fi。</p>
+  <p>很多操作（启动 App、输入）要求手机解锁。默认自动锁定会反复打断，长时间测试可在
+  <em>设置 → 显示与亮度 → 自动锁定</em> 调整；首次解锁仍需真人，WDA 不能绕过 Face ID/密码。</p>
+</div>
 
-  <h3>⑨ WDA 与 iPhone 镜像互斥:runner 一启动,镜像必断 <span class="tag block">架构级</span></h3>
+<div class="pit">
+  <h3>⑨ WDA 与 iPhone 镜像互斥：不要把两条链路叠加 <span class="tag block">架构级</span></h3>
   <p>跑在手机上的 XCUITest runner(WDA)会<strong>独占设备的远程会话</strong>:它一启动,iPhone 镜像立刻断成
   「Connection Interrupted」;它活着,镜像点 Try Again 永远连不回去 —— <strong>哪怕手机已锁屏</strong>。
   反向同样成立,先连镜像再启 runner,镜像当场被踢掉。真机 A/B 实测(iPhone 17 / iOS 27,2026-06-12):
   带着 WDA 点 Try Again → 失败;杀掉 runner 再点 → <strong>秒连</strong>;镜像连着时重启 runner → 镜像当场断。</p>
-  <p>所以 L2(元素树)和 L3(镜像实时视频)是<strong>二选一的模式</strong>,不是叠加层:</p>
+  <p>所以 direct 与 legacy mirror 是<strong>两个明确后端</strong>，不是运行时自动兜底：</p>
   <ul>
-    <li><strong>镜像模式</strong>(给人看):实时视频 + L3 像素输入。先 <code>setup-wda.sh stop</code>,再在镜像窗口点 Try Again。</li>
-    <li><strong>Agent 模式</strong>(给 agent 用):元素树、中文直通、手机端原生截图;此时网页端自动切到
-    <strong>静帧兜底</strong>(每 2.5s 一帧 WDA 抓屏,人仍能看到手机在干嘛),镜像窗口显示 Interrupted 属正常现象。</li>
+    <li><strong>Direct（默认）</strong>：WDA 控制 + WDA MJPEG 画面。不要打开 iPhone 镜像；镜像显示 Interrupted 属正常。</li>
+    <li><strong>Legacy mirror（显式兼容）</strong>：先停 WDA，再以
+    <code>PHONE_REMOTE_BACKEND=mirror</code> 重启 daemon，并在镜像窗口重新连接。此模式才申请录屏/辅助功能。</li>
   </ul>
-  <p>切换方式(推荐用 API,一条龙全自动):<code>POST /agent/mode {"mode":"mirror"}</code>(WDA 锁屏 → 停 runner → 激活镜像 → 自动点 Try Again,约 10 秒)/
-  <code>{"mode":"agent"}</code>(后台拉起 runner;若手机锁着需人解锁一次,launcher 会等)。命令行等价:<code>scripts/setup-wda.sh</code> / <code>scripts/setup-wda.sh stop</code>。
-  排障速记:<strong>镜像怎么也连不上时,第一反应查 WDA 是否在跑</strong>(<code>curl http://127.0.0.1:8100/status</code>)。</p>
+  <p>direct 后端不会接受「切到 mirror」作为一次普通控制命令；这是部署级选择，必须明确改配置并重启。
+  排障时先确认自己选择的是哪一个 backend，再查
+  <code>curl http://127.0.0.1:8100/status</code> 和两个 relay，避免一边启动 WDA、一边反复点镜像重连。</p>
 </div>
 
 <div class="pit">
@@ -174,34 +222,63 @@ xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   (<code>Testing failed: The connection was invalidated</code>)。</p>
   <p><strong>解法:</strong></p>
   <ul>
-    <li><strong>临时</strong>:装机 + 运行期间 <code>warp-cli disconnect</code>。注意若组织策略是 <code>Always On: true</code>,
-    disconnect 会被自动重连——这时得用下面的永久解。<code>setup-wda.sh</code> 开机即检测 WARP,
-    on 就硬停并指路(或 <code>WDA_AUTO_WARP=1</code> 自动断开-恢复)。</li>
-    <li><strong>永久(推荐)</strong>:让 Zero Trust 管理员在 WARP 设备配置的 Split Tunnels <strong>排除列表</strong>里
-    加上 <strong>CoreDevice 设备隧道的 IPv6 段</strong>(<code>fe80::/10</code> 链路本地 + 设备 RSD ULA),
+    <li><strong>临时</strong>:由操作者决定是否执行 <code>warp-cli disconnect</code>。
+    <code>setup-wda.sh doctor</code> 只检测并说明问题，脚本不会自动断开或恢复 WARP/VPN。
+    若组织策略是 <code>Always On: true</code>，交给管理员处理，不要让安装脚本绕过策略。</li>
+    <li><strong>永久（只访问少量目标时优先）</strong>:让 Zero Trust 管理员创建匹配该用户或设备组的配置，
+    将 Service mode 设为 <strong>Traffic only</strong>、Split Tunnels 设为 <strong>Include</strong>，
+    并只加入真正需要 WARP 的目标 IP/CIDR。系统 DNS 和其他目的流量不进 WARP，CoreDevice 也不会被捕获。
+    Traffic only 不支持按域名动态分流，因此先确认目标的稳定 IP。</li>
+    <li><strong>短 HTTP 请求的备选</strong>:MASQUE + <strong>Local proxy mode</strong> 只转发显式发给
+    <code>127.0.0.1:40000</code> 的 HTTP/HTTPS 请求，同样不会捕获 CoreDevice；但 Cloudflare 对这种模式设有
+    单次请求超时，不适合可能持续较久的 Git 上传。</li>
+    <li><strong>永久（仍需全隧道时）</strong>:让 Zero Trust 管理员在 WARP 设备配置的 Split Tunnels <strong>排除列表</strong>里
+    加上 <strong>CoreDevice 设备隧道的 IPv6 段</strong>（<code>fe80::/10</code> 链路本地 +
+    <code>fd00::/8</code> 设备 RSD ULA）。以 <code>warp-cli tunnel dump</code> 的
+    <strong>Excluded</strong> 有效路由为准，不要只看较短的策略摘要。
     这样 CoreDevice 不走 WARP,WDA 就能在 WARP 开着时跑——真正做到「办公 VPN + 操作手机」两不误。</li>
   </ul>
-  <p>排障速记:<strong>WDA / 真机装不上,第一反应 <code>warp-cli status</code>,Connected 就先 disconnect 再试</strong>
-  ——或直接 <code>setup-wda.sh doctor</code> 让它告诉你。</p>
+  <p>排障速记：WDA / 真机装不上时先看 <code>setup-wda.sh doctor</code>、<code>warp-cli settings</code> 和
+  <code>warp-cli status</code>。脚本会验证 Traffic only / Include 的有效排除路由，并将 Local proxy mode
+  视为路由安全；是否切换 VPN 状态或组织策略由操作者或管理员决定。</p>
 </div>
 
-<h2>已验证(iPhone 17 / iOS 27 真机,2026-06-11)</h2>
-<p>整条 L2 链路在真机跑通,以下能力是相对镜像+CGEvent(L3)的核心优势,<strong>均已实测</strong>:</p>
+<h2>已有真机证据（组件级）</h2>
+<p>在 iPhone 17 / iOS 27 真机（2026-06-11）上，以下 WDA 组件能力曾经通过 daemon API 实测：</p>
 <ul>
   <li><code>GET /source</code> — 元素树<strong>直接读到中文 UI</strong>(设置项、日期标签)。</li>
   <li>按元素 label 定位 + 点击 — <strong>无坐标漂移、不碰 Mac 光标</strong>(用它驱动设置把自动锁定设成「永不」,人没动电脑)。</li>
   <li><code>POST /wda/keys</code> 送字符串 — <strong>中文一次到位</strong>:在备忘录里干净打出整段中文,而同机 L3 像素路径打出的是 <code>我爱上…AI阿根廷鸥鸟啊</code> 这种被拼音 IME 吃 keycode 的乱码。WDA 直接把 Unicode 送进文本框,绕开键盘/IME。</li>
 </ul>
+<p>这些证据证明 WDA 组件可行，<strong>不等于</strong>当前 direct-by-default 的安装器、MJPEG、
+浏览器手势、故障恢复和多设备选择已经完整验收。</p>
+
+<h2>Direct 主路径真机验收</h2>
+<p>只有下面各项都在目标真机上观察到，才能把新默认标成「已验收」；源码审查、单测、
+daemon 在线、历史组件测试都不能替代：</p>
+<table>
+  <tr><th>层级</th><th>必须观察</th><th>失败时不能怎么做</th></tr>
+  <tr><td>权限边界</td><td>关闭 iPhone 镜像，移除 iPhoneUse 的录屏/辅助功能授权，direct daemon 仍可启动</td><td>不能为了“跑通”临时补 TCC</td></tr>
+  <tr><td>目标与状态</td><td><code>backend:"direct"</code>、目标 UDID 正确、<code>wda_actionable:true</code>、<code>drivable:true</code></td><td>不能只看 <code>ok:true</code> 或 launchd loaded</td></tr>
+  <tr><td>实时画面</td><td>另一台设备打开 <code>/phone</code>，<code>/agent/mjpeg</code> 连续更新；停 9100 后 UI 诚实降级</td><td>不能把一张 PNG 静帧当直播</td></tr>
+  <tr><td>浏览器控制</td><td>点按、拖动、长按、滚动、ASCII/CJK 文本各执行一次且收到确认</td><td>不能在请求失败后仍 toast 成功</td></tr>
+  <tr><td>Agent API</td><td>elements/screenshot/input 通过 bearer 鉴权；断开 8100 时明确失败且 Mac 光标不动</td><td>不能自动回退 CGEvent</td></tr>
+  <tr><td>读路径失效</td><td>elements/source 或 screenshot 失败后立即撤销缓存 actionability，后续状态不得继续声称 <code>drivable:true</code></td><td>下一次健康探测负责区分短暂 WebView 变化与 WDA 真正掉线</td></tr>
+  <tr><td>恢复</td><td>观察 <code>releasing → released → reconnecting → ready</code>，并覆盖锁屏/解锁、USB 重连、daemon/Mac 重启、WDA 重签</td><td>多设备环境不能静默换目标</td></tr>
+  <tr><td>网络暴露</td><td>在隔离网络检查手机 IP 的 8100/9100 是否可直连，并记录结果</td><td>不能把 USB loopback relay 当成 WDA 认证</td></tr>
+</table>
+<p>记录每次验收的 iPhone/iOS、Mac/macOS、Xcode、开发团队类型、USB 传输、网络隔离方式和逐项结果。</p>
 
 <aside>
-  <strong>这一层不取代镜像。</strong> 镜像 + WebRTC 仍是人类远程桌面、视觉兜底、以及 WDA 覆盖不到时的保险。
-  agent 的默认路径优先 L1 动词 → L2 元素 → L3 像素兜底。<br>
-  <strong>定位:</strong> L2 需要用户装 Xcode 自己编 WDA,与「一行 curl 安装」冲突 —— 所以 L3(像素,零 setup)是默认,L2(WDA)是高级/power-user 路径。
+  <strong>产品定位已经反转：</strong>Direct/WDA 是默认主路径；镜像 + ScreenCaptureKit +
+  WebRTC + CGEvent 仅作为显式 <code>PHONE_REMOTE_BACKEND=mirror</code> 兼容后端。
+  Home、Spotlight、named key、长按与拖动已走 WDA；App Switcher、Control Center 和
+  Shortcuts bridge 暂不属于 Direct 的已承诺能力。
 </aside>
 
 <footer>
-  iphone-use · WDA 接入与踩坑 · L2 真机验证:macOS 26 / Xcode 26.5(DDI 17F42=iOS 26.5)/ iPhone 17 (iOS 27.0)。
-  本页随路线推进持续更新。
+  iphone-use · Direct/WDA 接入与验收边界 · 历史组件证据：macOS 26 /
+  Xcode 26.5（DDI 17F42=iOS 26.5）/ iPhone 17（iOS 27.0）。完整 direct 浏览器链路待按本页矩阵记录。
 </footer>
 </body>
 </html>

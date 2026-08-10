@@ -1,5 +1,6 @@
-//! Per-viewer WebRTC PeerConnection: H.264 video track fed from the pipeline,
-//! PLI→keyframe, and `control`/`move` data channels routed to input injection.
+//! Legacy Mirror per-viewer WebRTC PeerConnection: H.264 video track fed from
+//! the pipeline, PLI→keyframe, and `control`/`move` data channels routed only
+//! to the Mac-side input injector.
 //!
 //! The daemon is the **offerer** (see [`crate::signaling`]). This module builds
 //! the PeerConnection, adds the video track + two data channels, wires the feed
@@ -47,12 +48,10 @@ pub const H264_FMTP: &str =
 ///
 /// Returns the `Arc<RTCPeerConnection>`; the caller ([`crate::signaling`]) does
 /// `create_offer` / `set_local_description` and the ICE/answer exchange.
-pub async fn build_viewer_pc(
+pub async fn build_mirror_viewer_pc(
     ice_servers: Vec<RTCIceServer>,
     pipeline: Arc<dyn VideoPipeline>,
     injector: InputInjector,
-    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
-    wda_actionable: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -68,8 +67,7 @@ pub async fn build_viewer_pc(
     // with "No route to host", so the phone never learns the Mac's real LAN IP and the
     // only surviving candidate is a useless VPN-egress srflx → ICE fails the instant the
     // page opens. This is a self-hosted LAN-first tool: advertise the real IP directly.
-    setting_engine
-        .set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+    setting_engine.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
 
     // Only gather candidates on physical interfaces. VPN tunnels (utun*/ipsec*/ppp*) add
     // dead POINTOPOINT candidates (a WARP host has 10+ utun NICs) that bloat the SDP, slow
@@ -144,7 +142,9 @@ pub async fn build_viewer_pc(
         let pipeline = pipeline.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             tracing::debug!("peer connection state: {state}");
-            if state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected {
+            if state
+                == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected
+            {
                 pipeline.request_keyframe();
             }
             Box::pin(async {})
@@ -161,15 +161,7 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
-    // Seed the agent/mirror flag from WDA's ACTUAL state at connect, so the very
-    // first gesture already routes correctly. Without this the flag starts false
-    // and only flips true after the first successful WDA control event — so an
-    // opening scroll/drag (before any tap) would hit L3 and pop iPhone Mirroring.
-    if let Some(w) = &wda {
-        let actionable = w.lock().await.probe_health().await.actionable;
-        wda_actionable.store(actionable, std::sync::atomic::Ordering::Relaxed);
-    }
-    wire_control_channel(control_ch, wda.clone(), wda_actionable.clone(), injector.clone());
+    wire_control_channel(control_ch, injector.clone());
 
     let move_ch = pc
         .create_data_channel(
@@ -181,7 +173,7 @@ pub async fn build_viewer_pc(
             }),
         )
         .await?;
-    wire_move_channel(move_ch, wda, wda_actionable, injector);
+    wire_move_channel(move_ch, injector);
 
     // Request a keyframe right away so the very first frames after handshake are
     // decodable (covers viewer-join per the encode contract).
@@ -221,35 +213,16 @@ async fn feed_loop(pipeline: Arc<dyn VideoPipeline>, track: Arc<TrackLocalStatic
     }
 }
 
-/// Route control-channel JSON. In agent mode (WDA actionable) the browser drives
-/// the phone ON-DEVICE via WDA — correct device, no Mac focus steal — and
-/// anything WDA can't take is DROPPED (never L3, so iPhone Mirroring is never
-/// yanked frontmost). Only when WDA is down (mirror mode) do events fall to the
-/// L3 injector.
-fn wire_control_channel(
-    ch: Arc<RTCDataChannel>,
-    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
-    actionable: Arc<std::sync::atomic::AtomicBool>,
-    injector: InputInjector,
-) {
+/// Route legacy Mirror control-channel JSON to the Mac-side injector.
+///
+/// Direct device control never creates a PeerConnection and cannot supply a
+/// WDA client to this module, so an invalid mixed backend state still cannot
+/// cross from WebRTC into on-device control.
+fn wire_control_channel(ch: Arc<RTCDataChannel>, injector: InputInjector) {
     ch.on_message(Box::new(move |msg| {
-        let wda = wda.clone();
-        let actionable = actionable.clone();
         let injector = injector.clone();
         Box::pin(async move {
             if let Ok(text) = std::str::from_utf8(&msg.data) {
-                if let Some(w) = &wda {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                        // WDA handled it → done. Not handled but WDA is up →
-                        // drop (don't pop Mirroring). WDA down → L3 below.
-                        if crate::http::wda_control_from_json(w, &actionable, &v).await {
-                            return;
-                        }
-                        if actionable.load(std::sync::atomic::Ordering::Relaxed) {
-                            return;
-                        }
-                    }
-                }
                 if let Some(ev) = decode_control(text) {
                     injector.send(ev);
                 }
@@ -258,34 +231,12 @@ fn wire_control_channel(
     }));
 }
 
-/// Route move-channel binary packets (scroll + drag). In agent mode, a scroll is
-/// re-issued as an on-device WDA swipe and a drag is dropped (no L3 → no
-/// Mirroring popup). In mirror mode (WDA down) both go to the L3 injector.
-fn wire_move_channel(
-    ch: Arc<RTCDataChannel>,
-    wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
-    actionable: Arc<std::sync::atomic::AtomicBool>,
-    injector: InputInjector,
-) {
+/// Route legacy Mirror move-channel binary packets to the Mac-side injector.
+fn wire_move_channel(ch: Arc<RTCDataChannel>, injector: InputInjector) {
     ch.on_message(Box::new(move |msg| {
-        let wda = wda.clone();
-        let actionable = actionable.clone();
         let injector = injector.clone();
         Box::pin(async move {
-            let Some(ev) = decode_move(&msg.data) else { return };
-            let agent = wda.is_some() && actionable.load(std::sync::atomic::Ordering::Relaxed);
-            if agent {
-                if let (Some(w), core::input::InputEvent::Scroll { x, y, dx, dy }) =
-                    (&wda, &ev)
-                {
-                    let mut g = w.lock().await;
-                    if crate::http::wda_swipe(&mut g, *x, *y, *dx, *dy).await.is_err() {
-                        g.invalidate_session();
-                        actionable.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                // Drag moves are dropped in agent mode (no L3 focus steal).
-            } else {
+            if let Some(ev) = decode_move(&msg.data) {
                 injector.send(ev);
             }
         })

@@ -29,6 +29,51 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Validate installer and release coherence
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n scripts/test-install-release-transaction.sh
+          bash -n scripts/test-setup-wda-warp-preflight.sh
+          bash scripts/test-install-release-transaction.sh
+          bash scripts/test-setup-wda-warp-preflight.sh
+
+          skill_file_count="$(
+            find skills/iphone-use -type f -print | wc -l | tr -d '[:space:]'
+          )"
+          test "$skill_file_count" = "1"
+          test -f skills/iphone-use/SKILL.md
+
+          if grep -R -n -E \
+            'skills(@[^[:space:]]+)?[[:space:]]+(add|update)([[:space:]]|$)|(npx|pnpx|bunx).*iphone-use' \
+            install.sh README.md README.zh-CN.md docs skills/iphone-use; then
+            echo "Floating public iphone-use skill installation is forbidden." >&2
+            exit 1
+          fi
+
+          server_version="$(
+            awk -F ' *= *' '$1 == "version" {
+              gsub(/"/, "", $2); print $2; exit
+            }' crates/server/Cargo.toml
+          )"
+          core_version="$(
+            awk -F ' *= *' '$1 == "version" {
+              gsub(/"/, "", $2); print $2; exit
+            }' crates/core/Cargo.toml
+          )"
+          mcp_version="$(
+            awk -F ' *= *' '$1 == "version" {
+              gsub(/"/, "", $2); print $2; exit
+            }' crates/mcp/Cargo.toml
+          )"
+          test -n "$server_version"
+          test "$core_version" = "$server_version"
+          test "$mcp_version" = "$server_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$server_version"
+          fi
+
       # ── Rust toolchain ───────────────────────────────────────────────────────
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -41,10 +86,16 @@ jobs:
       # ── Build ────────────────────────────────────────────────────────────────
       # Build for both Apple Silicon and Intel; lipo them into a universal binary.
       - name: Build (arm64)
-        run: cargo build --release --locked --bin iphone-use --target aarch64-apple-darwin
+        run: >-
+          cargo build --release --locked
+          --bin iphone-use --bin iphone-use-mcp
+          --target aarch64-apple-darwin
 
       - name: Build (x86_64)
-        run: cargo build --release --locked --bin iphone-use --target x86_64-apple-darwin
+        run: >-
+          cargo build --release --locked
+          --bin iphone-use --bin iphone-use-mcp
+          --target x86_64-apple-darwin
 
       - name: Create universal binary
         run: |
@@ -53,17 +104,101 @@ jobs:
             target/aarch64-apple-darwin/release/iphone-use \
             target/x86_64-apple-darwin/release/iphone-use \
             -output target/universal-apple-darwin/release/iphone-use
+          lipo -create \
+            target/aarch64-apple-darwin/release/iphone-use-mcp \
+            target/x86_64-apple-darwin/release/iphone-use-mcp \
+            -output target/universal-apple-darwin/release/iphone-use-mcp
           chmod +x target/universal-apple-darwin/release/iphone-use
+          chmod +x target/universal-apple-darwin/release/iphone-use-mcp
+          test "$(lipo -archs target/universal-apple-darwin/release/iphone-use)" = "x86_64 arm64" \
+            || test "$(lipo -archs target/universal-apple-darwin/release/iphone-use)" = "arm64 x86_64"
+          test "$(lipo -archs target/universal-apple-darwin/release/iphone-use-mcp)" = "x86_64 arm64" \
+            || test "$(lipo -archs target/universal-apple-darwin/release/iphone-use-mcp)" = "arm64 x86_64"
 
       # Expose universal binary where make-app.sh expects it
       - name: Copy universal binary to target/release
         run: |
           mkdir -p target/release
           cp target/universal-apple-darwin/release/iphone-use target/release/iphone-use
+          cp target/universal-apple-darwin/release/iphone-use-mcp target/release/iphone-use-mcp
 
       # ── Bundle ────────────────────────────────────────────────────────────────
       - name: Build .app bundle
         run: bash scripts/make-app.sh "$GITHUB_WORKSPACE"
+
+      - name: Verify bundled MCP protocol and multi-step tool
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          binary = "iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+          requests = "\n".join([
+              json.dumps({
+                  "jsonrpc": "2.0",
+                  "id": 1,
+                  "method": "initialize",
+                  "params": {
+                      "protocolVersion": "2025-03-26",
+                      "capabilities": {},
+                      "clientInfo": {"name": "release-audit", "version": "1"},
+                  },
+              }),
+              json.dumps({
+                  "jsonrpc": "2.0",
+                  "method": "notifications/initialized",
+              }),
+              json.dumps({
+                  "jsonrpc": "2.0",
+                  "id": 2,
+                  "method": "tools/list",
+                  "params": {},
+              }),
+              "",
+          ])
+          completed = subprocess.run(
+              [binary],
+              input=requests,
+              text=True,
+              capture_output=True,
+              timeout=15,
+              check=True,
+          )
+          responses = [
+              json.loads(line)
+              for line in completed.stdout.splitlines()
+              if line.strip()
+          ]
+          listing = next(item for item in responses if item.get("id") == 2)
+          tools = listing["result"]["tools"]
+          names = [tool["name"] for tool in tools]
+          assert len(names) == 12, names
+          assert "phone_run_steps" in names, names
+          run_steps = next(
+              tool for tool in tools if tool["name"] == "phone_run_steps"
+          )
+          assert "steps" in run_steps["inputSchema"]["properties"], run_steps
+          print("Bundled MCP exposes 12 tools including phone_run_steps.")
+
+          flow = subprocess.run(
+              [
+                  binary,
+                  "flow",
+                  "validate",
+                  "examples/flows/open-spotlight.json",
+              ],
+              text=True,
+              capture_output=True,
+              timeout=15,
+              check=True,
+          )
+          validated = json.loads(flow.stdout)
+          assert validated["ok"] is True, validated
+          assert validated["network"] == "not_contacted", validated
+          assert validated["steps"] == 3, validated
+          print("Bundled MCP validates saved flows offline.")
+          PY
 
       # ── Sign (Developer ID path, only when secrets are present) ──────────────
       - name: Import Developer ID certificate
@@ -127,11 +262,28 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           ditto -c -k --keepParent iPhoneUse.app iPhoneUse.app.zip
 
-      - name: Generate SHA-256 checksum
+      - name: Package standalone MCP bridge
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          package_dir="$(mktemp -d)"
+          cp iPhoneUse.app/Contents/MacOS/iphone-use-mcp "$package_dir/iphone-use-mcp"
+          chmod 755 "$package_dir/iphone-use-mcp"
+          if [[ "$HAS_SIGNING" != "true" ]]; then
+            codesign --force --sign - "$package_dir/iphone-use-mcp"
+          fi
+          codesign --verify --verbose=2 "$package_dir/iphone-use-mcp"
+          tar -C "$package_dir" -czf iphone-use-mcp-macos-universal.tar.gz iphone-use-mcp
+          test "$(tar -tzf iphone-use-mcp-macos-universal.tar.gz)" = "iphone-use-mcp"
+          rm -rf "$package_dir"
+
+      - name: Generate SHA-256 checksums
         run: |
           cd "$GITHUB_WORKSPACE"
           shasum -a 256 iPhoneUse.app.zip > iPhoneUse.app.zip.sha256
+          shasum -a 256 iphone-use-mcp-macos-universal.tar.gz \
+            > iphone-use-mcp-macos-universal.tar.gz.sha256
           cat iPhoneUse.app.zip.sha256
+          cat iphone-use-mcp-macos-universal.tar.gz.sha256
 
       # ── Release (tag push only) ────────────────────────────────────────────
       # On a workflow_dispatch run there is no tag ref, so we upload as an
@@ -143,6 +295,8 @@ jobs:
           files: |
             iPhoneUse.app.zip
             iPhoneUse.app.zip.sha256
+            iphone-use-mcp-macos-universal.tar.gz
+            iphone-use-mcp-macos-universal.tar.gz.sha256
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -157,4 +311,6 @@ jobs:
           path: |
             iPhoneUse.app.zip
             iPhoneUse.app.zip.sha256
+            iphone-use-mcp-macos-universal.tar.gz
+            iphone-use-mcp-macos-universal.tar.gz.sha256
           retention-days: 7

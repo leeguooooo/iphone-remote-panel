@@ -3,7 +3,7 @@
 locale: zh
 slug: iphone-use
 title: iphone-use — 把 computer-use 搬到 iPhone 上
-summary: 开源的 iPhone 智能体控制层：浏览器实时遥控 + AI agent 的看/操作 API。三层输入架构(Shortcuts 动词 / 元素树 / 像素兜底),中文直通,真机验证。
+summary: 开源的真实 iPhone Direct/WDA 控制层：WDA MJPEG 实时画面、HTTP 确认式控制和 Agent API。Mirror/WebRTC 仅为显式兼容后端。
 renderMode: raw
 section: editorial
 tags: [iphone-use, agent, computer-use, ios, open-source]
@@ -18,11 +18,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iphone-use — 把 computer-use 搬到 iPhone 上</title>
-<meta name="description" content="开源的 iPhone 智能体控制层:浏览器实时遥控 + AI agent 的看/操作 API。三层输入架构,中文直通,真机验证。">
+<meta name="description" content="开源的真实 iPhone Direct/WDA 控制层：WDA MJPEG 实时画面、HTTP 确认式控制和 Agent API。Mirror/WebRTC 仅为显式兼容后端。">
 <link rel="icon" href="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/icon-1024.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
     --ink: #1c1b33;
@@ -34,8 +31,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
     --border: rgba(79, 70, 229, 0.14);
     --good: #0f766e;
     --bad: #b91c1c;
-    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    --disp: "Unbounded", -apple-system, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --disp: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     --body: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -148,6 +145,11 @@ repoUrl: https://github.com/leeguooooo/iphone-use
   .cell h3 { font-size: 1rem; margin-bottom: .4rem; }
   .cell p { font-size: .9rem; color: var(--ink-soft); }
   .cell code { font-family: var(--mono); font-size: .82em; background: var(--accent-soft); padding: .1em .4em; border-radius: 5px; color: var(--accent); }
+  .notice {
+    background: #fffaf0; border: 1px solid #ead8ad; border-left: 4px solid #b7791f;
+    border-radius: 12px; padding: 1rem 1.2rem; color: #5f4a1e;
+  }
+  .notice code { font-family: var(--mono); font-size: .86em; }
 
   /* api sample */
   .api-two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; align-items: start; }
@@ -175,8 +177,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
       iphone-use
     </div>
     <nav class="top">
-      <a href="#install">安装</a>
-      <a href="#layers">三层架构</a>
+      <a href="#install">接入</a>
+      <a href="#layers">Direct 主路径</a>
       <a href="#api">Agent API</a>
       <a href="https://github.com/leeguooooo/iphone-use">GitHub</a>
     </nav>
@@ -184,19 +186,20 @@ repoUrl: https://github.com/leeguooooo/iphone-use
 
   <section class="hero">
     <div>
-      <div class="kicker">Open source · macOS + iPhone Mirroring · Rust</div>
+      <div class="kicker">Open source · Direct/WDA default · Rust</div>
       <h1>
-        把 computer-use<br>搬到 iPhone 上
-        <span class="en">Computer-use, but for the iPhone.</span>
+        让 agent 直接操作<br>真实 iPhone
+        <span class="en">Direct device control, with honest failure.</span>
       </h1>
       <p class="lede">
-        让 AI 智能体(和你的浏览器)<strong>看见并操作一台真实的 iPhone</strong>。
-        浏览器里 WebRTC 实时遥控;agent 用一套 HTTP API 截屏、读 UI 元素树、点按、输入 ——
-        <strong>中文一次到位</strong>。全程跑在你自己的 Mac 上,不经过任何第三方云。
+        默认后端在手机上运行 <strong>WebDriverAgent</strong>：浏览器通过 WDA MJPEG
+        看实时画面，通过有确认响应的 HTTP 请求操作手机；agent 使用同一台目标设备的
+        元素树、截图和输入 API。iPhone 镜像、WebRTC、TURN 和 Mac 光标只属于显式
+        <code>PHONE_REMOTE_BACKEND=mirror</code> 兼容模式。
       </p>
       <div class="cta-row">
         <a class="btn primary" href="https://github.com/leeguooooo/iphone-use">GitHub ↗</a>
-        <a class="btn ghost" href="#install">60 秒装好</a>
+        <a class="btn ghost" href="#install">查看接入步骤</a>
       </div>
     </div>
     <div class="phone-stage">
@@ -204,93 +207,109 @@ repoUrl: https://github.com/leeguooooo/iphone-use
         <img src="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/demo-l2-cjk.png"
              alt="真机演示:agent 通过元素层把整段中文一次性打进备忘录">
       </div>
-      <div class="phone-note">真机实拍 · agent 直接打入<br><b>整段中文,零乱码</b></div>
+      <div class="phone-note">真机组件记录 · WDA 直接输入<br><b>整段中文，无 Mac 键码</b></div>
     </div>
   </section>
 
   <section id="install">
-    <h2>60 秒装好</h2>
-    <p class="sec-lede">一条命令装守护进程;再给你的 agent 装上技能,它就会自己操作手机了。</p>
+    <h2>接入分两段，WDA 不是可选项</h2>
+    <p class="sec-lede">安装器负责 daemon 与 LaunchAgent；随后必须在目标真机上完成 WDA 构建、签名、安装和 USB 中继。耗时取决于 Xcode、签名和设备状态，不承诺固定分钟数。</p>
     <div class="term">
-<span class="c"># 1) Mac 上装守护进程(自动签名 + LaunchAgent,授权一次永久有效)</span>
+<span class="c"># 1) 安装已校验的 Release app；skill 和 WDA 脚本固定到 tag commit</span>
 <span class="p">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 
-<span class="c"># 2) 教会任何支持 skills 的 agent(Claude Code 等)驾驶你的手机</span>
-<span class="p">$</span> npx skills add leeguooooo/iphone-use
+<span class="c"># 2) 必做：连接、信任并解锁 iPhone，然后完成 WDA 主路径</span>
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh doctor
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh status
 
-<span class="c"># 3) (可选)上 L2 元素层 —— 元素树 + 按标签点按 + 中文直通</span>
-<span class="p">$</span> ./scripts/setup-wda.sh
+<span class="c"># 已校验的 agent skill 和 Claude 发现链接已同时安装</span>
     </div>
+    <p class="sec-lede">需要完整 Xcode、Apple 开发团队、iPhone 开发者模式、配对/信任、解锁亮屏和 <code>iproxy</code>。普通路径使用 USB，不会自动切换 Wi-Fi 或 <code>socat</code>。</p>
+    <p class="sec-lede">app 会校验对应 Release asset 的 SHA-256；helper 与 skill 使用 tag 的确定 commit。skill 下载、校验、发现链接或安装失败会在替换 daemon 前中止；后续 daemon 失败则恢复旧 skill。管道末端明确使用 <code>IPHONE_USE_SKIP_SKILL=1 sh</code> 才会跳过；这是降级选项，不代表 daemon 与现有 skill 兼容。</p>
+    <p class="sec-lede">升级时，旧 plist 虽没有 backend 字段，但已有有效 loopback WDA URL，会迁移到 Direct；只有完全没有 WDA 配置的旧安装才保留 Mirror。显式 backend 不变。</p>
   </section>
 
   <section id="layers">
-    <h2>三层输入架构</h2>
+    <h2>Direct 主路径</h2>
     <p class="sec-lede">
-      同一套 agent API,守护进程自动选最优路径 —— 快的更快,兜底永远在。
+      画面、控制和恢复都围绕同一个持久化目标。WDA 不可用时请求失败，不会暗中改走镜像或移动 Mac 光标。
     </p>
     <div class="layers">
       <div class="layer">
-        <div class="tag">L1 · 动词</div>
-        <h3>Shortcuts / App Intents</h3>
-        <p>通过一个受管的桥接快捷指令直达 iOS 原生 API:电量、健康数据、定位…… 结构化 JSON 回传,最快、确定性,无需视觉。</p>
+        <div class="tag">VIDEO · 9100</div>
+        <h3>WDA MJPEG 实时画面</h3>
+        <p>daemon 把手机端 9100 流代理到 <code>/agent/mjpeg</code>。断流会显式报错或降级，不会切到 legacy WebRTC。</p>
       </div>
       <div class="layer hot">
-        <div class="tag">L2 · 元素</div>
-        <h3>元素树(WebDriverAgent)</h3>
-        <p>读 iOS 自己的辅助功能树,按<b>元素标签</b>点按、把 Unicode 直接送进输入框 —— 不抢 Mac 光标、无坐标漂移、<b>中文直通</b>。人拿着手机时 agent 依然能看能操作。</p>
+        <div class="tag">CONTROL · 8100</div>
+        <h3>手机端输入，有结果才算成功</h3>
+        <p>浏览器走 <code>/control</code>，agent 走 <code>/agent/input</code>。WDA 在手机上执行点按、手势和 Unicode 输入；HTTP 成功响应才表示命令完成。</p>
       </div>
       <div class="layer">
-        <div class="tag">L3 · 像素</div>
-        <h3>镜像 + CGEvent</h3>
-        <p>基于 iPhone 镜像的屏幕流和系统级输入注入 —— 万能兜底,任何画面都能看、能点。也是人类的浏览器远程桌面(WebRTC,低延迟)。</p>
+        <div class="tag">LIFECYCLE · UDID</div>
+        <h3>固定目标与可观察恢复</h3>
+        <p><code>PHONE_REMOTE_UDID</code> 是 canonical 目标，单次请求不能临时换机。状态会区分 <code>releasing</code>、<code>released</code> 与 <code>reconnecting</code>。</p>
       </div>
     </div>
   </section>
 
   <section>
-    <h2>中文输入:直通 vs 乱码</h2>
-    <p class="sec-lede">同一台手机、同一个拼音键盘,两条路径的真实结果(均为真机记录):</p>
+    <h2>中文输入：直通与乱码</h2>
+    <p class="sec-lede">下面是同一台手机上的组件级真机记录。它证明 WDA Unicode 输入可行，不代表 Direct 浏览器整条链路已经验收。</p>
     <div class="versus">
       <div class="vs-card vs-bad">
-        <span class="lbl">❌ 传统像素路径(keycode 被拼音输入法吞掉)</span>
+        <span class="lbl">Legacy mirror 键码路径：被拼音输入法吞掉</span>
         我爱上 typed 不要按 AI阿根廷鸥鸟啊 real iPh…
       </div>
       <div class="vs-card vs-good">
-        <span class="lbl">✅ iphone-use L2 元素层(Unicode 直送输入框)</span>
-        你好世界!这条备忘录由 iphone-use 的 L2 层直接输入 —— 中文一次到位。
+        <span class="lbl">Direct/WDA：Unicode 直送输入框</span>
+        你好世界！这条备忘录由 iphone-use 通过 WDA 直接输入。
       </div>
     </div>
   </section>
 
   <section id="api">
     <h2>给 agent 的 API</h2>
-    <p class="sec-lede">三个动作就能开车:看(元素树或截图)→ 操作 → 验证。也有现成的 <a href="https://github.com/leeguooooo/iphone-use/tree/main/crates/mcp">MCP 服务器</a>(9 个工具)直接接 Claude。</p>
+    <p class="sec-lede">每次操作都按“看 → 操作 → 验证”执行。所有会改变状态的 POST 除了鉴权，还必须携带 <code>X-Phone-Control: 1</code> 作为 CSRF/操作意图保护；GET 不需要。现有 <a href="https://github.com/leeguooooo/iphone-use/tree/main/crates/mcp">MCP 服务器</a>提供 12 个工具：状态、截图/元素、snapshot-bound 与严格标签点按、滚动、文字、按键、快捷操作、失败即停的 <code>phone_run_steps</code> 多步执行，以及只重连 canonical managed Direct 目标的 <code>phone_reconnect</code>；MCP client 会自动添加 mutation header。正常安装包把同版本 MCP 放在 <code>~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp</code>，不需要另行从源码拼装；同一 binary 的 <code>flow validate/run</code> 还能离线校验并一条命令运行审阅过的 version-1 JSON，<code>--input key=value</code> 只为本次执行注入文字参数，正常路径不调用模型。浏览器控制栏也提供「流程」录制：只保留确认成功的动作，优先语义标签，把文字原文丢弃并转换成运行参数，再在人工安全审核后保存脚本或运行全部步骤；之后可用「打开脚本」恢复步骤、重新填写参数并直接重放，不再调用模型。</p>
     <div class="api-two">
       <div class="term">
-<span class="c"># 看 —— UI 即文本,比截图便宜一个量级</span>
-<span class="p">$</span> curl -H "$AUTH" $HOST/agent/elements
-{"elements":[{"kind":"Button",
-  "label":"新备忘录","rect":[369,885,38,38]}…]}
+<span class="c"># 先检查固定目标是否真的可操作</span>
+<span class="p">$</span> curl -H "$AUTH" $HOST/agent/status
+{"backend":"direct","target_configured":true,
+ "managed_wda":true,"recovery_owner":"daemon",
+ "wda_actionable":true,"drivable":true}
       </div>
       <div class="term">
-<span class="c"># 操作 —— 按标签点按 / 中文直输</span>
-<span class="p">$</span> curl -X POST $HOST/agent/input \
+<span class="c"># 再操作，并检查 HTTP 状态</span>
+<span class="p">$</span> MUTATION="X-Phone-Control: 1"
+<span class="p">$</span> curl -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" \
    -d '{"type":"tap","label":"新备忘录"}'
-<span class="p">$</span> curl -X POST $HOST/agent/input \
+<span class="p">$</span> curl -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" \
    -d '{"type":"text","text":"你好世界"}'
       </div>
     </div>
   </section>
 
   <section>
-    <h2>为什么不是又一个截图轮询工具</h2>
+    <h2>它现在承诺什么</h2>
     <div class="grid">
-      <div class="cell"><h3>🔒 完全自托管</h3><p>守护进程跑在你的 Mac 上,画面不出家门。密码 + bearer 鉴权,登录限速。</p></div>
-      <div class="cell"><h3>⚡ WebRTC 硬编码</h3><p>VideoToolbox H.264 + WebRTC,浏览器里看手机接近原生延迟;跨网络走 Cloudflare TURN。</p></div>
-      <div class="cell"><h3>🤖 MCP + Skill</h3><p>Claude Desktop / Claude Code 一行配置接入;<code>npx skills add</code> 让 agent 学会「视觉一次 → 脚本永久」。</p></div>
-      <div class="cell"><h3>🧠 UI 即文本</h3><p><code>/agent/elements</code> 把屏幕变成元素列表 —— 推理成本骤降,标签直接拿来点按。</p></div>
-      <div class="cell"><h3>🛠 真机验证的工程细节</h3><p>滚动必须是滚轮事件、镜像只收 keycode、焦点竞争、TCC 签名……每个坑都写进了<a href="https://github.com/leeguooooo/iphone-use/tree/main/docs">文档</a>。</p></div>
-      <div class="cell"><h3>📦 一次授权,永久有效</h3><p>稳定本地签名身份 —— 升级重装不再重新授权屏幕录制/辅助功能。</p></div>
+      <div class="cell"><h3>WDA 是默认依赖</h3><p>Direct 需要完整的 WDA setup。只有 daemon 启动，不等于画面和控制已经可用。</p></div>
+      <div class="cell"><h3>HTTP 确认式控制</h3><p><code>/control</code> 和 <code>/agent/input</code> 不把“已接收”冒充“已执行”。遇到 <code>504 outcome_unknown</code>，先看画面/状态，不能盲目重发。</p></div>
+      <div class="cell"><h3>元素与 Unicode</h3><p><code>/agent/elements</code> 返回手机辅助功能树；文字由 WDA 送入输入框，不经过 Mac 键码。</p></div>
+      <div class="cell"><h3>Direct 不申请 TCC</h3><p>安装器保留已有有效签名；无有效签名时才 ad-hoc 签名。稳定 TCC 身份只服务于 legacy mirror。</p></div>
+      <div class="cell"><h3>Mirror 是兼容后端</h3><p>只有显式设置 <code>PHONE_REMOTE_BACKEND=mirror</code> 才启用 ScreenCaptureKit、WebRTC、TURN、CGEvent 与对应 TCC 权限。</p></div>
+      <div class="cell"><h3>真机证据分层</h3><p>已有 WDA 组件记录；安装器、MJPEG、浏览器手势、恢复和多设备整链路仍须按<a href="https://github.com/leeguooooo/iphone-use/tree/main/docs">验收文档</a>实测。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Phase 1 的网络边界</h2>
+    <div class="notice">
+      daemon 的密码、cookie 和 bearer 只保护 44321。iPhone 上 WDA 的 8100/9100
+      没有认证；USB <code>iproxy</code> 固定 Mac relay 的目标，但不能阻止同一可路由网络
+      直接访问手机端 WDA。当前版本只应运行在可信、隔离网络。真正的设备传输认证要由
+      Phase 2 companion app 或受控 tunnel 提供。
     </div>
   </section>
 

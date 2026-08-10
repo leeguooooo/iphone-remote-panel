@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iphone-use · 低 Token 真机脚本化竞品研究</title>
+  <style>
+    :root {
+      --bg: #f7f6f2;
+      --surface: #ffffff;
+      --fg: #20201e;
+      --muted: #6c6b66;
+      --border: #d9d7cf;
+      --accent: #b84f32;
+      --accent-soft: #f5e7e1;
+      --good: #456b4b;
+      --warn: #8a6421;
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Inter", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code, pre { font-family: var(--mono); }
+    code {
+      font-size: .9em;
+      background: #efeee9;
+      border-radius: 4px;
+      padding: .08em .35em;
+    }
+    .layout {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr);
+      gap: 44px;
+      padding: 48px 0 96px;
+    }
+    nav {
+      position: sticky;
+      top: 28px;
+      align-self: start;
+      padding-top: 4px;
+      font-size: 13px;
+    }
+    nav strong {
+      display: block;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font: 600 11px/1.3 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    nav a {
+      display: block;
+      padding: 6px 0 6px 12px;
+      border-left: 2px solid var(--border);
+      color: var(--muted);
+      text-decoration: none;
+    }
+    nav a:hover { color: var(--fg); border-color: var(--accent); }
+    main { min-width: 0; }
+    header { margin-bottom: 42px; }
+    .eyebrow {
+      color: var(--accent);
+      font: 600 11px/1.3 var(--mono);
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 760px;
+      margin: 10px 0 14px;
+      font-size: clamp(30px, 5vw, 46px);
+      line-height: 1.12;
+      letter-spacing: -.035em;
+    }
+    h2 {
+      margin: 48px 0 16px;
+      font-size: 24px;
+      line-height: 1.25;
+      letter-spacing: -.015em;
+      scroll-margin-top: 28px;
+    }
+    h3 { margin: 26px 0 8px; font-size: 17px; }
+    p { max-width: 780px; margin: 0 0 12px; }
+    .lede { color: var(--muted); font-size: 17px; max-width: 780px; }
+    .decision {
+      margin-top: 24px;
+      padding: 20px 22px;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 9px;
+      background: var(--surface);
+    }
+    .decision strong { display: block; margin-bottom: 6px; }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .meta span::before { content: "— "; color: var(--border); }
+    .stage-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0 8px;
+    }
+    .stage {
+      position: relative;
+      min-height: 128px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .stage b { display: block; margin-bottom: 6px; font-size: 16px; }
+    .stage small { color: var(--muted); }
+    .stage .n {
+      color: var(--accent);
+      font: 600 11px/1 var(--mono);
+      letter-spacing: .08em;
+    }
+    table {
+      width: 100%;
+      margin: 16px 0 24px;
+      border-collapse: collapse;
+      background: var(--surface);
+      font-size: 13.5px;
+    }
+    th, td {
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #eeede8;
+      font-size: 12px;
+      letter-spacing: .02em;
+    }
+    .yes { color: var(--good); font-weight: 650; }
+    .no { color: var(--accent); font-weight: 650; }
+    .partial { color: var(--warn); font-weight: 650; }
+    aside {
+      margin: 18px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    aside.warning { background: #fbf4e7; border-color: #dfcda5; }
+    aside strong { display: block; margin-bottom: 4px; }
+    ul, ol { max-width: 800px; margin: 10px 0 18px; padding-left: 22px; }
+    li { margin: 5px 0; }
+    pre {
+      overflow-x: auto;
+      padding: 18px;
+      border: 1px solid #343431;
+      border-radius: 8px;
+      background: #222220;
+      color: #f2f0ea;
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+    pre code { padding: 0; background: none; color: inherit; }
+    .priority td:first-child { white-space: nowrap; font-weight: 700; }
+    .source-list { font-size: 13px; color: var(--muted); }
+    footer {
+      margin-top: 52px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; padding-top: 28px; }
+      nav { display: none; }
+      .stage-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 580px) {
+      .layout { width: min(100% - 24px, 1180px); }
+      .stage-grid { grid-template-columns: 1fr; }
+      th, td { padding: 9px 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav aria-label="文档目录">
+      <strong>Research map</strong>
+      <a href="#decision">结论</a>
+      <a href="#market">竞品拆解</a>
+      <a href="#gaps">当前缺口</a>
+      <a href="#model">产品模型</a>
+      <a href="#contract">Flow 合同</a>
+      <a href="#rednote">小红书边界</a>
+      <a href="#roadmap">落地顺序</a>
+      <a href="#acceptance">验收标准</a>
+      <a href="#sources">资料来源</a>
+    </nav>
+
+    <main>
+      <header>
+        <div class="eyebrow">iphone-use · competitive research · 2026-07-28</div>
+        <h1>录一次，不等于回放点击；要保存的是意图、定位方式和结果</h1>
+        <p class="lede">
+          目标不是让 AI 每次重新看图操作，也不是把一次探索冻结成坐标脚本。
+          正确分层是：AI 负责第一次探索和失败修复，确定性 runner 负责绝大多数重复执行。
+        </p>
+        <div class="decision" id="decision">
+          <strong>产品决策：继续做，但不做通用 Mobile MCP 的复制品。</strong>
+          <p>
+            iphone-use 的差异化应是<strong>真实个人 iPhone、浏览器人工接管、低 Token
+            flow 重放</strong>。MCP 是 Explore/Repair 的入口；Flow runner 才是 Run
+            的主体。正常重放不调用模型，不把截图塞给模型，也不保存临时 snapshot ref。
+          </p>
+        </div>
+        <div class="meta">
+          <span>证据范围：公开竞品文档 + 当前仓库源码</span>
+          <span>尚未证明：真实 iPhone 上的小红书完整重放</span>
+          <span>不在本阶段：实现 workflow engine</span>
+        </div>
+      </header>
+
+      <section id="market">
+        <h2>竞品不是一个答案，而是四个不同层</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>产品</th>
+              <th>做得好的层</th>
+              <th>值得吸收</th>
+              <th>不能直接替代我们</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><a href="https://github.com/mobile-next/mobile-mcp">Mobile MCP</a></td>
+              <td>AI 探索与设备能力入口</td>
+              <td>可访问性树优先，截图坐标兜底；支持真实 iOS 设备</td>
+              <td>它自己明确建议：探索完成后转到 Mobilewright 做确定性测试</td>
+            </tr>
+            <tr>
+              <td><a href="https://github.com/mobile-next/mobilewright">Mobilewright</a></td>
+              <td>确定性 locator runner</td>
+              <td>lazy locator、每步重新解析、自动等待、稳定 bounds、严格断言、失败留证</td>
+              <td>建立在 mobilecli 生态；直接接入会绕开现有 daemon、浏览器和 WDA 生命周期</td>
+            </tr>
+            <tr>
+              <td><a href="https://docs.maestro.dev/maestro-flows/flow-control-and-logic/flow-control-and-logic-overview">Maestro Flows</a></td>
+              <td>易写、易读、可组合的 flow DSL</td>
+              <td>子 flow、变量、条件、有限循环、自动等待、关系 selector、Studio 点选插入</td>
+              <td>本地 iOS 只支持 Simulator；官方文档仍明确不支持物理 iOS 设备执行</td>
+            </tr>
+            <tr>
+              <td><a href="https://appium.github.io/appium-inspector/latest/session-inspector/recorder/">Appium Inspector / MCP</a></td>
+              <td>检查、录制、代码生成和证据</td>
+              <td>录制交互生成可执行代码；headless/NO_UI 模式去掉重复 UI 负担；动作证据可选</td>
+              <td>完整 Appium 栈复杂，且“录制出来的代码”仍需要 locator 质量审查</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <aside>
+          <strong>行业共识</strong>
+          元素树是默认观察面，截图是像素信息、失败证据或无可访问性控件时的兜底。
+          录制器应生成可编辑的确定性步骤，而不是继续让 LLM 执行整段自然语言。
+        </aside>
+      </section>
+
+      <section id="gaps">
+        <h2>当前项目离“可靠脚本化”还差什么</h2>
+        <table>
+          <thead>
+            <tr><th>当前事实</th><th>影响</th><th>需要的修正</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>ElementRow</code> 已补充 identifier、enabled、visible、accessible、focused、placeholder</td>
+              <td>只读观察面已有 durable locator 的原料，但当前动作接口仍不能组合这些条件</td>
+              <td>下一步设计严格 locator 查询；继续保留 snapshot 作为临时元素的安全边界</td>
+            </tr>
+            <tr>
+              <td><code>phone_tap_label</code> 已改为精确唯一匹配，并通过 snapshot-bound index 执行动作</td>
+              <td>重名标签现在会零动作失败，但仍无法表达父容器、角色、状态或相对锚点</td>
+              <td>增加完整 strict locator 查询；支持 identifier、role、state 和 ancestor 组合</td>
+            </tr>
+            <tr>
+              <td>skill 建议把 curl + sleep + 坐标冻结成脚本</td>
+              <td>动画、A/B 页面、设备尺寸和列表重排都会造成误点</td>
+              <td>保存前置条件、locator、动作、后置断言和 timeout</td>
+            </tr>
+            <tr>
+              <td>已有 snapshot token 只保护当前元素列表</td>
+              <td>它适合交互面板，不适合长期保存</td>
+              <td>明确区分 ephemeral ref 与 durable locator</td>
+            </tr>
+            <tr>
+              <td>失败只有 HTTP 层结果，没有统一 flow artifact</td>
+              <td>AI 修复时缺少最后一步、树 diff、截图和应用状态</td>
+              <td>定义 repair bundle，失败时一次性收集</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="model">
+        <h2>建议产品模型：Explore → Teach → Run → Repair</h2>
+        <div class="stage-grid" aria-label="产品四阶段">
+          <article class="stage">
+            <span class="n">01 / EXPLORE</span>
+            <b>AI + 人探索</b>
+            <small>读取元素树；必要时看截图；记录每一步的意图、候选 locator 和结果。</small>
+          </article>
+          <article class="stage">
+            <span class="n">02 / TEACH</span>
+            <b>编译为草稿</b>
+            <small>参数化输入，删掉推理，补齐前后置断言、风险级别和失败策略。</small>
+          </article>
+          <article class="stage">
+            <span class="n">03 / RUN</span>
+            <b>零模型执行</b>
+            <small>每一步重新解析 locator、自动等待、严格唯一匹配；成功路径不调用 AI。</small>
+          </article>
+          <article class="stage">
+            <span class="n">04 / REPAIR</span>
+            <b>显式修复</b>
+            <small>失败即停；生成最小证据包；AI 只修坏掉的 locator 或分支，产生新版本。</small>
+          </article>
+        </div>
+
+        <h3>关键边界</h3>
+        <table class="priority">
+          <tbody>
+            <tr><td>可以长期保存</td><td>bundle/app 身份、参数、语义 locator、timeout、断言、风险策略、有限分支和有限循环</td></tr>
+            <tr><td>只能当前快照使用</td><td>元素 index、snapshot token、WDA element id、临时坐标框</td></tr>
+            <tr><td>默认不保存</td><td>密码、验证码、Cookie、会话 token、用户私密内容、截图中的敏感像素</td></tr>
+            <tr><td>只能作兜底</td><td>绝对坐标、归一化坐标、纯视觉点击；必须有紧邻的状态断言</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="contract">
+        <h2>Flow 应保存“合同”，不是点击流水账</h2>
+        <p>
+          下例只是研究阶段的可读草案，不是现在就承诺的最终文件格式。重点是字段语义：
+          runner 必须知道开始状态、怎样找到目标、什么算成功，以及不确定时能不能重试。
+        </p>
+        <pre><code>version: 1
+id: rednote.search_and_open
+target:
+  platform: ios
+  app: ${APP_BUNDLE_ID}
+inputs:
+  query: { type: string, required: true }
+
+preconditions:
+  - app_foreground: ${APP_BUNDLE_ID}
+  - any_visible:
+      - { id: search_entry }
+      - { role: button, label: "搜索" }
+
+steps:
+  - id: open_search
+    action: tap
+    locator:
+      strict: true
+      prefer:
+        - { id: search_entry }
+        - { role: button, label: "搜索" }
+        - { role: button, near: { label: "首页" } }
+    wait:
+      until: { role: textfield, focused: true }
+      timeout_ms: 5000
+    retry:
+      only_if_not_sent: 1
+    evidence: on_failure
+
+  - id: enter_query
+    action: fill
+    locator: { role: textfield, focused: true }
+    value: ${query}
+    postcondition: { value: ${query} }
+    idempotency: replace
+
+  - id: submit
+    action: key
+    name: return
+    postcondition:
+      any_visible:
+        - { text: ${query} }
+        - { id: search_results }
+    on_unknown: stop_and_inspect
+
+on_failure:
+  collect: [status, foreground_app, element_tree, screenshot, last_action]
+  policy: stop_and_repair
+</code></pre>
+
+        <h3>Locator 优先级</h3>
+        <ol>
+          <li><strong>accessibility identifier / test id</strong>：最稳定，也不受语言影响。</li>
+          <li><strong>role + label + state</strong>：符合用户可见语义，必须严格唯一。</li>
+          <li><strong>父子或相对锚点</strong>：解决“每张卡片都有一个更多按钮”。</li>
+          <li><strong>文本正则 + 有界 index</strong>：只能在稳定容器内使用。</li>
+          <li><strong>坐标</strong>：最后兜底；绑定屏幕特征与前后断言，不自动跨设备复用。</li>
+        </ol>
+
+        <aside class="warning">
+          <strong>禁止“看到没变化就再点一次”的通用自愈</strong>
+          页面没变化可能是网络慢，也可能是第一次点击已经产生外部副作用但响应未回来。
+          只有服务端明确返回 <code>outcome:not_sent</code>，且动作仍然符合当前前置条件时，
+          runner 才能自动重试。<code>outcome_unknown</code> 必须先重新观察。
+        </aside>
+      </section>
+
+      <section id="rednote">
+        <h2>小红书不是普通表单：脚本必须面对动态内容</h2>
+        <table>
+          <thead>
+            <tr><th>场景</th><th>偷懒做法</th><th>可靠做法</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>信息流卡片复用、顺序变化</td>
+              <td>点击第 3 张卡片</td>
+              <td>用卡片内标题/作者作锚点，再在该容器内找动作</td>
+            </tr>
+            <tr>
+              <td>无限滚动</td>
+              <td>固定 sleep 后连续滑动</td>
+              <td>有限循环：每轮验证目标或列表进度，并设置最大次数</td>
+            </tr>
+            <tr>
+              <td>A/B 文案、国际化</td>
+              <td>只保存一个中文按钮名</td>
+              <td>identifier 优先；否则显式候选集，不做模糊全局点击</td>
+            </tr>
+            <tr>
+              <td>登录、青少年模式、权限弹窗</td>
+              <td>把弹窗当异常坐标点掉</td>
+              <td>作为命名分支；未知弹窗停下，不猜“允许/确认”</td>
+            </tr>
+            <tr>
+              <td>点赞、评论、发布、关注</td>
+              <td>失败就自动重试</td>
+              <td>标记外部副作用；执行前确认身份/内容，未知结果先读状态</td>
+            </tr>
+            <tr>
+              <td>平台策略和账号风控</td>
+              <td>追求无人值守高频执行</td>
+              <td>频率上限、人工接管、审计记录；不设计绕过风控的能力</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="roadmap">
+        <h2>落地顺序：先补观察协议，再做录制器</h2>
+        <table class="priority">
+          <thead>
+            <tr><th>阶段</th><th>产物</th><th>为什么先做</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>P0</td>
+              <td><strong>已完成：</strong>元素协议补充 identifier、enabled、visible、accessible、focused、placeholder</td>
+              <td>没有可表达的稳定 locator，录制器只会制造脆弱脚本</td>
+            </tr>
+            <tr>
+              <td>P0.5</td>
+              <td><strong>已完成：</strong>MCP 暴露 snapshot-bound element tap；精确 label 必须唯一匹配，重名时零动作</td>
+              <td>先消除“默认点击第一个匹配”的误操作风险，再扩展 locator 语法</td>
+            </tr>
+            <tr>
+              <td>P1</td>
+              <td><strong>部分完成：</strong><code>wait_for</code> 与 <code>tap_locator</code> 共用 application + label/id/kind/value/focus/enabled/visible 的 strict match；ancestor/容器关系待补</td>
+              <td>先证明定位质量，不急着执行动作</td>
+            </tr>
+            <tr>
+              <td>P2</td>
+              <td><strong>已完成第一版：</strong><code>POST /agent/actions</code> + MCP <code>phone_run_steps</code>；整批预校验、单 WDA 锁、最多 24 step、wait/assert、失败即停</td>
+              <td>覆盖最常见重复任务，同时保持安全面可审计</td>
+            </tr>
+            <tr>
+              <td>P2.5</td>
+              <td><strong>已完成第一版：</strong><code>iphone-use-mcp flow validate/run &lt;file&gt;</code>；严格 version-1 JSON、离线校验、Direct + drivable preflight、单批提交、零自动重试</td>
+              <td>把已理解的稳定段落变成真正的一条命令；正常路径不再调用模型</td>
+            </tr>
+            <tr>
+              <td>P3</td>
+              <td><strong>已完成第三版：</strong>浏览器「流程」面板记录成功动作 → 优先保存唯一语义标签 → 文字原文丢弃并转换为运行参数 → 对比动作前后元素树并自动建议 <code>wait_for</code> → 标记易失坐标 → 人工成组重排/删除/安全确认 → 保存脚本或运行全部步骤；无法稳定录入的动作形成“不完整草稿”</td>
+              <td>录制必须建立在稳定 locator 和 runner 已验证的前提上</td>
+            </tr>
+            <tr>
+              <td>P4</td>
+              <td>Repair bundle + AI patch；版本化历史与回滚</td>
+              <td>失败修复是稀有路径，不应先于确定性执行内核</td>
+            </tr>
+            <tr>
+              <td>P5</td>
+              <td>MCP：list/run/inspect/repair_flow，而不是暴露几十个原子工具</td>
+              <td>MCP 应编排产品能力，而不是成为 workflow engine 本身</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="acceptance">
+        <h2>真正完成的验收标准</h2>
+        <ul>
+          <li>同一小红书 flow 连续运行 20 次，正常路径不调用模型。</li>
+          <li>不同内容顺序下仍通过语义 locator 找到同一目标，不依赖固定列表 index。</li>
+          <li>人工插入一个未知弹窗时，runner 停止并生成 repair bundle，不误点确认。</li>
+          <li>模拟请求超时且结果未知时，不自动重复评论、点赞、发布或发送。</li>
+          <li>失败报告包含最后成功步骤、当前元素树、前后 diff、截图和设备/应用状态。</li>
+          <li>坐标 fallback 在另一机型或界面特征不匹配时拒绝执行。</li>
+          <li>人工可在浏览器中接管，并能从明确 checkpoint 继续，而不是重跑整条 flow。</li>
+        </ul>
+        <aside>
+          <strong>当前证据结论</strong>
+          仓库已经有真实 iPhone WDA、元素树、snapshot 防旧引用能力，以及严格唯一的
+          label tap / snapshot-bound element tap；现在也有了有界多步 runner，
+          支持 durable <code>tap_locator</code>、整批预校验、semantic wait/assert、
+          首错停止、已完成 step 证据与整批重放安全标记。release-matched MCP binary
+          还可离线校验并直接运行 user-owned version-1 flow 文件，正常路径不需要模型。
+          浏览器 Teach UI 已可录制已确认成功的 Home/搜索、语义标签点按和坐标
+          手势；文字原文不会持久化，而是转换为每次执行时填写的显式 string 参数。
+          CLI 同样支持 <code>flow run --input key=value</code>，并在接触 daemon 前拒绝
+          缺失、未知、重复或未定义参数。在元素树出现可证明的新唯一 accessibility identifier
+          或前台应用时自动追加可审核的 semantic wait；自动检查点不会复制可能包含
+          姓名、余额的任意画面标签和值。找不到可靠检查点时会明确保留短等待，不会伪造
+          locator。逐项审核后可保存合法 v1 JSON 或一次批量执行；后续浏览器会话可以
+          通过「打开脚本」在严格校验后恢复步骤、重新填写运行参数并直接重放。
+          但仍没有 ancestor/container locator、托管 flow store、repair bundle 或上述
+          20 次真机重放证据。因此“多步执行内核已具备”成立，“完整脚本化产品已完成”
+          仍不成立。
+        </aside>
+      </section>
+
+      <section id="sources">
+        <h2>主要资料来源</h2>
+        <ul class="source-list">
+          <li><a href="https://github.com/mobile-next/mobile-mcp">Mobile MCP README</a>：可访问性优先、真实设备支持、探索后转 Mobilewright。</li>
+          <li><a href="https://github.com/mobile-next/mobilewright">Mobilewright README</a>：lazy locator、auto-wait、strict locator、失败留证和 Inspector locator 优先级。</li>
+          <li><a href="https://docs.maestro.dev/reference/selectors/core-selectors">Maestro Core Selectors</a> 与 <a href="https://docs.maestro.dev/reference/selectors/relational-selectors">Relational Selectors</a>。</li>
+          <li><a href="https://docs.maestro.dev/maestro-flows/flow-control-and-logic/flow-control-and-logic-overview">Maestro Flow control</a>：子 flow、条件、循环、参数和生命周期。</li>
+          <li><a href="https://docs.maestro.dev/maestro-studio/run-tests-with-maestro-studio">Maestro Studio Run and Insert</a>：点选元素、执行并插入 YAML。</li>
+          <li><a href="https://docs.maestro.dev/platform-support/ios-uikit">Maestro iOS/UIKit 限制</a>：本地物理 iOS 设备尚不支持。</li>
+          <li><a href="https://appium.io/docs/en/3.1/ecosystem/tools/">Appium ecosystem tools</a> 与 <a href="https://appium.github.io/appium-inspector/latest/session-inspector/recorder/">Inspector Recorder</a>。</li>
+          <li><a href="https://github.com/appium/appium-mcp">Appium MCP</a>：NO_UI 低 Token 模式、缓存和可选动作证据。</li>
+        </ul>
+      </section>
+
+      <footer>
+        研究结论基于 2026-07-28 可见的官方文档和当前工作树。竞品能力、平台支持和
+        项目实现均可能变化；正式选型前应重新验证版本与真实设备行为。
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

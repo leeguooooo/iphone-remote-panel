@@ -1,12 +1,11 @@
 <!doctype html>
 <!--
-  iphone-use — WebRTC web client  (web/index.html)
-  =====================================================
-  Served at /phone (auth-gated).  Daemon is the OFFERER.
-  Signaling:  WebSocket /ws
-  ICE creds:  GET /turn-creds  → {iceServers:[...]}
-  Video:      recvonly track, ondatachannel for "control" (reliable) + "move" (lossy)
-  Touch:      Pointer Events → normalized [0,1] content-rect coords
+  iphone-use — remote-control web client  (web/index.html)
+  ==========================================================
+  Served at /phone (auth-gated).
+  Direct (default): MJPEG/stills + cookie-authenticated POST /control
+  Mirror (compat): WebSocket /ws + WebRTC video/data channels
+  Touch: Pointer Events → normalized [0,1] content-rect coords
 
   Mobile UI: video is the hero (full-bleed). Chrome is a thumb-zone bottom toolbar +
   floating status pill + slide-up text panel + immersive collapse. Instrument-panel
@@ -54,6 +53,16 @@
        syncToolbarReserve() (and set to 0 in immersive mode); the calc above is
        just a first-paint fallback. */
     *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    .visually-hidden {
+      position: absolute !important;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
 
     /* [iOS-notes §Touch] suppress scroll/zoom/callout on html+body */
     html, body {
@@ -162,7 +171,8 @@
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       gap: 14px; background: rgba(6,7,11,.86);
       backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
-      cursor: pointer;
+      cursor: pointer; width: 100%; border: 0; padding: 0;
+      color: inherit; font: inherit;
     }
     #playOverlay .pulse {
       width: 92px; height: 92px; border-radius: 50%;
@@ -179,8 +189,6 @@
     }
     #playOverlay svg { width: 40px; height: 40px; fill: var(--accent); margin-left: 4px; }
     #playOverlay p { color: var(--text); font-size: 15px; margin: 0; letter-spacing: .04em; }
-    #playOverlay.hidden { display: none; }
-
     /* ── Bottom toolbar (thumb zone) ─────────────────────────────── */
     #toolbar {
       position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
@@ -208,6 +216,7 @@
       transition: background .15s, color .15s, border-color .15s;
     }
     .tbtn:active { background: var(--panel-2); }
+    .tbtn:disabled { opacity: .42; cursor: default; }
     .tbtn svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
     .tbtn .lbl { font-size: 10px; line-height: 1; letter-spacing: .02em; white-space: nowrap; }
     .tbtn.active {
@@ -267,15 +276,343 @@
       color: var(--muted); border-radius: 12px; padding: 12px 12px; font-size: 14px; cursor: pointer;
     }
 
-    /* ── L2 stills fallback (Mirroring gone but WDA alive) ───────── */
-    #stillFrame {
-      position: absolute; inset: 0;
-      width: 100%; height: 100%;
+    /* ── Accessible WDA element controls ────────────────────────── */
+    .element-glyph {
+      display: grid; place-items: center;
+      width: 22px; height: 22px; border: 1px solid currentColor;
+      border-radius: 6px; font: 700 9px/1 var(--mono); letter-spacing: -.03em;
+    }
+    #elementPanel {
+      position: fixed; left: 0; right: 0; z-index: 42;
+      bottom: calc(var(--tb-h) + env(safe-area-inset-bottom) + 8px);
+      height: min(62dvh, 560px);
+      display: flex; flex-direction: column;
+      background: rgba(14,16,22,.985);
+      border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+      box-shadow: 0 -18px 48px rgba(0,0,0,.42);
+      transform: translateY(115%); opacity: 0; pointer-events: none;
+      transition: transform .26s cubic-bezier(.2,.7,.2,1), opacity .2s;
+    }
+    #elementPanel.open { transform: translateY(0); opacity: 1; pointer-events: auto; }
+    .element-panel-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 12px calc(env(safe-area-inset-right) + 12px) 10px
+               calc(env(safe-area-inset-left) + 14px);
+      border-bottom: 1px solid var(--line);
+    }
+    .element-panel-heading { flex: 1 1 auto; min-width: 0; }
+    .element-panel-heading h2 {
+      margin: 0; color: var(--text); font-size: 15px; line-height: 1.3;
+    }
+    .element-panel-heading p {
+      margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.35;
+    }
+    .element-panel-action {
+      min-height: 42px; padding: 8px 12px; border-radius: 10px;
+      border: 1px solid var(--line); background: transparent;
+      color: var(--text); font: 600 13px var(--sans); cursor: pointer;
+    }
+    .element-panel-action:disabled { opacity: .45; cursor: default; }
+    .element-panel-action:focus-visible,
+    .element-control:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
+    #elementStatus {
+      min-height: 20px; padding: 8px 14px 0;
+      color: var(--muted); font: 11px/1.45 var(--sans);
+    }
+    #elementList {
+      flex: 1 1 auto; min-height: 0; overflow-y: auto;
+      list-style: none; margin: 0; padding: 8px 12px 18px;
+      -webkit-overflow-scrolling: touch;
+    }
+    #elementList li + li { margin-top: 7px; }
+    .element-control {
+      width: 100%; min-height: 48px; padding: 9px 11px;
+      display: grid; grid-template-columns: minmax(0,1fr) auto;
+      gap: 4px 10px; align-items: center; text-align: left;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: var(--panel); color: var(--text);
+      font-family: var(--sans); cursor: pointer;
+    }
+    .element-control:hover { border-color: rgba(79,140,255,.55); }
+    .element-control:active { background: var(--panel-2); }
+    .element-control:disabled { opacity: .5; cursor: default; }
+    .element-label {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; font-size: 14px; font-weight: 600;
+    }
+    .element-meta {
+      color: var(--muted); font: 10px/1.3 var(--mono); white-space: nowrap;
+    }
+    .element-value {
+      grid-column: 1 / -1; color: var(--muted);
+      font-size: 11px; line-height: 1.35;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+
+    /* ── Multi-step recording and review ───────────────────────── */
+    #recordingPill {
+      position: absolute; z-index: 12;
+      top: calc(env(safe-area-inset-top) + 10px);
+      right: calc(env(safe-area-inset-right) + 12px);
+      min-height: 36px; padding: 7px 12px;
+      border: 1px solid rgba(255,90,102,.58); border-radius: 999px;
+      background: rgba(42,17,22,.9); color: #ffb2b8;
+      font: 700 11px/1 var(--sans); letter-spacing: .02em;
+      cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,.28);
+    }
+    #recordingPill:focus-visible,
+    .flow-action:focus-visible,
+    .flow-step-button:focus-visible,
+    #flowName:focus-visible,
+    .flow-runtime-input:focus-visible,
+    #flowSafety:focus-visible + span {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
+    #flowPanel {
+      position: fixed; inset: 0 0 0 auto; z-index: 44;
+      width: min(100vw, 460px);
+      display: flex; flex-direction: column;
+      background: rgba(14,16,22,.99);
+      border-left: 1px solid var(--line);
+      box-shadow: -18px 0 48px rgba(0,0,0,.44);
+      transform: translateX(105%); opacity: 0; pointer-events: none;
+      transition: transform .26s cubic-bezier(.2,.7,.2,1), opacity .2s;
+    }
+    #flowPanel.open { transform: translateX(0); opacity: 1; pointer-events: auto; }
+    .flow-panel-header {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: calc(env(safe-area-inset-top) + 14px)
+               calc(env(safe-area-inset-right) + 14px) 12px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .flow-panel-heading { flex: 1 1 auto; min-width: 0; }
+    .flow-panel-heading h2 {
+      margin: 0; color: var(--text); font-size: 17px; line-height: 1.3;
+    }
+    .flow-panel-heading p {
+      margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45;
+    }
+    .flow-body {
+      flex: 1 1 auto; min-height: 0; overflow-y: auto;
+      padding: 14px 16px 24px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .flow-name-label {
+      display: block; margin-bottom: 7px;
+      color: var(--muted); font-size: 11px; font-weight: 700;
+    }
+    #flowName {
+      width: 100%; min-height: 44px; padding: 10px 12px;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: var(--bg); color: var(--text);
+      font: 15px var(--sans);
+    }
+    .flow-summary {
+      display: flex; align-items: center; gap: 9px;
+      margin: 12px 0; padding: 10px 12px;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: var(--panel);
+    }
+    .flow-summary strong { font-size: 13px; }
+    .flow-summary span {
+      margin-left: auto; color: var(--muted); font: 11px var(--mono);
+    }
+    .flow-availability {
+      margin: 0 0 12px; padding: 10px 12px;
+      border: 1px solid rgba(250,204,21,.3); border-radius: 11px;
+      background: rgba(250,204,21,.07); color: #e6dca7;
+      font-size: 12px; line-height: 1.5;
+    }
+    .flow-file-status {
+      margin: 0 0 12px; padding: 10px 12px;
+      border: 1px solid rgba(79,140,255,.34); border-radius: 11px;
+      background: rgba(79,140,255,.08); color: #b8d0ff;
+      font-size: 12px; line-height: 1.5;
+    }
+    .flow-file-status[data-tone="error"] {
+      border-color: rgba(255,90,102,.42);
+      background: rgba(255,90,102,.08); color: #ffb2b8;
+    }
+    .flow-file-status[data-tone="success"] {
+      border-color: rgba(65,201,127,.36);
+      background: rgba(65,201,127,.08); color: #a9e8c4;
+    }
+    .flow-note {
+      margin: 0 0 12px; padding: 0;
+      border: 1px solid rgba(250,204,21,.26); border-radius: 11px;
+      background: rgba(250,204,21,.06); color: #d9d1a7;
+      font-size: 11px; line-height: 1.55;
+    }
+    .flow-note summary {
+      min-height: 42px; padding: 11px 12px;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      color: #e6dca7; font-size: 12px; font-weight: 700;
+      cursor: pointer; list-style: none;
+    }
+    .flow-note summary::-webkit-details-marker { display: none; }
+    .flow-note summary::after {
+      content: "展开"; color: var(--muted);
+      font: 10px/1 var(--sans); font-weight: 600;
+    }
+    .flow-note[open] summary::after { content: "收起"; }
+    .flow-note-body {
+      margin: 0; padding: 0 12px 12px;
+    }
+    #flowInputs {
+      margin: 0 0 12px; padding: 11px 12px 12px;
+      border: 1px solid rgba(79,140,255,.35); border-radius: 11px;
+      background: rgba(79,140,255,.07);
+    }
+    .flow-inputs-heading {
+      display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+      margin-bottom: 9px;
+    }
+    .flow-inputs-heading strong { color: var(--text); font-size: 12px; }
+    .flow-inputs-heading span { color: #9eb9ee; font-size: 10px; }
+    .flow-input-row + .flow-input-row { margin-top: 9px; }
+    .flow-input-row label {
+      display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+      margin-bottom: 5px; color: var(--text); font-size: 11px; font-weight: 650;
+    }
+    .flow-input-row label code {
+      color: var(--muted); font: 10px var(--mono); font-weight: 400;
+    }
+    .flow-runtime-input {
+      width: 100%; min-height: 42px; padding: 9px 11px;
+      border: 1px solid var(--line); border-radius: 9px;
+      background: var(--bg); color: var(--text);
+      font: 14px var(--sans);
+    }
+    .flow-runtime-input::placeholder { color: #676d7d; }
+    #flowStepList { list-style: none; margin: 0; padding: 0; }
+    #flowStepList li + li { margin-top: 8px; }
+    .flow-step {
+      display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+      align-items: center; gap: 9px; padding: 10px;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: var(--panel);
+    }
+    .flow-step-number {
+      display: grid; place-items: center;
+      min-width: 28px; height: 28px; padding: 0 6px;
+      border-radius: 8px; background: var(--panel-2);
+      color: var(--muted); font: 700 10px var(--mono);
+    }
+    .flow-step-copy { min-width: 0; }
+    .flow-step-title {
+      display: block; overflow: hidden; text-overflow: ellipsis;
+      color: var(--text); font-size: 13px; font-weight: 650; white-space: nowrap;
+    }
+    .flow-step-meta {
+      display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis;
+      color: var(--muted); font: 10px/1.35 var(--mono); white-space: nowrap;
+    }
+    .flow-step.fragile { border-color: rgba(250,204,21,.32); }
+    .flow-step.checkpoint {
+      border-color: rgba(79,140,255,.42);
+      background: rgba(79,140,255,.07);
+    }
+    .flow-step.checkpoint .flow-step-number {
+      background: rgba(79,140,255,.16); color: #b8d0ff;
+    }
+    .flow-step-button {
+      min-width: 38px; min-height: 38px; padding: 7px 9px;
+      border: 1px solid var(--line); border-radius: 9px;
+      background: transparent; color: var(--muted);
+      font: 600 12px var(--sans); cursor: pointer;
+    }
+    .flow-step-controls { display: flex; gap: 5px; }
+    .flow-step-button:hover { color: var(--text); border-color: #495064; }
+    .flow-step-button:disabled { opacity: .35; cursor: default; }
+    #flowEmpty {
+      margin: 20px 0 0; padding: 20px 16px;
+      border: 1px dashed #34394a; border-radius: 12px;
+      color: var(--muted); font-size: 12px; line-height: 1.55;
+    }
+    .flow-empty-title {
+      display: block; margin-bottom: 12px;
+      color: var(--text); text-align: center; font-size: 14px;
+    }
+    .flow-empty-steps {
+      margin: 0; padding: 0; list-style: none; counter-reset: flow-empty;
+    }
+    .flow-empty-steps li {
+      display: grid; grid-template-columns: 24px minmax(0,1fr);
+      align-items: center; gap: 9px;
+    }
+    .flow-empty-steps li + li { margin-top: 9px; }
+    .flow-empty-steps li::before {
+      counter-increment: flow-empty; content: counter(flow-empty);
+      display: grid; place-items: center;
+      width: 24px; height: 24px; border-radius: 7px;
+      background: rgba(79,140,255,.13); color: #b8d0ff;
+      font: 700 10px/1 var(--mono);
+    }
+    .flow-empty-result {
+      display: block; margin-top: 12px;
+      color: #9eb9ee; text-align: center;
+    }
+    .flow-safety {
+      display: flex; align-items: flex-start; gap: 9px;
+      margin-top: 14px; padding: 11px 12px;
+      border: 1px solid var(--line); border-radius: 11px;
+      color: var(--muted); font-size: 11px; line-height: 1.5;
+      cursor: pointer;
+    }
+    .flow-safety input { margin: 2px 0 0; width: 18px; height: 18px; accent-color: var(--accent); }
+    .flow-footer {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+      padding: 12px calc(env(safe-area-inset-right) + 14px)
+               calc(env(safe-area-inset-bottom) + 12px) 14px;
+      border-top: 1px solid var(--line); background: var(--panel);
+    }
+    .flow-footer .flow-safety {
+      grid-column: 1 / -1; margin: 0 0 2px;
+      background: rgba(14,16,22,.72);
+    }
+    .flow-action {
+      min-height: 44px; padding: 9px 12px;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: transparent; color: var(--text);
+      font: 700 13px var(--sans); cursor: pointer;
+    }
+    .flow-action.primary {
+      background: var(--accent); border-color: var(--accent); color: white;
+    }
+    .flow-action.recording {
+      background: var(--danger-bg); border-color: var(--danger-border); color: #ffb2b8;
+    }
+    .flow-action:disabled { opacity: .42; cursor: default; }
+    .flow-action.wide { grid-column: 1 / -1; }
+    @media (max-width: 560px) {
+      #flowPanel {
+        inset: auto 0 0;
+        width: 100%;
+        height: min(82dvh, 720px);
+        border-left: 0; border-top: 1px solid var(--line);
+        transform: translateY(105%);
+      }
+      #flowPanel.open { transform: translateY(0); }
+      body.flow-panel-open #toast {
+        bottom: calc(var(--flow-footer-h, 69px) + 14px);
+        max-width: calc(100vw - 28px);
+      }
+    }
+
+    /* ── Direct device image (MJPEG with periodic still fallback) ── */
+    #mjpegFrame, #stillFrame {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: calc(100% - var(--tb-reserve));
       object-fit: contain;
       display: none;
       pointer-events: none;   /* taps still land on #videoArea */
+      transition: height .28s cubic-bezier(.2,.7,.2,1);
     }
-    #stillFrame.active { display: block; }
+    #mjpegFrame { z-index: 2; }
+    #stillFrame { z-index: 1; }
+    #mjpegFrame.active, #stillFrame.active { display: block; }
 
     /* ── Update banner (new release available) ───────────────────── */
     #updateBanner {
@@ -287,8 +624,15 @@
     }
     #updateBanner.visible { display: flex; }
     #updateBanner code { font-size: 11px; background: rgba(99,102,241,.18); padding: .1em .4em; border-radius: 4px; }
-    #updateBanner .x { cursor: pointer; opacity: .6; padding: 0 .2rem; }
+    #updateBanner .x {
+      cursor: pointer; opacity: .6; padding: .15rem .25rem;
+      border: 0; border-radius: 4px; background: transparent;
+      color: inherit; font: inherit; line-height: 1;
+    }
     #updateBanner .x:hover { opacity: 1; }
+    #updateBanner .x:focus-visible {
+      opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px;
+    }
 
     /* ── Offline / stall overlay ────────────────────────────────── */
     #offlineOverlay {
@@ -306,6 +650,15 @@
       opacity: 0;
     }
     #offlineOverlay.visible { opacity: 1; }
+    #offlineCard {
+      width: min(calc(100% - 32px), 440px);
+      padding: 24px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      border: 1px solid rgba(255,255,255,.10); border-radius: 18px;
+      background: rgba(17,19,26,.93);
+      box-shadow: 0 24px 72px rgba(0,0,0,.34);
+      pointer-events: none;
+    }
     #reconnectBtn {
       margin-top: 14px; padding: .5rem 1.3rem; border-radius: 99px; cursor: pointer;
       border: 1px solid rgba(99,102,241,.55); background: rgba(99,102,241,.18);
@@ -313,7 +666,40 @@
     }
     #reconnectBtn:hover { background: rgba(99,102,241,.32); }
     #reconnectBtn:disabled { opacity: .5; cursor: default; }
-    #offlineOverlay .ol-icon  { font-size: 36px; line-height: 1; }
+    #setupHelp {
+      margin-top: 8px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      max-width: min(88vw, 420px);
+      pointer-events: auto;
+    }
+    #setupHelp .setup-label {
+      color: var(--muted); font-size: 11px; line-height: 1.4; text-align: center;
+    }
+    #setupCommand {
+      max-width: 100%; padding: 8px 10px; border-radius: 9px;
+      background: rgba(255,255,255,.05); border: 1px solid var(--line);
+      color: #dbe6ff; font-family: var(--mono); font-size: 11px;
+      overflow-wrap: anywhere; user-select: text; -webkit-user-select: text;
+    }
+    #copySetupBtn {
+      min-height: 42px; padding: 8px 16px; border-radius: 999px;
+      border: 1px solid rgba(79,140,255,.6); background: var(--accent-dim);
+      color: #dbe6ff; font: 600 13px var(--sans); cursor: pointer;
+    }
+    #copySetupBtn:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 3px;
+    }
+    #setupGuideLink {
+      min-height: 44px; margin-top: 10px; padding: 10px 18px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid var(--accent); border-radius: 999px;
+      background: var(--accent); color: #fff; text-decoration: none;
+      font: 650 13px var(--sans); pointer-events: auto;
+    }
+    #setupGuideLink:hover { filter: brightness(1.08); }
+    #setupGuideLink:focus-visible {
+      outline: 3px solid rgba(79,140,255,.42); outline-offset: 3px;
+    }
     #offlineOverlay .ol-title {
       font-family: var(--sans); font-size: 16px; font-weight: 600;
       color: var(--text); letter-spacing: .02em;
@@ -357,6 +743,14 @@
       max-width: 86vw; pointer-events: none; text-align: center;
     }
     #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: .01ms !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -365,97 +759,203 @@
   <div id="videoArea">
     <video id="screen" autoplay playsinline webkit-playsinline muted
            disablePictureInPicture disableRemotePlayback></video>
-    <!-- L2 stills fallback: shown when the Mirroring window is gone but the
-         daemon can still capture via WDA (GET /agent/screenshot, cookie-authed) -->
-    <img id="stillFrame" alt="">
-    <canvas id="gridCanvas"></canvas>
+    <!-- Direct image: keep the last screenshot visible while MJPEG reconnects. -->
+    <img id="stillFrame" alt="iPhone 设备静态画面">
+    <img id="mjpegFrame" alt="iPhone 设备实时画面">
+    <canvas id="gridCanvas" aria-hidden="true"></canvas>
     <div id="tapDot"></div>
 
     <!-- update-available banner (populated from /agent/status) -->
     <div id="updateBanner" role="status">
       <span id="updateText"></span>
-      <span class="x" id="updateDismiss" title="本次会话不再提示">✕</span>
+      <button class="x" id="updateDismiss" type="button"
+              title="本次会话不再提示" aria-label="关闭更新提示">✕</button>
     </div>
 
     <!-- offline / stall overlay (pointer-events:none so taps still reach videoArea) -->
-    <div id="offlineOverlay" aria-live="polite" aria-atomic="true">
-      <div class="ol-pulse"></div>
-      <div class="ol-icon">📵</div>
-      <div class="ol-title" id="olTitle">画面已停止</div>
-      <div class="ol-sub"  id="olSub">手机可能已锁屏、断开或镜像已暂停</div>
-      <button id="reconnectBtn" type="button">重新连接</button>
+    <div id="offlineOverlay" aria-live="polite" aria-atomic="true" hidden inert>
+      <div id="offlineCard">
+        <div class="ol-pulse"></div>
+        <div class="ol-title" id="olTitle" tabindex="-1">画面已停止</div>
+        <div class="ol-sub"  id="olSub">正在检查设备连接状态</div>
+        <div id="setupHelp" hidden inert>
+          <span class="setup-label" id="setupLabel">在这台 Mac 的终端运行</span>
+          <code id="setupCommand"></code>
+          <button id="copySetupBtn" type="button">复制命令</button>
+        </div>
+        <a id="setupGuideLink" href="/setup" hidden>打开连接向导</a>
+        <button id="reconnectBtn" type="button">重新连接</button>
+      </div>
     </div>
 
     <!-- floating status pill -->
-    <div id="statusPill">
+    <div id="statusPill" role="status" aria-live="polite">
       <span class="conn-dot">&#9679;</span>
       <span id="statusLine">connecting…</span>
     </div>
+    <button id="recordingPill" type="button" hidden
+            aria-label="打开自动化流程并审核正在录制的步骤">录制中 · 0 步</button>
 
     <!-- [iOS-notes §Video] "Tap to start" play() gesture fallback -->
-    <div id="playOverlay">
+    <button id="playOverlay" type="button" aria-label="开始播放 iPhone 画面" hidden>
       <span class="pulse">
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M8 5v14l11-7L8 5z"/></svg>
       </span>
       <p>轻触以开始</p>
-    </div>
+    </button>
   </div>
 </div><!-- #app -->
 
-<!-- ── Bottom toolbar (thumb zone, v1 parity + WebRTC affordances) ── -->
+<!-- ── Bottom toolbar (thumb zone; backend-specific controls hide in Direct) ── -->
 <nav id="toolbar" aria-label="控制栏">
-  <button id="btnHome" class="tbtn" title="Home">
+  <button id="btnHome" class="tbtn" title="Home" type="button">
     <svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
     <span class="lbl">Home</span>
   </button>
-  <button id="btnSearch" class="tbtn" title="Spotlight 搜索">
+  <button id="btnSearch" class="tbtn" title="Spotlight 搜索" type="button">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
     <span class="lbl">搜索</span>
   </button>
-  <button id="btnSwitcher" class="tbtn" title="App 切换">
+  <button id="btnSwitcher" class="tbtn" title="App 切换" type="button" hidden>
     <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/></svg>
     <span class="lbl">切换器</span>
   </button>
-  <button id="btnGrid" class="tbtn" title="数字网格覆盖">
+  <button id="btnGrid" class="tbtn" title="数字网格覆盖" type="button" aria-pressed="false">
     <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1.5"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>
     <span class="lbl">网格</span>
   </button>
-  <button id="btnFreeze" class="tbtn" title="暂停/继续渲染">
+  <button id="btnElements" class="tbtn" title="可访问控件列表" type="button"
+          aria-controls="elementPanel" aria-expanded="false">
+    <span class="element-glyph" aria-hidden="true">UI</span>
+    <span class="lbl">控件</span>
+  </button>
+  <button id="btnFreeze" class="tbtn" title="暂停/继续渲染" type="button"
+          aria-pressed="false" hidden>
     <svg class="ico-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></svg>
     <svg class="ico-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5z" fill="currentColor" stroke="none"/></svg>
     <span class="lbl">冻结</span>
   </button>
-  <button id="btnKeyboard" class="tbtn" title="文字输入">
+  <button id="btnKeyboard" class="tbtn" title="文字输入" type="button"
+          aria-controls="textPanel" aria-expanded="false">
     <svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h0M10 10h0M14 10h0M18 10h0M6 14h0M18 14h0M9 14h6"/></svg>
     <span class="lbl">键盘</span>
   </button>
-  <button id="btnLogout" class="tbtn danger" title="退出">
+  <button id="btnFlow" class="tbtn" title="录制并运行自动化流程" type="button"
+          aria-label="录制并运行自动化流程"
+          aria-controls="flowPanel" aria-expanded="false">
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <circle cx="6" cy="6" r="2.5"/>
+      <circle cx="18" cy="12" r="2.5"/>
+      <circle cx="6" cy="18" r="2.5"/>
+      <path d="M8.5 6h2a3 3 0 013 3v0a3 3 0 003 3h-1"/>
+      <path d="M8.5 18h2a3 3 0 003-3v0a3 3 0 013-3h2"/>
+    </svg>
+    <span class="lbl">流程</span>
+  </button>
+  <button id="btnLogout" class="tbtn danger" title="退出" type="button">
     <svg viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3"/><path d="M10 17l-5-5 5-5"/><path d="M15 12H5"/></svg>
     <span class="lbl">退出</span>
   </button>
   <span class="tbtn spacer" aria-hidden="true"></span>
-  <button id="btnImmersive" class="tbtn" title="全屏（收起控制栏）">
+  <button id="btnImmersive" class="tbtn" title="全屏（收起控制栏）" type="button">
     <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 00-2 2v3M16 3h3a2 2 0 012 2v3M21 16v3a2 2 0 01-2 2h-3M3 16v3a2 2 0 002 2h3"/></svg>
     <span class="lbl">全屏</span>
   </button>
 </nav>
 
 <!-- restore handle when immersive -->
-<button id="grabber" aria-label="显示控制栏"></button>
+<button id="grabber" type="button" aria-label="显示控制栏"></button>
 
 <!-- slide-up text panel (opened by 键盘) -->
-<div id="textPanel">
+<div id="textPanel" role="group" aria-labelledby="textPanelLabel" hidden inert>
+  <label id="textPanelLabel" class="visually-hidden" for="textInput">输入到 iPhone</label>
   <input id="textInput" type="text" placeholder="输入到手机…" maxlength="500"
          autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send" />
-  <button id="btnSend" class="primary">发送</button>
-  <button id="btnTextClose">关闭</button>
+  <button id="btnSend" class="primary" type="button">发送</button>
+  <button id="btnTextClose" type="button">关闭</button>
 </div>
 
-<div id="toast"></div>
+<section id="elementPanel" role="dialog" aria-modal="false"
+         aria-labelledby="elementPanelTitle" hidden inert>
+  <header class="element-panel-header">
+    <div class="element-panel-heading">
+      <h2 id="elementPanelTitle">iPhone 可访问控件</h2>
+      <p>来自当前设备画面的 WDA 元素树</p>
+    </div>
+    <button id="elementRefresh" class="element-panel-action" type="button">刷新</button>
+    <button id="elementClose" class="element-panel-action" type="button">关闭</button>
+  </header>
+  <div id="elementStatus" role="status" aria-live="polite" aria-atomic="true"></div>
+  <ul id="elementList" aria-label="当前 iPhone 控件"></ul>
+</section>
+
+<section id="flowPanel" role="dialog" aria-modal="false"
+         aria-labelledby="flowPanelTitle" hidden inert>
+  <header class="flow-panel-header">
+    <div class="flow-panel-heading">
+      <h2 id="flowPanelTitle">自动化流程</h2>
+      <p>把一串手机操作录成流程，以后一次运行</p>
+    </div>
+    <button id="flowClose" class="element-panel-action" type="button">关闭</button>
+  </header>
+  <div class="flow-body">
+    <label class="flow-name-label" for="flowName">流程名称</label>
+    <input id="flowName" type="text" maxlength="100"
+           placeholder="例如：查询指定联系人流水"
+           autocomplete="off" spellcheck="false">
+    <div class="flow-summary" role="status" aria-live="polite" aria-atomic="true">
+      <strong id="flowState">尚未录制</strong>
+      <span id="flowCount">0 / 24 步</span>
+    </div>
+    <p id="flowAvailability" class="flow-availability" role="status" hidden></p>
+    <p id="flowFileStatus" class="flow-file-status" role="status" hidden></p>
+    <details class="flow-note">
+      <summary>隐私与稳定性保护</summary>
+      <p class="flow-note-body">
+        文字只会变成运行参数，不会把刚才输入的姓名、搜索词或账号写进文件；参数值只保留在当前页面。
+        通过「控件」点按会优先保存稳定标签；
+        页面变化时只用 identifier 或应用名追加检查点，不会自动保存画面文字和值；
+        直接点画面会标记为易失坐标，保存前请逐项检查。
+      </p>
+    </details>
+    <section id="flowInputs" hidden aria-labelledby="flowInputsTitle">
+      <div class="flow-inputs-heading">
+        <strong id="flowInputsTitle">运行参数</strong>
+        <span>只用于本次执行，不写入 JSON</span>
+      </div>
+      <div id="flowInputList"></div>
+    </section>
+    <ol id="flowStepList" aria-label="已录制步骤"></ol>
+    <div id="flowEmpty">
+      <strong class="flow-empty-title">录一次，以后整段执行</strong>
+      <ol class="flow-empty-steps">
+        <li>点击「开始录制」</li>
+        <li>关闭面板，照常操作手机</li>
+        <li>回来审核并运行，或保存成脚本</li>
+      </ol>
+      <span class="flow-empty-result">下次点「打开脚本」，正常重放不需要 AI 逐步操作。</span>
+    </div>
+  </div>
+  <footer class="flow-footer">
+    <label id="flowSafetyGate" class="flow-safety" hidden>
+      <input id="flowSafety" type="checkbox">
+      <span>我已逐项检查：这个流程不包含付款、转账、发送、发布、删除或其他不可逆操作。</span>
+    </label>
+    <button id="flowRecord" class="flow-action primary" type="button">开始录制</button>
+    <button id="flowOpen" class="flow-action" type="button">打开脚本</button>
+    <input id="flowOpenFile" class="visually-hidden" type="file"
+           accept=".json,application/json">
+    <button id="flowDownload" class="flow-action" type="button" hidden disabled>保存脚本</button>
+    <button id="flowRun" class="flow-action primary" type="button" hidden disabled>运行全部步骤</button>
+    <button id="flowClear" class="flow-action wide" type="button" hidden disabled>清空步骤</button>
+  </footer>
+</section>
+
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 /* ================================================================
-   iphone-use — WebRTC client
+   iphone-use — Direct/WDA client with legacy Mirror compatibility
    Contract legend:
      [SIG] signaling (/ws)  [ICE] /turn-creds + ICE  [CH] data channels
      [TOUCH] Pointer Events  [iOS] Safari notes  [v1] parity affordance
@@ -469,13 +969,20 @@
 const FORCE_RELAY = new URLSearchParams(location.search).has('relay');
 
 /* ── Constants ────────────────────────────────────────────────── */
-const TAP_MS       = 250;
 const TAP_SLOP     = 10;
 const LONGPRESS_MS = 500;
 const MOVE_BACKPRESSURE_BYTES = 256 * 1024;
 const STATS_INTERVAL_MS = 2000;
 const ICE_RESTART_DEBOUNCE_MS = 2000;
 const RECONNECT_BASE_MS = 1500;
+// /control owns a 2.5s maximum at-most-once deadline. Leave enough transport
+// headroom for its authoritative outcome while still bounding a hung browser
+// request.
+const CONTROL_TIMEOUT_MS = 5000;
+const DIRECT_CONTROL_MAX_QUEUE = 4;
+const DIRECT_CONTROL_MAX_AGE_MS = 2000;
+const RECONNECT_REQUEST_TIMEOUT_MS = 15000;
+const RECONNECT_COOLDOWN_MS = 3000;
 
 /* ── DOM refs ─────────────────────────────────────────────────── */
 const video          = document.getElementById('screen');
@@ -487,24 +994,126 @@ const statusLine     = document.getElementById('statusLine');
 const toastEl        = document.getElementById('toast');
 const textInput      = document.getElementById('textInput');
 const offlineOverlay = document.getElementById('offlineOverlay');
+const btnFlow        = document.getElementById('btnFlow');
+const flowPanel      = document.getElementById('flowPanel');
+const flowFooter     = flowPanel.querySelector('.flow-footer');
+const flowClose      = document.getElementById('flowClose');
+const flowName       = document.getElementById('flowName');
+const flowState      = document.getElementById('flowState');
+const flowCount      = document.getElementById('flowCount');
+const flowAvailability = document.getElementById('flowAvailability');
+const flowFileStatus = document.getElementById('flowFileStatus');
+const flowInputs     = document.getElementById('flowInputs');
+const flowInputList  = document.getElementById('flowInputList');
+const flowStepList   = document.getElementById('flowStepList');
+const flowEmpty      = document.getElementById('flowEmpty');
+const flowSafetyGate = document.getElementById('flowSafetyGate');
+const flowSafety     = document.getElementById('flowSafety');
+const flowRecord     = document.getElementById('flowRecord');
+const flowOpen       = document.getElementById('flowOpen');
+const flowOpenFile   = document.getElementById('flowOpenFile');
+const flowDownload   = document.getElementById('flowDownload');
+const flowRun        = document.getElementById('flowRun');
+const flowClear      = document.getElementById('flowClear');
+const recordingPill = document.getElementById('recordingPill');
 const reconnectBtn = document.getElementById('reconnectBtn');
+const setupHelp = document.getElementById('setupHelp');
+const setupLabel = document.getElementById('setupLabel');
+const setupCommand = document.getElementById('setupCommand');
+const copySetupBtn = document.getElementById('copySetupBtn');
+const setupGuideLink = document.getElementById('setupGuideLink');
+let reconnectActionBusy = false;
+function syncReconnectControl(kind = overlayState) {
+  const recoveryIsExternal = backendType === 'direct' &&
+    (backendStatus?.recovery_owner === 'unconfigured' ||
+     backendStatus?.recovery_owner === 'external');
+  reconnectBtn.hidden =
+    recoveryIsExternal ||
+    kind === 'releasing' ||
+    kind === 'connecting' ||
+    kind === 'reconnecting' ||
+    kind === 'locked' ||
+    kind === 'outcome-unknown' ||
+    kind === 'unconfigured' ||
+    kind === 'external' ||
+    kind === 'setup-blocked';
+  reconnectBtn.disabled = reconnectActionBusy;
+  if (!reconnectActionBusy) {
+    setTextIfChanged(reconnectBtn, kind === 'status-error'
+      ? '重新检查'
+      : (backendType === 'mirror' ? '重连镜像' : '重新连接'));
+  }
+}
 if (reconnectBtn) reconnectBtn.onclick = async () => {
+  if (reconnectActionBusy) return;
+  if (backendType === 'direct' && overlayState === 'status-error') {
+    reconnectActionBusy = true;
+    reconnectBtn.disabled = true;
+    reconnectBtn.textContent = '正在检查…';
+    cancelStatusPoll();
+    try {
+      await pollAgentMode();
+    } finally {
+      reconnectActionBusy = false;
+      syncReconnectControl();
+    }
+    return;
+  }
+  if (
+    backendType === 'direct' &&
+    (backendStatus?.recovery_owner === 'unconfigured' ||
+     backendStatus?.recovery_owner === 'external')
+  ) {
+    toast(backendStatus.recovery_owner === 'unconfigured'
+      ? '请先完成 iPhone 设备设置'
+      : '请在 WDA 所在主机恢复服务');
+    return;
+  }
+  reconnectActionBusy = true;
   reconnectBtn.disabled = true;
-  const orig = reconnectBtn.textContent;
-  reconnectBtn.textContent = '连接中…';
+  reconnectBtn.textContent = '正在启动…';
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    RECONNECT_REQUEST_TIMEOUT_MS,
+  );
   try {
-    // When the phone was idle-released (handed back to its owner), reconnect
-    // means "take the phone back" → restart WDA (mode=agent). Otherwise it's a
-    // stalled mirror: mode=mirror runs the full server-side recovery (lock
-    // phone, stop any WDA, bring Mirroring frontmost, tap Try Again).
-    const mode = (overlayState === 'released') ? 'agent' : 'mirror';
-    await fetch('/agent/mode', {
+    // Direct is fail-closed: every recovery starts the on-device WDA path.
+    // Only the explicitly selected legacy backend may recover Mirroring.
+    const mode = backendType === 'mirror' ? 'mirror' : 'agent';
+    if (mode === 'agent') invalidateDirectControlQueue();
+    const r = await fetch('/agent/mode', {
       method: 'POST', cache: 'no-store',
-      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'X-Phone-Control': '1' },
       body: JSON.stringify({ mode }),
     });
-  } catch (_) { /* best-effort */ }
-  setTimeout(() => { reconnectBtn.disabled = false; reconnectBtn.textContent = orig; }, 12000);
+    if (r.status === 401) {
+      location.replace('/login');
+      return;
+    }
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok || result.ok !== true) {
+      const error = new Error('backend recovery rejected');
+      error.result = result;
+      throw error;
+    }
+    toast(mode === 'agent' ? '设备正在启动' : '正在恢复镜像');
+    await pollAgentMode();
+  } catch (error) {
+    toast(recoveryFailureText(error?.result));
+    const refreshed = await pollAgentMode();
+    if (!refreshed) {
+      showOverlay(backendType === 'mirror' ? 'disconnected' : 'offline');
+    }
+  } finally {
+    clearTimeout(timeout);
+    setTimeout(() => {
+      reconnectActionBusy = false;
+      syncReconnectControl();
+    }, RECONNECT_COOLDOWN_MS);
+  }
 };
 const olTitle        = document.getElementById('olTitle');
 const olSub          = document.getElementById('olSub');
@@ -519,64 +1128,290 @@ let frozen = false, gridOn = false, wakeLock = null;
 let iceRestartTimer = null, reconnectTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS, statsInterval = null;
 let lastRtt = '--', connState = 'new';
-let agentMode = false; // true when the daemon reports mode=agent (WDA on-device drive + MJPEG video)
+let backendType = 'direct'; // Fail closed to the on-device path until status loads.
+let backendStatus = null;
+let mirrorTransportEnabled = false;
+let textSendBusy = false;
+let flowRecording = false;
+let flowRunning = false;
+let flowImportBusy = false;
+let recordedFlowSteps = [];
+let recordedFlowInputs = [];
+let flowInputValues = new Map();
+let flowInputSequence = 0;
+let excludedUnrecordedActions = 0;
+let flowStarting = false;
+let flowFinalizing = false;
+let flowCheckpointPending = 0;
+let flowCheckpointTail = Promise.resolve();
+let flowCheckpointSession = 0;
+let flowActionSerial = 0;
+let flowLastObservation = null;
+let flowEntrySequence = 0;
 
 /* ── Overlay state: 'hidden' | 'stalled' | 'disconnected' ────── */
 let overlayState = 'hidden';
 let queuedAhead = 0; /* issue #8: viewers ahead of us in the single-viewer queue */
 
+function setTextIfChanged(node, text) {
+  if (node && node.textContent !== text) node.textContent = text;
+}
+
 /* ── Toast ────────────────────────────────────────────────────── */
 let toastTimer = null;
 function toast(msg) {
-  toastEl.textContent = msg; toastEl.classList.add('on');
+  setTextIfChanged(toastEl, msg);
+  if (flowPanel.classList.contains('open')) {
+    const footerHeight = Math.ceil(flowFooter.getBoundingClientRect().height);
+    if (footerHeight > 0) {
+      document.documentElement.style.setProperty('--flow-footer-h', `${footerHeight}px`);
+    }
+  }
+  toastEl.classList.add('on');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove('on'), 1600);
+  toastTimer = setTimeout(() => toastEl.classList.remove('on'), 3200);
+}
+
+copySetupBtn.addEventListener('click', async () => {
+  const command = setupCommand.textContent;
+  if (!command) return;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(command);
+    copied = true;
+  } catch (_) {
+    const range = document.createRange();
+    range.selectNodeContents(setupCommand);
+    const selection = window.getSelection();
+    if (selection) {
+      selection.removeAllRanges();
+      selection.addRange(range);
+      try { copied = document.execCommand('copy'); } catch (_) {}
+      selection.removeAllRanges();
+    }
+  }
+  toast(copied
+    ? '命令已复制，请在这台 Mac 的终端运行'
+    : '请长按命令复制，然后在这台 Mac 的终端运行');
+});
+
+function recoveryFailureText(result = {}) {
+  switch (result.error) {
+    case 'target_not_configured':
+      return '尚未选择 iPhone，请先运行设备设置';
+    case 'wda_is_externally_managed':
+      return 'WDA 由外部服务管理，请在来源主机恢复';
+    case 'device_release_in_progress':
+      return '设备正在释放，请稍后再试';
+    case 'reconnect_in_progress':
+      return '设备已经在重新连接';
+    case 'backend_is_direct':
+    case 'backend_is_mirror':
+      return '后端配置已变更，请重启服务';
+    default:
+      return result.hint || '启动失败，请检查设备连接';
+  }
+}
+
+function setupBlockerCopy(blockedOn) {
+  switch (blockedOn) {
+    case 'warp':
+      return [
+        'WARP 设备配置需要调整',
+        '若只需特定站点走 WARP，请管理员使用 Traffic only + Split Tunnels Include 目标 IP；全隧道模式则需排除 fe80::/10 与 fd00::/8',
+      ];
+    case 'proxy':
+      return ['系统代理不可用', '请启动代理应用，或关闭已失效的代理项；修复后会自动重试'];
+    case 'usb':
+      return ['请连接 iPhone', '请用 USB 连接并解锁这台 iPhone，保持亮屏；连接后会自动继续'];
+    case 'trust':
+      return ['等待设备信任', '请在 iPhone 上信任开发者证书；完成后会自动继续'];
+    case 'ddi':
+      return ['开发者服务未就绪', '请保持 USB、解锁和亮屏；设备准备完成后会自动继续'];
+    case 'wda':
+      return ['设备服务启动失败', '请保持 USB、解锁和亮屏，然后重新运行下方设置命令'];
+    default:
+      return ['设备设置尚未完成', '请处理第一个阻塞项，然后重新运行下方设置命令'];
+  }
+}
+
+function managedSetupWillRetry(status) {
+  const managed = status?.recovery_owner === 'daemon' ||
+    status?.managed_wda === true;
+  return managed && new Set(['warp', 'proxy', 'usb', 'trust', 'ddi'])
+    .has(status?.setup_blocked_on);
+}
+
+function directHintText(status, fallback) {
+  const hint = String(status?.hint || '');
+  if (!hint) return fallback;
+  if (hint.includes('canonical iPhone target')) {
+    return '请连接、解锁并信任 iPhone，然后在这台 Mac 上完成首次设置';
+  }
+  if (hint.includes('externally managed')) {
+    return '请在 WDA 所在主机恢复服务；本机不会接管或重启它';
+  }
+  if (hint.includes('locked')) {
+    return '请解锁 iPhone 并保持亮屏，连接会自动恢复';
+  }
+  if (hint.includes('start or repair WDA')) {
+    return '请运行下方状态检查，修复设备服务与 USB 中继';
+  }
+  // Server hints are diagnostic English for API callers. The Chinese UI must
+  // not leak an unmapped internal message to the user.
+  return fallback;
+}
+
+function updateSetupHelp(kind) {
+  let command = '';
+  let label = '在这台 Mac 的终端运行';
+  if (backendType === 'direct') {
+    if (kind === 'unconfigured') {
+      command = '~/.iphone-use/setup-wda.sh setup';
+      label = '连接并解锁 iPhone 后，在这台 Mac 的终端运行';
+    } else if (
+      kind === 'setup-blocked' &&
+      !managedSetupWillRetry(backendStatus)
+    ) {
+      command = '~/.iphone-use/setup-wda.sh setup';
+      label = '处理上面的阻塞项后，在这台 Mac 的终端运行';
+    } else if (
+      kind === 'offline' &&
+      backendStatus?.recovery_owner !== 'external'
+    ) {
+      command = '~/.iphone-use/setup-wda.sh status';
+      label = '在这台 Mac 的终端检查设备服务';
+    }
+  }
+  setupHelp.hidden = command.length === 0;
+  setupHelp.inert = command.length === 0;
+  setTextIfChanged(setupLabel, label);
+  setTextIfChanged(setupCommand, command);
+  const guideKinds = new Set([
+    'offline',
+    'unconfigured',
+    'external',
+    'setup-blocked',
+    'locked',
+    'blocked',
+  ]);
+  setupGuideLink.hidden = backendType !== 'direct' || !guideKinds.has(kind);
+}
+
+function directUnavailableKind(status) {
+  if (status?.wda_locked === true) return 'locked';
+  if (status?.setup_blocked_on) return 'setup-blocked';
+  if (
+    status?.recovery_owner === 'unconfigured' ||
+    (status?.recovery_owner == null && status?.target_configured === false)
+  ) return 'unconfigured';
+  if (status?.recovery_owner === 'external' && status?.wda !== true) {
+    return 'external';
+  }
+  if (status?.mode !== 'agent' || status?.wda !== true) return 'offline';
+  return 'blocked';
 }
 
 /* ── Offline overlay management ──────────────────────────────── */
 function showOverlay(kind) {
-  /* kind: 'stalled' | 'disconnected' | 'gone'
+  /* kind: 'offline' | 'locked' | 'frame-stale' | 'stalled' |
+     'disconnected' | 'gone'
      'gone' = daemon-reported: the Mirroring window vanished (phone fully
      disconnected / Mirroring quit). The daemon's keepalive keeps frames
      flowing, so only the phone_status signal can tell us this. */
-  if (overlayState === kind) return;
   overlayState = kind;
+  updateSetupHelp(kind);
   offlineOverlay.classList.remove('disconnected');
+  syncReconnectControl(kind);
   if (kind === 'disconnected') {
-    olTitle.textContent = '连接已断开';
-    olSub.textContent   = '正在尝试重连…';
+    setTextIfChanged(olTitle, '连接已断开');
+    setTextIfChanged(olSub, '正在尝试重连…');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'offline') {
+    setTextIfChanged(olTitle, '设备未连接');
+    setTextIfChanged(olSub, directHintText(
+      backendStatus,
+      '启动设备连接后即可查看并控制 iPhone',
+    ));
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'unconfigured') {
+    setTextIfChanged(olTitle, '尚未选择 iPhone');
+    setTextIfChanged(olSub, directHintText(
+      backendStatus,
+      '请连接、解锁并信任 iPhone，然后在这台 Mac 上完成首次设置',
+    ));
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'external') {
+    setTextIfChanged(olTitle, '外部 WDA 未连接');
+    setTextIfChanged(olSub, directHintText(
+      backendStatus,
+      '请在设备服务所在主机恢复 WDA；本机不会擅自重启外部服务',
+    ));
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'setup-blocked') {
+    const [title, detail] = setupBlockerCopy(backendStatus?.setup_blocked_on);
+    setTextIfChanged(olTitle, title);
+    setTextIfChanged(olSub, detail);
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'status-error') {
+    setTextIfChanged(olTitle, '无法获取设备状态');
+    setTextIfChanged(olSub, '请检查服务是否正在运行，然后重试');
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'gone') {
-    olTitle.textContent = '手机已断开';
-    olSub.textContent   = 'iPhone 镜像窗口已消失 — 检查手机与 Mac 的连接';
+    setTextIfChanged(olTitle, '手机已断开');
+    setTextIfChanged(olSub, 'iPhone 镜像窗口已消失 — 检查手机与 Mac 的连接');
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'queued') {
     /* issue #8: another viewer holds the live session — we wait in line and the
        daemon promotes us (sends an offer) when they disconnect. */
-    olTitle.textContent = '会话占用中';
-    olSub.textContent   = (queuedAhead > 1)
+    setTextIfChanged(olTitle, '会话占用中');
+    setTextIfChanged(olSub, (queuedAhead > 1)
       ? `另一个观看者正在使用 — 已排队(前面还有 ${queuedAhead} 位)，对方断开后自动接入`
-      : '另一个观看者正在使用 — 已排队，对方断开后将自动接入';
+      : '另一个观看者正在使用 — 已排队，对方断开后将自动接入');
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'released') {
-    /* idle auto-release: the daemon stopped WDA after a stretch of no remote
-       activity so the phone is free for hands-on use. Not an error — offer to
-       take it back. The reconnect button posts mode=agent in this state. */
-    olTitle.textContent = '手机已交还给你';
-    olSub.textContent   = '一段时间无远程操作，已自动把手机交还，你可正常使用。需要远程控制时点「重新连接」(约 30-90 秒重启 WDA)';
+    setTextIfChanged(olTitle, '手机已交还给你');
+    setTextIfChanged(olSub, '一段时间无远程操作，设备连接已释放。需要远程控制时重新连接');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'releasing') {
+    setTextIfChanged(olTitle, '正在释放设备');
+    setTextIfChanged(olSub, '正在确认设备连接已停止，请稍候');
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'locked') {
-    /* agent/WDA mode: WDA answers /status but isn't actionable (phone locked or
-       the XCUITest session went zombie), so its MJPEG is dead/stale. Tell the
-       user instead of showing a silent black screen. The daemon's WDA keepalive
-       recovers on its own once the phone is unlocked + awake. */
-    olTitle.textContent = '手机不可用';
-    olSub.textContent   = '手机已锁屏或会话失效 — 请解锁手机并保持唤醒(建议把自动锁定设为「永不」)';
+    setTextIfChanged(olTitle, '手机不可用');
+    setTextIfChanged(olSub, '请解锁手机并保持唤醒，设备连接会自动恢复');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'blocked') {
+    setTextIfChanged(olTitle, '设备控制暂不可用');
+    setTextIfChanged(olSub, directHintText(
+      backendStatus,
+      '设备服务仍在线，但当前不能执行操作。请重新连接；若仍失败，请检查 WDA 状态',
+    ));
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'frame-stale') {
+    setTextIfChanged(olTitle, '画面已停滞');
+    setTextIfChanged(olSub, '当前显示的是最后一帧，已暂停控制；收到新画面后会自动恢复');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'outcome-unknown') {
+    setTextIfChanged(olTitle, '正在确认刚才的操作');
+    setTextIfChanged(olSub, '操作可能已经执行，正在等待新画面；确认前请勿重复操作');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'connecting') {
+    setTextIfChanged(olTitle, '正在连接设备画面');
+    setTextIfChanged(olSub, '控制服务已就绪，正在等待第一帧');
+    offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'reconnecting') {
+    setTextIfChanged(olTitle, '正在重新连接设备');
+    setTextIfChanged(olSub, '正在恢复设备端控制服务，请稍候');
     offlineOverlay.classList.add('disconnected');
   } else {
-    olTitle.textContent = '画面已停止';
-    olSub.textContent   = '手机可能已锁屏、断开或镜像已暂停';
+    setTextIfChanged(olTitle, '画面已停止');
+    setTextIfChanged(olSub, backendType === 'direct'
+      ? '设备画面暂时没有更新'
+      : '手机可能已锁屏、断开或镜像已暂停');
   }
+  offlineOverlay.hidden = false;
+  offlineOverlay.inert = false;
   offlineOverlay.classList.add('visible');
   paintDot();
 }
@@ -589,8 +1424,18 @@ function showOverlay(kind) {
     if (!r.ok) return;
     const s = await r.json();
     if (s.update_available && s.latest && !sessionStorage.getItem('updateDismissed')) {
-      document.getElementById('updateText').innerHTML =
-        `新版本 <b>${s.latest}</b> 可用(当前 v${s.version})— 升级:<code>curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code>`;
+      const updateText = document.getElementById('updateText');
+      const latest = document.createElement('b');
+      latest.textContent = String(s.latest);
+      const command = document.createElement('code');
+      command.textContent =
+        'curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh';
+      updateText.replaceChildren(
+        document.createTextNode('新版本 '),
+        latest,
+        document.createTextNode(` 可用(当前 v${String(s.version || '—')})— 升级:`),
+        command,
+      );
       document.getElementById('updateBanner').classList.add('visible');
       document.getElementById('updateDismiss').onclick = () => {
         sessionStorage.setItem('updateDismissed', '1');
@@ -600,103 +1445,432 @@ function showOverlay(kind) {
   } catch (_) { /* best-effort */ }
 })();
 
-/* ── Agent-mode video source ─────────────────────────────────────
-   When WDA drives the phone (mode=agent), the WebRTC video track is the Mac's
-   iPhone-Mirroring capture — which is a DIFFERENT device than WDA's target (or a
-   stale frame), so it must NOT be shown. Force the live MJPEG of the actual WDA
-   target on top instead. Mirror mode keeps the WebRTC video. Poll cheaply; the
-   startStills/stopStills calls are idempotent. */
+/* ── Backend + device status ─────────────────────────────────────
+   Direct is the primary path: MJPEG for video and cookie-authenticated HTTP for
+   control. It must never create /ws or a PeerConnection. Mirror keeps the
+   original WebRTC/data-channel implementation as an explicit compatibility
+   backend. */
+const STATUS_REQUEST_TIMEOUT_MS = 8000;
+let statusPollBusy = false;
+let statusPollGeneration = 0;
+let statusAbortController = null;
+function cancelStatusPoll() {
+  // Aborting is not enough on its own: a response may already be between
+  // fetch() and json(). The generation also prevents that stale result from
+  // restoring readiness after the page was hidden or shown again.
+  statusPollGeneration += 1;
+  if (statusAbortController) statusAbortController.abort();
+  statusAbortController = null;
+  statusPollBusy = false;
+}
 async function pollAgentMode() {
+  // A degraded WDA can take several seconds to answer its action-level probe.
+  // Never let the 3s timer stack duplicate probes behind the daemon's single
+  // WDA session lock; one authoritative poll at a time is enough.
+  if (statusPollBusy) return backendStatus;
+  statusPollBusy = true;
+  const generation = ++statusPollGeneration;
+  const controller = new AbortController();
+  statusAbortController = controller;
+  const timeoutId = setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
+  const polledStreamId = mjpegStreamId;
+  const statusUrl = polledStreamId
+    ? `/agent/status?stream_id=${encodeURIComponent(polledStreamId)}`
+    : '/agent/status';
   try {
-    const r = await fetch('/agent/status', { cache: 'no-store' });
-    if (!r.ok) return;
-    const s = await r.json();
-    agentMode = (s.mode === 'agent');
-    if (s.released === true) {
-      // Idle auto-release takes priority over mode rendering: WDA is stopped on
-      // purpose so the owner can use the phone. Show the reconnect affordance.
-      stopStills();
-      playOverlay.classList.add('hidden');
-      showOverlay('released');
-      return;
-    } else if (overlayState === 'released') {
-      hideOverlay();   // taken back → drop the released overlay
+    const r = await fetch(statusUrl, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (generation !== statusPollGeneration) return backendStatus;
+    if (r.status === 401) {
+      location.replace('/login');
+      return null;
     }
-    if (agentMode) {
-      startStills();                          // MJPEG (WDA device) overlays the WebRTC track
-      // The MJPEG <img> needs no autoplay gesture, and it's per-viewer (independent
-      // of the WebRTC single-viewer lease). So the "轻触以开始" play gesture and the
-      // "会话占用中"(queued)/mirror-gone overlays would all wrongly block a live picture.
-      playOverlay.classList.add('hidden');
-      if (s.wda_actionable === false) {
-        // WDA up but not actionable (phone locked / zombie session) → MJPEG is
-        // dead/stale. Show an informative overlay instead of a silent black screen.
-        showOverlay('locked');
-      } else if (overlayState === 'locked' || overlayState === 'gone' || overlayState === 'queued') {
-        hideOverlay();                        // recovered → drop the stale overlay
+    if (!r.ok) throw new Error('status rejected');
+    const s = await r.json();
+    if (generation !== statusPollGeneration) return backendStatus;
+    const previousBackend = backendType;
+    backendStatus = s;
+    backendType = s.backend === 'mirror' ? 'mirror' : 'direct';
+
+    if (backendType === 'direct') {
+      updateMjpegActivityFromStatus(s, polledStreamId);
+      const directPageVisible = document.visibilityState === 'visible';
+      setDirectControlReady(
+        directPageVisible &&
+          s.releasing !== true && s.reconnecting !== true && s.released !== true &&
+          s.mode === 'agent' && s.drivable === true && hasFreshDirectFrame(),
+      );
+      if (previousBackend === 'mirror') stopMirrorTransport();
+      hidePlayOverlay();
+      if (!directPageVisible) {
+        // A background/locked browser must not keep an MJPEG viewer alive and
+        // defeat the daemon's idle release. Visible recovery starts with a
+        // fresh status probe instead of silently retaining control readiness.
+        stopStills();
+      } else if (s.releasing === true) {
+        stopStills();
+        showOverlay('releasing');
+      } else if (s.reconnecting === true) {
+        stopStills();
+        showOverlay('reconnecting');
+      } else if (s.released === true) {
+        stopStills();
+        showOverlay('released');
+      } else if (s.drivable !== true) {
+        const unavailableKind = directUnavailableKind(s);
+        if (unavailableKind === 'locked' || unavailableKind === 'blocked') {
+          startStills();
+          acquireWakeLock();
+        } else {
+          stopStills();
+        }
+        showOverlay(unavailableKind);
+      } else {
+        startStills();
+        acquireWakeLock();
+        if (hasFreshDirectFrame()) hideOverlay();
+        else showOverlay(directVisualEvidenceRequiredAfter !== null
+          ? 'outcome-unknown'
+          : (directFrameSeen ? 'frame-stale' : 'connecting'));
       }
     } else {
-      stopStills();                           // mirror mode → show the WebRTC video
+      setDirectControlReady(false);
+      if (previousBackend === 'direct') stopStills();
+      startMirrorTransport();
     }
-  } catch (_) { /* best-effort */ }
+    updateModeControls();
+    updateStatusLine();
+    return s;
+  } catch (_) {
+    if (generation !== statusPollGeneration) return backendStatus;
+    if (backendType !== 'mirror') {
+      backendType = 'direct'; // safe default: never start Mac capture/input.
+      backendStatus = null;
+      setDirectControlReady(false);
+      stopMirrorTransport();
+      stopStills();
+      showOverlay('status-error');
+      updateModeControls();
+      updateStatusLine();
+    }
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+    if (generation === statusPollGeneration) {
+      if (statusAbortController === controller) statusAbortController = null;
+      statusPollBusy = false;
+    }
+  }
 }
-pollAgentMode();
-setInterval(pollAgentMode, 3000);
 
-/* ── L2 stills fallback ──────────────────────────────────────────
-   When Mirroring dies (phone in use / disconnected) the WebRTC track has no
-   real pixels, but the daemon's /agent/screenshot can still capture via WDA
-   on the phone. Poll it as stills so the page never goes blank. The endpoint
-   accepts the login session cookie, so no extra credential is needed. */
+/* ── Direct device video + still-image fallback ───────────────── */
 const stillFrame = document.getElementById('stillFrame');
-let stillsTimer = null, stillsUrl = null, stillsBusy = false, mjpegLive = false;
-async function fetchStill() {
+const mjpegFrame = document.getElementById('mjpegFrame');
+const MJPEG_RETRY_BASE_MS = 5000;
+const MJPEG_RETRY_MAX_MS = 30000;
+const MJPEG_FRAME_FRESH_MS = 8000;
+// Screenshot fallback refreshes every 2.5s. Three missed refreshes are enough
+// to treat its retained image as historical rather than safe control context.
+const STILL_FRAME_FRESH_MS = 8000;
+const STILL_REQUEST_TIMEOUT_MS = 7000;
+let directFeedActive = false;
+let stillsTimer = null, stillsStartTimer = null;
+let stillsUrl = null, stillsBusy = false, mjpegLive = false;
+let stillsAbortController = null;
+let lastStillFrameAt = null, stillFreshnessTimer = null;
+let lastMjpegActivityAt = null, mjpegFreshnessTimer = null;
+let mjpegStreamId = null;
+let directFrameSeen = false;
+let stillsGeneration = 0;
+let stillRequestEpoch = 0;
+let mjpegConnectTimer = null, mjpegProbeTimer = null, mjpegRetryTimer = null;
+let mjpegRetryDelay = MJPEG_RETRY_BASE_MS;
+function hasFreshDirectFrame(now = performance.now()) {
+  const mjpegFresh = mjpegLive &&
+    lastMjpegActivityAt !== null &&
+    now - lastMjpegActivityAt <= MJPEG_FRAME_FRESH_MS;
+  const stillFresh = lastStillFrameAt !== null &&
+    now - lastStillFrameAt <= STILL_FRAME_FRESH_MS;
+  const freshestEvidenceAt = Math.max(
+    mjpegFresh ? lastMjpegActivityAt : -Infinity,
+    stillFresh ? lastStillFrameAt : -Infinity,
+  );
+  return freshestEvidenceAt !== -Infinity &&
+    (directVisualEvidenceRequiredAfter === null ||
+     freshestEvidenceAt > directVisualEvidenceRequiredAfter);
+}
+function directStatusAllowsControl(s = backendStatus) {
+  return backendType === 'direct' &&
+    document.visibilityState === 'visible' &&
+    s != null &&
+    s.releasing !== true &&
+    s.reconnecting !== true &&
+    s.released !== true &&
+    s.mode === 'agent' &&
+    s.drivable === true;
+}
+function syncDirectFrameFreshness() {
+  const statusReady = directStatusAllowsControl();
+  const frameFresh = hasFreshDirectFrame();
+  if (frameFresh && directVisualEvidenceRequiredAfter !== null) {
+    directVisualEvidenceRequiredAfter = null;
+  }
+  setDirectControlReady(statusReady && frameFresh);
+  if (statusReady) {
+    if (frameFresh) hideOverlay();
+    else if (directFeedActive) {
+      showOverlay(directVisualEvidenceRequiredAfter !== null
+        ? 'outcome-unknown'
+        : (directFrameSeen ? 'frame-stale' : 'connecting'));
+    }
+  }
+  updateStatusLine();
+}
+function clearMjpegFreshnessTimer() {
+  if (!mjpegFreshnessTimer) return;
+  clearTimeout(mjpegFreshnessTimer);
+  mjpegFreshnessTimer = null;
+}
+function armMjpegFreshnessTimer(generation) {
+  clearMjpegFreshnessTimer();
+  if (lastMjpegActivityAt === null) return;
+  const remaining = Math.max(
+    0,
+    MJPEG_FRAME_FRESH_MS - (performance.now() - lastMjpegActivityAt),
+  );
+  mjpegFreshnessTimer = setTimeout(() => {
+    mjpegFreshnessTimer = null;
+    if (
+      generation === stillsGeneration &&
+      directFeedActive &&
+      mjpegLive &&
+      (lastMjpegActivityAt === null ||
+       performance.now() - lastMjpegActivityAt > MJPEG_FRAME_FRESH_MS)
+    ) {
+      mjpegFailed(generation);
+      return;
+    }
+    syncDirectFrameFreshness();
+  }, remaining + 1);
+}
+function updateMjpegActivityFromStatus(status, polledStreamId) {
+  if (
+    !mjpegLive ||
+    !polledStreamId ||
+    polledStreamId !== mjpegStreamId ||
+    status?.mjpeg_stream_fresh !== true
+  ) return;
+  const ageMs = Number(status.mjpeg_stream_age_ms);
+  if (!Number.isFinite(ageMs) || ageMs < 0 ||
+      ageMs > MJPEG_FRAME_FRESH_MS) return;
+  lastMjpegActivityAt = performance.now() - ageMs;
+  armMjpegFreshnessTimer(stillsGeneration);
+}
+function newMjpegStreamId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+function clearStillFreshnessTimer() {
+  if (!stillFreshnessTimer) return;
+  clearTimeout(stillFreshnessTimer);
+  stillFreshnessTimer = null;
+}
+function armStillFreshnessTimer(generation) {
+  clearStillFreshnessTimer();
+  stillFreshnessTimer = setTimeout(() => {
+    stillFreshnessTimer = null;
+    if (generation === stillsGeneration && directFeedActive) {
+      syncDirectFrameFreshness();
+    }
+  }, STILL_FRAME_FRESH_MS + 1);
+}
+async function fetchStill(generation = stillsGeneration) {
   if (stillsBusy) return;
   stillsBusy = true;
+  const requestEpoch = stillRequestEpoch;
+  const controller = new AbortController();
+  stillsAbortController = controller;
+  const timeout = setTimeout(() => controller.abort(), STILL_REQUEST_TIMEOUT_MS);
   try {
-    const r = await fetch('/agent/screenshot?t=' + Date.now(), { cache: 'no-store' });
+    const r = await fetch('/agent/screenshot?t=' + Date.now(), {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (r.status === 401) {
+      location.replace('/login');
+      return;
+    }
     if (r.ok) {
       const blob = await r.blob();
       const next = URL.createObjectURL(blob);
-      stillFrame.src = next;
+      if (generation !== stillsGeneration ||
+          requestEpoch !== stillRequestEpoch ||
+          backendType !== 'direct' ||
+          backendStatus?.mode !== 'agent') {
+        URL.revokeObjectURL(next);
+        return;
+      }
       if (stillsUrl) URL.revokeObjectURL(stillsUrl);
       stillsUrl = next;
-      stillFrame.classList.add('active');
-      olSub.textContent = '镜像离线 — 静帧模式(每 2.5 秒刷新,仍可点按操作)';
+      lastStillFrameAt = performance.now();
+      directFrameSeen = true;
+      armStillFreshnessTimer(generation);
+      stillFrame.src = next;
+      if (!mjpegLive) stillFrame.classList.add('active');
+      olSub.textContent = '设备实时画面暂不可用 — 每 2.5 秒刷新，仍可点按操作';
+      syncDirectFrameFreshness();
     }
-  } catch (_) { /* offline poll is best-effort */ }
-  stillsBusy = false;
+  } catch (_) {
+    /* offline poll is best-effort */
+  } finally {
+    clearTimeout(timeout);
+    if (stillsAbortController === controller) {
+      stillsAbortController = null;
+      stillsBusy = false;
+      syncDirectFrameFreshness();
+    }
+  }
 }
-/* Mirror is offline (agent/WDA mode). Prefer the LIVE MJPEG stream — WDA serves
-   it on-device in the same XCUITest session as control, so it coexists with
-   driving (Mirroring can't). The browser renders multipart/x-mixed-replace
-   directly in the <img> at ~28fps; the session cookie rides along automatically.
-   If MJPEG is unavailable (no relay / no WDA), fall back to 2.5s screenshots. */
-function startStills() {
-  if (mjpegLive || stillsTimer) return;
+function startSnapshotFallback(generation) {
+  if (
+    generation !== stillsGeneration ||
+    !directFeedActive ||
+    backendType !== 'direct' ||
+    backendStatus?.mode !== 'agent'
+  ) return;
+  if (!stillsTimer) {
+    void fetchStill(generation);
+    stillsTimer = setInterval(() => void fetchStill(generation), 2500);
+  }
+}
+function stopSnapshotPolling() {
+  if (stillsStartTimer) { clearTimeout(stillsStartTimer); stillsStartTimer = null; }
+  if (stillsTimer) { clearInterval(stillsTimer); stillsTimer = null; }
+}
+function clearMjpegAttempt() {
+  if (mjpegConnectTimer) { clearTimeout(mjpegConnectTimer); mjpegConnectTimer = null; }
+  if (mjpegProbeTimer) { clearInterval(mjpegProbeTimer); mjpegProbeTimer = null; }
+}
+function mjpegReady(generation) {
+  if (
+    generation !== stillsGeneration ||
+    !directFeedActive ||
+    backendType !== 'direct' ||
+    backendStatus?.mode !== 'agent' ||
+    !mjpegFrame.naturalWidth ||
+    !mjpegFrame.naturalHeight
+  ) return;
+  clearMjpegAttempt();
+  if (mjpegRetryTimer) { clearTimeout(mjpegRetryTimer); mjpegRetryTimer = null; }
+  mjpegRetryDelay = MJPEG_RETRY_BASE_MS;
+  if (!mjpegLive && stillFrame.classList.contains('active')) {
+    invalidateDirectVisualContext();
+  }
   mjpegLive = true;
-  stillFrame.onerror = () => {
-    if (!mjpegLive) return;          // already torn down
-    mjpegLive = false;
-    stillFrame.onerror = null;
-    if (!stillsTimer) { fetchStill(); stillsTimer = setInterval(fetchStill, 2500); }
-  };
-  stillFrame.src = '/agent/mjpeg?t=' + Date.now();
-  stillFrame.classList.add('active');
-  olSub.textContent = '镜像离线 — 实时画面(WDA 设备端,可点按操作)';
+  lastMjpegActivityAt = performance.now();
+  armMjpegFreshnessTimer(generation);
+  directFrameSeen = true;
+  mjpegFrame.classList.add('active');
+  stillFrame.classList.remove('active');
+  stopSnapshotPolling();
+  syncDirectFrameFreshness();
+}
+function scheduleMjpegRetry(generation) {
+  if (mjpegRetryTimer || generation !== stillsGeneration || !directFeedActive) return;
+  const delay = mjpegRetryDelay;
+  mjpegRetryDelay = Math.min(MJPEG_RETRY_MAX_MS, mjpegRetryDelay * 2);
+  mjpegRetryTimer = setTimeout(() => {
+    mjpegRetryTimer = null;
+    startMjpegAttempt(generation);
+  }, delay);
+}
+function mjpegFailed(generation) {
+  if (generation !== stillsGeneration || !directFeedActive) return;
+  clearMjpegAttempt();
+  if (mjpegLive) invalidateDirectVisualContext();
+  mjpegLive = false;
+  lastMjpegActivityAt = null;
+  mjpegStreamId = null;
+  clearMjpegFreshnessTimer();
+  mjpegFrame.onload = null;
+  mjpegFrame.onerror = null;
+  mjpegFrame.classList.remove('active');
+  mjpegFrame.src = '';
+  if (stillsUrl) stillFrame.classList.add('active');
+  startSnapshotFallback(generation);
+  scheduleMjpegRetry(generation);
+  syncDirectFrameFreshness();
+}
+function startMjpegAttempt(generation) {
+  if (
+    generation !== stillsGeneration ||
+    !directFeedActive ||
+    backendType !== 'direct' ||
+    backendStatus?.mode !== 'agent'
+  ) return;
+  clearMjpegAttempt();
+  mjpegFrame.onload = () => mjpegReady(generation);
+  mjpegFrame.onerror = () => mjpegFailed(generation);
+  mjpegFrame.classList.remove('active');
+  mjpegStreamId = newMjpegStreamId();
+  mjpegFrame.src = `/agent/mjpeg?stream_id=${encodeURIComponent(mjpegStreamId)}&t=${Date.now()}`;
+  // Streaming images need not dispatch load until the multipart response ends.
+  // naturalWidth becomes non-zero after the first decoded frame, so poll that
+  // as the authoritative readiness signal and bound a silent TCP connection.
+  mjpegProbeTimer = setInterval(() => mjpegReady(generation), 200);
+  mjpegConnectTimer = setTimeout(() => mjpegFailed(generation), 8000);
+  if (!stillsUrl) olSub.textContent = '设备实时画面正在连接…';
+}
+function startStills() {
+  if (directFeedActive) return;
+  directFeedActive = true;
+  const generation = ++stillsGeneration;
+  mjpegRetryDelay = MJPEG_RETRY_BASE_MS;
+  // Give the live stream a brief head start. If it is slow, fetch a still so
+  // retries happen behind a useful last-known frame instead of a blank panel.
+  stillsStartTimer = setTimeout(() => {
+    stillsStartTimer = null;
+    startSnapshotFallback(generation);
+  }, 1500);
+  startMjpegAttempt(generation);
 }
 function stopStills() {
+  directFeedActive = false;
+  stillsGeneration++;
+  cancelDirectPointers();
+  if (stillsAbortController) {
+    stillsAbortController.abort();
+    stillsAbortController = null;
+    stillsBusy = false;
+  }
   mjpegLive = false;
-  stillFrame.onerror = null;
-  if (stillsTimer) { clearInterval(stillsTimer); stillsTimer = null; }
-  stillFrame.src = '';               // close the MJPEG connection / drop the still
+  lastMjpegActivityAt = null;
+  mjpegStreamId = null;
+  lastStillFrameAt = null;
+  directFrameSeen = false;
+  clearStillFreshnessTimer();
+  clearMjpegFreshnessTimer();
+  setDirectControlReady(false);
+  clearMjpegAttempt();
+  if (mjpegRetryTimer) { clearTimeout(mjpegRetryTimer); mjpegRetryTimer = null; }
+  stopSnapshotPolling();
+  mjpegFrame.onload = null;
+  mjpegFrame.onerror = null;
+  mjpegFrame.src = '';                // close the MJPEG connection
+  mjpegFrame.classList.remove('active');
+  stillFrame.src = '';                // drop the last screenshot
   stillFrame.classList.remove('active');
+  if (stillsUrl) { URL.revokeObjectURL(stillsUrl); stillsUrl = null; }
 }
 
 function hideOverlay() {
-  if (overlayState === 'hidden') return;
   overlayState = 'hidden';
   offlineOverlay.classList.remove('visible', 'disconnected');
+  offlineOverlay.inert = true;
+  offlineOverlay.hidden = true;
   paintDot();
 }
 
@@ -705,8 +1879,36 @@ function hideOverlay() {
    paintDot() reads overlayState + connState directly rather than scraping text. */
 
 /* ── Status line ──────────────────────────────────────────────── */
-function setStatus(msg) { statusLine.textContent = msg; }
+function setStatus(msg) { setTextIfChanged(statusLine, msg); }
 function updateStatusLine() {
+  if (backendType === 'direct') {
+    if (overlayState === 'status-error') { setStatus('无法获取设备状态'); return; }
+    if (!backendStatus) { setStatus('正在获取设备状态…'); return; }
+    if (backendStatus.reconnecting === true) { setStatus('正在重新连接设备…'); return; }
+    if (backendStatus.releasing === true) { setStatus('正在释放设备…'); return; }
+    if (backendStatus.released === true) { setStatus('设备已释放'); return; }
+    if (backendStatus.drivable !== true) {
+      switch (directUnavailableKind(backendStatus)) {
+        case 'locked': setStatus('设备不可用 · 请解锁'); break;
+        case 'setup-blocked': setStatus('设备设置被阻塞'); break;
+        case 'unconfigured': setStatus('尚未选择 iPhone'); break;
+        case 'external': setStatus('外部 WDA 未连接'); break;
+        case 'blocked': setStatus('设备控制暂不可用'); break;
+        default: setStatus('设备未连接');
+      }
+      return;
+    }
+    if (directVisualEvidenceRequiredAfter !== null) {
+      setStatus('操作结果待确认 · 等待新画面');
+      return;
+    }
+    if (!hasFreshDirectFrame()) {
+      setStatus(directFrameSeen ? '设备在线 · 画面停滞' : '设备在线 · 等待画面');
+      return;
+    }
+    setStatus('设备在线 · Direct');
+    return;
+  }
   const rtt   = lastRtt !== '--' ? ` · ${lastRtt}ms` : '';
   const relay = FORCE_RELAY ? ' · relay' : '';
   setStatus(`${connState}${rtt}${relay}`);
@@ -723,22 +1925,57 @@ async function acquireWakeLock() {
 }
 
 /* ── Play() with fallback overlay [iOS §Video] ────────────────── */
-async function tryPlay() {
-  if (video.srcObject == null) return;
-  try { await video.play(); playOverlay.classList.add('hidden'); acquireWakeLock(); }
-  catch (_) { playOverlay.classList.remove('hidden'); }
+function hidePlayOverlay() {
+  playOverlay.hidden = true;
+  playOverlay.inert = true;
 }
-playOverlay.addEventListener('pointerup', async (e) => {
+function showPlayOverlay() {
+  if (backendType === 'direct') return;
+  playOverlay.inert = false;
+  playOverlay.hidden = false;
+}
+async function tryPlay() {
+  if (backendType === 'direct' || video.srcObject == null) return;
+  try { await video.play(); hidePlayOverlay(); acquireWakeLock(); }
+  catch (_) { showPlayOverlay(); }
+}
+playOverlay.addEventListener('click', async (e) => {
   e.stopPropagation();
-  try { await video.play(); playOverlay.classList.add('hidden'); acquireWakeLock(); } catch (_) {}
+  try { await video.play(); hidePlayOverlay(); acquireWakeLock(); } catch (_) {}
 });
 
 /* ── Visibility change: re-play + WakeLock + ICE restart [iOS] ── */
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (video.srcObject && video.paused && !frozen) tryPlay();
-    acquireWakeLock();
-    if (pc && (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed')) scheduleIceRestart();
+    if (backendType === 'direct') {
+      // Re-establish both readiness and the image feed only from current daemon
+      // truth; never reuse the pre-background control state.
+      cancelStatusPoll();
+      void pollAgentMode();
+    } else {
+      if (video.srcObject && video.paused && !frozen) tryPlay();
+      acquireWakeLock();
+      if (pc &&
+          (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed')) {
+        scheduleIceRestart();
+      }
+    }
+  } else if (backendType === 'direct') {
+    cancelStatusPoll();
+    setDirectControlReady(false);
+    stopStills();
+  }
+});
+window.addEventListener('pagehide', () => {
+  if (backendType !== 'direct') return;
+  cancelStatusPoll();
+  setDirectControlReady(false);
+  stopStills();
+});
+window.addEventListener('pageshow', () => {
+  if (backendType === 'direct' && document.visibilityState === 'visible') {
+    cancelStatusPoll();
+    void pollAgentMode();
   }
 });
 
@@ -770,15 +2007,17 @@ window.addEventListener('resize', () => { if (gridOn) drawGrid(); });
 
 /* ── Content-rect coord mapping [iOS §Touch] ──────────────────── */
 function pointerToNormalized(clientX, clientY) {
-  // Map against whichever source is actually on screen: the live MJPEG still
-  // (agent/WDA mode — the real target phone) or the WebRTC video (mirror mode).
-  // In agent mode the WebRTC track is the Mac's mirror — a DIFFERENT device — so
-  // its size/letterboxing would map taps to the wrong place.
-  const usingStill = mjpegLive && stillFrame.classList.contains('active');
-  const el = usingStill ? stillFrame : video;
+  // The visible source owns the coordinate system. This includes the periodic
+  // PNG fallback after MJPEG has failed; tying it to `mjpegLive` mapped those
+  // taps against a hidden/empty video element.
+  const directFrame = mjpegFrame.classList.contains('active')
+    ? mjpegFrame
+    : (stillFrame.classList.contains('active') ? stillFrame : null);
+  const usingDirectFrame = directFrame !== null;
+  const el = directFrame || video;
   const rect = el.getBoundingClientRect();
-  const vw = usingStill ? el.naturalWidth  : el.videoWidth;
-  const vh = usingStill ? el.naturalHeight : el.videoHeight;
+  const vw = usingDirectFrame ? el.naturalWidth  : el.videoWidth;
+  const vh = usingDirectFrame ? el.naturalHeight : el.videoHeight;
   if (!vw || !vh) return null;
   const elAR = rect.width / rect.height, vidAR = vw / vh;
   let contentW, contentH, offX, offY;
@@ -789,12 +2028,207 @@ function pointerToNormalized(clientX, clientY) {
   return { nx, ny };
 }
 
-/* ── Control / move channels [CH] ─────────────────────────────── */
-function sendControl(obj) {
-  if (!controlCh || controlCh.readyState !== 'open') return;
-  try { controlCh.send(JSON.stringify(obj)); } catch (_) {}
+/* ── Direct HTTP control / legacy data channels ───────────────── */
+let directControlTail = Promise.resolve();
+let directControlEpoch = 0;
+let directControlQueued = 0;
+let directControlReady = false;
+let directVisualEvidenceRequiredAfter = null;
+function controlResult(ok, failure = null) {
+  return { ok, failure };
+}
+function controlFailureText(result, fallback) {
+  if (result && result.failure === 'stale_element_snapshot') {
+    return '控件列表已变化，请重新选择';
+  }
+  if (result && result.failure === 'invalid_element_snapshot') {
+    return '这个控件当前不可操作，请刷新列表';
+  }
+  if (result && result.failure === 'outcome_unknown') {
+    return '操作结果未知，请先查看画面再重试';
+  }
+  if (result && result.failure === 'not_sent') {
+    return '操作未发送，设备连接未就绪';
+  }
+  return fallback;
+}
+function invalidateDirectControlQueue() {
+  directControlEpoch++;
+}
+function invalidateDirectVisualContext() {
+  cancelDirectPointers();
+  invalidateDirectControlQueue();
+  directControlReady = false;
+  syncDirectControlAvailability();
+}
+function enterOutcomeUnknownQuarantine() {
+  directVisualEvidenceRequiredAfter = performance.now();
+  stillRequestEpoch++;
+  if (stillsAbortController) {
+    stillsAbortController.abort();
+    stillsAbortController = null;
+    stillsBusy = false;
+  }
+  cancelStatusPoll();
+  invalidateDirectVisualContext();
+  if (directFeedActive) showOverlay('outcome-unknown');
+  updateStatusLine();
+}
+function setDirectControlReady(ready) {
+  const lostReadiness = directControlReady && !ready;
+  if (lostReadiness) {
+    invalidateDirectControlQueue();
+    if (flowRecording || flowStarting) {
+      flowRecording = false;
+      flowStarting = false;
+      flowFinalizing = false;
+      flowCheckpointSession++;
+      flowLastObservation = null;
+      renderRecordedFlow();
+      toast('设备连接已变化，流程录制已停止，请先审核现有步骤');
+    }
+  }
+  directControlReady = ready;
+  syncDirectControlAvailability();
+  if (
+    lostReadiness &&
+    document.visibilityState === 'visible' &&
+    document.activeElement?.disabled === true
+  ) {
+    requestAnimationFrame(() => {
+      if (!directControlReady && !offlineOverlay.hidden) {
+        olTitle.focus({ preventScroll: true });
+      }
+    });
+  }
+}
+function syncDirectControlAvailability() {
+  const unavailable = backendType === 'direct' && !directControlReady;
+  if (unavailable && textPanel.classList.contains('open')) {
+    closeTextPanel({ restoreFocus: false });
+  }
+  if (unavailable && elementPanel.classList.contains('open')) {
+    closeElementPanel({ restoreFocus: false });
+  }
+  for (const id of ['btnHome', 'btnSearch', 'btnGrid', 'btnElements', 'btnKeyboard']) {
+    const control = document.getElementById(id);
+    if (control) control.disabled = unavailable;
+  }
+  const send = document.getElementById('btnSend');
+  if (send) send.disabled = textSendBusy || unavailable;
+  syncFlowControls();
+}
+function sendDirectControl(obj) {
+  if (!directControlReady || directControlQueued >= DIRECT_CONTROL_MAX_QUEUE) {
+    return Promise.resolve(controlResult(false, 'not_sent'));
+  }
+  const epoch = directControlEpoch;
+  const queuedAt = performance.now();
+  directControlQueued++;
+  const request = directControlTail.then(async () => {
+    // Never replay gestures captured against an older screen/session. A WDA
+    // timeout, backend transition, release, or reconnect invalidates the epoch;
+    // a bounded queue age also drops commands that waited too long behind one
+    // slow request.
+    if (
+      epoch !== directControlEpoch ||
+      backendType !== 'direct' ||
+      !directControlReady
+    ) {
+      return controlResult(false, 'not_sent');
+    }
+    // The server deadline consumes only the gesture's remaining freshness
+    // budget. Do not give an action that already waited in this queue a fresh
+    // full TTL after dequeue.
+    const remainingTtlMs = Math.floor(
+      DIRECT_CONTROL_MAX_AGE_MS - (performance.now() - queuedAt),
+    );
+    if (remainingTtlMs <= 0) return controlResult(false, 'not_sent');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONTROL_TIMEOUT_MS);
+    try {
+      const r = await fetch('/control', {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Phone-Control': '1',
+        },
+        body: JSON.stringify({
+          ...obj,
+          issued_at_ms: Date.now(),
+          ttl_ms: remainingTtlMs,
+        }),
+      });
+      if (r.status === 401) {
+        invalidateDirectControlQueue();
+        location.replace('/login');
+        return controlResult(false, 'unauthorized');
+      }
+      const result = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const failure = result.error === 'stale_element_snapshot'
+          ? 'stale_element_snapshot'
+          : result.error === 'invalid_element_snapshot'
+            ? 'invalid_element_snapshot'
+            : result.error === 'outcome_unknown' ||
+          result.outcome === 'unknown' ||
+          r.status === 502 ||
+          r.status === 504
+          ? 'outcome_unknown'
+          : 'not_sent';
+        // Never let later queued gestures run after an uncertain transport or
+        // a server-side rejection. An uncertain result also pauses new input
+        // until the next authoritative status probe restores readiness.
+        if (failure === 'outcome_unknown') enterOutcomeUnknownQuarantine();
+        else invalidateDirectControlQueue();
+        return controlResult(false, failure);
+      }
+      if (result.ok !== true) {
+        invalidateDirectControlQueue();
+        return controlResult(false, 'not_sent');
+      }
+      return controlResult(true);
+    } catch (_) {
+      enterOutcomeUnknownQuarantine();
+      // A browser abort/network failure can happen after the POST reached the
+      // daemon. Treat it as possibly executed; automatic retry is unsafe.
+      return controlResult(false, 'outcome_unknown');
+    } finally {
+      clearTimeout(timeout);
+    }
+  }).finally(() => {
+    directControlQueued = Math.max(0, directControlQueued - 1);
+  });
+  // Preserve action order even when one request fails.
+  directControlTail = request.catch(() => {
+    enterOutcomeUnknownQuarantine();
+    return controlResult(false, 'outcome_unknown');
+  });
+  return directControlTail;
+}
+async function sendControl(obj) {
+  let result;
+  if (backendType === 'direct') {
+    result = await sendDirectControl(obj);
+    if (!result.ok) void pollAgentMode();
+  } else if (!controlCh || controlCh.readyState !== 'open') {
+    result = controlResult(false, 'not_sent');
+  } else {
+    try {
+      controlCh.send(JSON.stringify(obj));
+      result = controlResult(true);
+    } catch (_) {
+      result = controlResult(false, 'not_sent');
+    }
+  }
+  if (result.ok) recordSuccessfulControl(obj);
+  return result;
 }
 function sendMove(nx, ny, flags) {
+  if (backendType !== 'mirror') return false;
   if (!moveCh || moveCh.readyState !== 'open') return;
   if (moveCh.bufferedAmount > MOVE_BACKPRESSURE_BYTES) return;
   const buf = new ArrayBuffer(5), view = new DataView(buf);
@@ -809,6 +2243,7 @@ function sendMove(nx, ny, flags) {
    mouse-drag → long-press/reorder and never scrolls). */
 const clampI8 = v => Math.max(-127, Math.min(127, Math.round(v)));
 function sendScroll(nx, ny, dx, dy) {
+  if (backendType !== 'mirror') return false;
   if (!moveCh || moveCh.readyState !== 'open') return;
   if (moveCh.bufferedAmount > MOVE_BACKPRESSURE_BYTES) return;
   const buf = new ArrayBuffer(7), view = new DataView(buf);
@@ -837,9 +2272,10 @@ videoArea.addEventListener('pointerdown', onPointerDown, { passive: false });
 videoArea.addEventListener('pointermove', onPointerMove, { passive: false });
 videoArea.addEventListener('pointerup',   onPointerUp,   { passive: false });
 videoArea.addEventListener('pointercancel', onPointerCancel, { passive: false });
-document.addEventListener('gesturestart',  e => e.preventDefault(), { passive: false });
-document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
-document.addEventListener('gestureend',    e => e.preventDefault(), { passive: false });
+videoArea.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+videoArea.addEventListener('gesturestart',  e => e.preventDefault(), { passive: false });
+videoArea.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
+videoArea.addEventListener('gestureend',    e => e.preventDefault(), { passive: false });
 
 /* Gesture model (matches iPhone Mirroring's input semantics):
    - quick tap (no move)        → control `tap`         → mouse down+up
@@ -850,101 +2286,1565 @@ document.addEventListener('gestureend',    e => e.preventDefault(), { passive: f
    No eager `down` on every gesture: an early mouse press + drag is what Mirroring
    read as long-press/icon-reorder, so swipes never scrolled. */
 function onPointerDown(e) {
+  if (e.target.closest('a, button, input, textarea, select, summary, [contenteditable="true"]')) {
+    return;
+  }
   e.preventDefault();
   videoArea.setPointerCapture(e.pointerId);
-  const longTimer = setTimeout(() => {
-    const pd = pointers.get(e.pointerId); if (!pd) return;
-    const coords = pointerToNormalized(pd.lastX, pd.lastY);
-    if (coords) { sendControl({ type:'longpress', x:coords.nx, y:coords.ny }); showTapDot(pd.lastX, pd.lastY); toast('长按'); }
-    pd.pressed = true; // now in mouse-drag mode (slider / icon reorder)
-  }, LONGPRESS_MS);
-  pointers.set(e.pointerId, { startX:e.clientX, startY:e.clientY, startT:performance.now(), lastX:e.clientX, lastY:e.clientY, longTimer, pressed:false, scrolling:false });
+  const directAtDown = backendType === 'direct';
+  const pd = {
+    startX:e.clientX, startY:e.clientY, startT:performance.now(),
+    lastX:e.clientX, lastY:e.clientY,
+    longTimer:null, pressed:false, scrolling:false,
+    longpressArmed:false, movedAt:null,
+    backendAtDown:backendType,
+    directEpoch:directAtDown ? directControlEpoch : null,
+    directReadyAtDown:directAtDown &&
+      directControlReady &&
+      directStatusAllowsControl() &&
+      hasFreshDirectFrame(),
+  };
+  pointers.set(e.pointerId, pd);
+  if (backendType === 'direct') {
+    pd.longTimer = setTimeout(() => {
+      const live = pointers.get(e.pointerId); if (!live) return;
+      const distance = Math.hypot(
+        live.lastX - live.startX,
+        live.lastY - live.startY,
+      );
+      if (directGestureIsCurrent(live) && distance <= TAP_SLOP) {
+        live.longpressArmed = true;
+      }
+    }, LONGPRESS_MS);
+  } else {
+    pd.longTimer = setTimeout(async () => {
+      const live = pointers.get(e.pointerId); if (!live) return;
+      const coords = pointerToNormalized(live.lastX, live.lastY);
+      if (!coords) return;
+      const result = await sendControl({ type:'longpress', x:coords.nx, y:coords.ny });
+      if (!result.ok || pointers.get(e.pointerId) !== live) return;
+      showTapDot(live.lastX, live.lastY); toast('长按');
+      live.pressed = true; // mirror-only mouse-drag mode
+    }, LONGPRESS_MS);
+  }
 }
 function onPointerMove(e) {
-  e.preventDefault();
   const pd = pointers.get(e.pointerId); if (!pd) return;
+  e.preventDefault();
   const events = hasCoalesced ? e.getCoalescedEvents() : [e];
   for (const ev of events) {
     const ddx = ev.clientX - pd.lastX, ddy = ev.clientY - pd.lastY; // per-move delta
     pd.lastX = ev.clientX; pd.lastY = ev.clientY;
     const moved = Math.hypot(ev.clientX - pd.startX, ev.clientY - pd.startY) > TAP_SLOP;
     const coords = pointerToNormalized(ev.clientX, ev.clientY);
-    if (pd.pressed) {
+    if (backendType === 'direct') {
+      if (moved && !pd.scrolling) {
+        pd.scrolling = true;
+        pd.movedAt = performance.now();
+        // Movement before the hold threshold is always a swipe, even if the
+        // finger stays down for a long time afterwards. Only movement after a
+        // stationary hold is a drag.
+        if (!pd.longpressArmed) clearTimeout(pd.longTimer);
+      }
+    } else if (pd.pressed) {
       // long-press already fired → real mouse-drag (slider/reorder).
       if (coords) sendMove(coords.nx, coords.ny, 1);
     } else if (moved) {
       // swipe before any hold. Cancel the long-press timer once.
       if (!pd.scrolling) { clearTimeout(pd.longTimer); pd.scrolling = true; }
-      // Mirror mode: stream scroll-wheel deltas (the only thing Mirroring scrolls
-      // on). Agent/WDA mode has NO scroll-wheel — a per-move delta stream becomes a
-      // storm of discrete on-device swipes that keep scrolling after release, so
-      // there we accumulate and fire ONE swipe (start→end) on pointer-up instead.
-      if (!agentMode && coords) sendScroll(coords.nx, coords.ny, ddx, ddy);
+      if (coords) sendScroll(coords.nx, coords.ny, ddx, ddy);
     }
   }
 }
+function classifyDirectGesture(pd, elapsedMs, distancePx) {
+  // Once a gesture crossed the movement threshold it must never degrade back
+  // into a tap/long-press merely because the finger returned near its origin.
+  // That ambiguous loop is cancelled rather than risking an unintended action.
+  if (pd.scrolling && distancePx <= TAP_SLOP) return 'cancel';
+  if (distancePx > TAP_SLOP) {
+    return pd.longpressArmed ? 'drag' : 'swipe';
+  }
+  return (pd.longpressArmed || elapsedMs >= LONGPRESS_MS) ? 'longpress' : 'tap';
+}
+function directGestureIsCurrent(pd) {
+  return pd.directReadyAtDown &&
+    pd.directEpoch === directControlEpoch &&
+    backendType === 'direct' &&
+    directControlReady &&
+    directStatusAllowsControl() &&
+    hasFreshDirectFrame();
+}
 function onPointerUp(e) {
-  e.preventDefault();
   const pd = pointers.get(e.pointerId); if (!pd) return;
+  e.preventDefault();
   clearTimeout(pd.longTimer); pointers.delete(e.pointerId);
   const coords = pointerToNormalized(e.clientX, e.clientY);
-  if (pd.pressed) {
-    // release the held long-press / drag.
-    if (coords) sendControl({ type:'up', x:coords.nx, y:coords.ny });
-  } else if (pd.scrolling) {
-    // swipe released. Mirror mode already scrolled per-move (scroll-wheel) — nothing
-    // to do. Agent/WDA mode: emit the whole gesture as ONE on-device drag (start→end).
-    if (agentMode) {
-      const a = pointerToNormalized(pd.startX, pd.startY);
-      const b = pointerToNormalized(e.clientX, e.clientY);
-      if (a && b) sendControl({ type:'swipe', x1:a.nx, y1:a.ny, x2:b.nx, y2:b.ny });
+  const dt = performance.now() - pd.startT;
+  const dist = Math.hypot(e.clientX - pd.startX, e.clientY - pd.startY);
+
+  if (pd.backendAtDown !== backendType) return;
+  if (backendType === 'direct') {
+    // A gesture belongs to the exact visible Direct control epoch in which it
+    // began. Backgrounding, feed loss, reconnect, or a readiness transition
+    // cancels it; a later pointerup must not act on a newly connected screen.
+    if (!directGestureIsCurrent(pd)) return;
+    const a = pointerToNormalized(pd.startX, pd.startY);
+    const b = coords;
+    let action = null, feedback = '';
+    const gesture = classifyDirectGesture(pd, dt, dist);
+    if ((gesture === 'drag' || gesture === 'swipe') && a && b) {
+      action = gesture === 'drag'
+        ? {
+            type:'drag', x1:a.nx, y1:a.ny, x2:b.nx, y2:b.ny,
+            hold_ms:LONGPRESS_MS,
+            duration_ms:Math.max(120, Math.min(900, Math.round(
+              dt - Math.max(LONGPRESS_MS, (pd.movedAt || pd.startT) - pd.startT),
+            ))),
+          }
+        : {
+            type:'swipe', x1:a.nx, y1:a.ny, x2:b.nx, y2:b.ny,
+            duration_ms:Math.max(120, Math.min(900, Math.round(dt))),
+          };
+    } else if (b && gesture === 'longpress') {
+      action = {
+        type:'longpress', x:b.nx, y:b.ny,
+        duration_ms:Math.max(600, Math.min(10_000, Math.round(dt))),
+      };
+      feedback = '长按';
+    } else if (b && gesture === 'tap') {
+      action = { type:'tap', x:b.nx, y:b.ny };
     }
+    if (action) {
+      void sendControl(action).then(result => {
+        if (!result.ok) {
+          toast(controlFailureText(result, '操作失败，设备未连接'));
+          return;
+        }
+        if (action.type !== 'swipe') showTapDot(e.clientX, e.clientY);
+        if (feedback) toast(feedback);
+      });
+    }
+  } else if (pd.pressed) {
+    // release the held long-press / drag.
+    if (coords) void sendControl({ type:'up', x:coords.nx, y:coords.ny });
+  } else if (pd.scrolling) {
+    // Mirror mode already emitted scroll-wheel deltas per move.
   } else {
-    // stationary, quick → a tap.
-    const dt = performance.now() - pd.startT;
-    const dist = Math.hypot(e.clientX - pd.startX, e.clientY - pd.startY);
-    if (coords && dist < TAP_SLOP && dt < TAP_MS) { sendControl({ type:'tap', x:coords.nx, y:coords.ny }); showTapDot(e.clientX, e.clientY); }
+    // No long-press fired and no scroll occurred: this is a tap. Avoid the old
+    // 250–500ms dead zone where a deliberate tap produced no action.
+    if (coords && dist < TAP_SLOP) {
+      void sendControl({ type:'tap', x:coords.nx, y:coords.ny }).then(result => {
+        if (result.ok) showTapDot(e.clientX, e.clientY);
+        else toast(controlFailureText(result, '操作失败，连接未就绪'));
+      });
+    }
   }
 }
 function onPointerCancel(e) {
-  const pd = pointers.get(e.pointerId); if (pd) clearTimeout(pd.longTimer);
+  const pd = pointers.get(e.pointerId);
+  if (pd) {
+    clearTimeout(pd.longTimer);
+    if (backendType === 'mirror' && pd.pressed) {
+      const coords = pointerToNormalized(pd.lastX, pd.lastY);
+      if (coords) void sendControl({ type:'up', x:coords.nx, y:coords.ny });
+    }
+  }
   pointers.delete(e.pointerId);
 }
 
+function cancelDirectPointers() {
+  for (const [pointerId, pd] of pointers) {
+    if (pd.backendAtDown !== 'direct') continue;
+    clearTimeout(pd.longTimer);
+    pointers.delete(pointerId);
+  }
+}
+
+/* ── Multi-step recorder: execute once, replay without a model ── */
+let flowPanelCloseTimer = null;
+let clearFlowArmedUntil = 0;
+
+function roundedFlowCoord(value) {
+  return Number(Number(value).toFixed(4));
+}
+
+function flowStepPresentation(step) {
+  switch (step.kind) {
+    case 'tap_label':
+      return [`点按「${step.label}」`, '稳定标签'];
+    case 'tap_locator': {
+      const locator = step.locator || {};
+      const target = locator.identifier
+        ? `控件 ${locator.identifier}`
+        : locator.label
+          ? `「${locator.label}」`
+          : locator.kind
+            ? locator.kind
+            : '语义控件';
+      return [`点按 ${target}`, '稳定定位条件'];
+    }
+    case 'tap':
+      return ['点按画面坐标', `x ${step.x} · y ${step.y}`];
+    case 'longpress':
+      return ['长按画面', `x ${step.x} · y ${step.y} · ${step.duration_ms}ms`];
+    case 'swipe':
+      return ['滑动画面', `${step.x1},${step.y1} → ${step.x2},${step.y2}`];
+    case 'drag':
+      return ['长按拖动', `${step.x1},${step.y1} → ${step.x2},${step.y2}`];
+    case 'shortcut':
+      return [step.name === 'home' ? '返回主屏幕' : '打开搜索', `快捷操作 · ${step.name}`];
+    case 'scroll':
+      return ['滚动画面', `dx ${step.dx} · dy ${step.dy}`];
+    case 'key':
+      return [`按键 ${step.name}`, '设备按键'];
+    case 'back':
+      return ['返回上一层', '应用内导航'];
+    case 'launch_app':
+      return ['打开指定应用', step.bundle];
+    case 'picker':
+      return [`选择「${step.value}」`, `第 ${Number(step.column || 0) + 1} 列选择器`];
+    case 'pause':
+      return [`等待 ${step.ms}ms`, '固定等待 · 建议优先使用界面检查点'];
+    case 'type': {
+      const input = recordedFlowInputs.find(candidate => candidate.key === step.input);
+      return [
+        `输入「${input?.label || step.input || '运行参数'}」`,
+        `运行参数 · ${step.input}${step.clear ? ' · 先清空' : ''}`,
+      ];
+    }
+    case 'wait_for': {
+      const expected = step.expect || {};
+      const presentLocator = Array.isArray(expected.present) ? expected.present[0] : null;
+      const absentLocator = Array.isArray(expected.absent) ? expected.absent[0] : null;
+      const locator = presentLocator || absentLocator;
+      const target = locator?.identifier
+        ? `控件 ${locator.identifier}`
+        : locator?.label
+          ? `「${locator.label}」`
+          : expected.application
+            ? `应用「${expected.application}」`
+            : '目标界面';
+      const change = absentLocator && !presentLocator ? '消失' : '出现';
+      return [`等待 ${target} ${change}`, `界面检查点 · 最长 ${step.timeout_ms || 5000}ms`];
+    }
+    default:
+      return [step.kind, '已录制步骤'];
+  }
+}
+
+function pruneFlowInputs() {
+  const referenced = new Set(
+    recordedFlowSteps
+      .filter(entry => entry.step.kind === 'type' && entry.step.input)
+      .map(entry => entry.step.input),
+  );
+  recordedFlowInputs = recordedFlowInputs.filter(input => referenced.has(input.key));
+  for (const key of [...flowInputValues.keys()]) {
+    if (!referenced.has(key)) flowInputValues.delete(key);
+  }
+}
+
+function missingFlowInputs() {
+  return recordedFlowInputs.filter(input => {
+    const value = flowInputValues.get(input.key);
+    return typeof value !== 'string' || value.length === 0;
+  });
+}
+
+function syncFlowParameterState() {
+  if (
+    flowRunning ||
+    flowRecording ||
+    flowStarting ||
+    flowFinalizing ||
+    recordedFlowSteps.length === 0 ||
+    excludedUnrecordedActions > 0
+  ) return;
+  const missing = missingFlowInputs().length;
+  flowState.textContent = missing ? `等待填写 ${missing} 个运行参数` : '等待审核';
+}
+
+function renderFlowInputs() {
+  flowInputList.replaceChildren();
+  flowInputs.hidden = recordedFlowInputs.length === 0;
+  recordedFlowInputs.forEach(input => {
+    const row = document.createElement('div');
+    row.className = 'flow-input-row';
+    const label = document.createElement('label');
+    const fieldId = `flow-runtime-${input.key}`;
+    label.htmlFor = fieldId;
+    const title = document.createElement('span');
+    title.textContent = input.label;
+    const key = document.createElement('code');
+    key.textContent = input.key;
+    label.append(title, key);
+    const field = document.createElement('input');
+    field.id = fieldId;
+    field.className = 'flow-runtime-input';
+    field.type = 'text';
+    field.maxLength = 1000;
+    field.autocomplete = 'off';
+    field.spellcheck = false;
+    field.placeholder = '填写本次运行使用的文字';
+    field.value = flowInputValues.get(input.key) || '';
+    field.disabled = flowRunning || flowRecording || flowStarting || flowFinalizing;
+    field.addEventListener('input', () => {
+      flowInputValues.set(input.key, field.value);
+      flowSafety.checked = false;
+      syncFlowParameterState();
+      syncFlowControls();
+    });
+    row.append(label, field);
+    flowInputList.append(row);
+  });
+}
+
+function renderRecordedFlow() {
+  pruneFlowInputs();
+  renderFlowInputs();
+  flowStepList.replaceChildren();
+  recordedFlowSteps.forEach((entry, index) => {
+    const item = document.createElement('li');
+    item.className = [
+      'flow-step',
+      entry.fragile ? 'fragile' : '',
+      entry.checkpoint ? 'checkpoint' : '',
+    ].filter(Boolean).join(' ');
+
+    const number = document.createElement('span');
+    number.className = 'flow-step-number';
+    number.textContent = String(index + 1);
+
+    const copy = document.createElement('span');
+    copy.className = 'flow-step-copy';
+    const title = document.createElement('span');
+    title.className = 'flow-step-title';
+    const meta = document.createElement('span');
+    meta.className = 'flow-step-meta';
+    const [titleText, metaText] = flowStepPresentation(entry.step);
+    title.textContent = titleText;
+    meta.textContent = [
+      metaText,
+      entry.fragile ? '易受布局变化影响' : '',
+      entry.checkpointMiss ? '未找到可靠检查点，保留 350ms 等待' : '',
+    ].filter(Boolean).join(' · ');
+    copy.append(title, meta);
+
+    const controls = document.createElement('span');
+    controls.className = 'flow-step-controls';
+    const pairedCheckpoint =
+      !entry.checkpoint && recordedFlowSteps[index + 1]?.checkpoint === true;
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.className = 'flow-step-button';
+    up.textContent = '上移';
+    up.disabled =
+      entry.checkpoint ||
+      index === 0 ||
+      flowRunning ||
+      flowCheckpointPending > 0;
+    up.setAttribute(
+      'aria-label',
+      pairedCheckpoint
+        ? `上移第 ${index + 1} 步及其检查点`
+        : `上移第 ${index + 1} 步`,
+    );
+    up.addEventListener('click', () => {
+      if (
+        entry.checkpoint ||
+        index === 0 ||
+        flowRunning ||
+        flowCheckpointPending > 0
+      ) return;
+      const groupLength = pairedCheckpoint ? 2 : 1;
+      const previousEnd = index - 1;
+      const previousStart = recordedFlowSteps[previousEnd]?.checkpoint
+        ? previousEnd - 1
+        : previousEnd;
+      if (previousStart < 0) return;
+      const moving = recordedFlowSteps.splice(index, groupLength);
+      recordedFlowSteps.splice(previousStart, 0, ...moving);
+      flowSafety.checked = false;
+      setFlowFileStatus('');
+      renderRecordedFlow();
+    });
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'flow-step-button';
+    remove.textContent = '删除';
+    remove.disabled = flowRunning || flowCheckpointPending > 0;
+    remove.setAttribute(
+      'aria-label',
+      pairedCheckpoint
+        ? `删除第 ${index + 1} 步及其检查点`
+        : `删除第 ${index + 1} 步`,
+    );
+    remove.addEventListener('click', () => {
+      if (flowRunning || flowCheckpointPending > 0) return;
+      if (entry.checkpoint) {
+        const previous = recordedFlowSteps[index - 1];
+        if (previous && previous.step.kind !== 'wait_for') {
+          previous.step.after_ms = 350;
+          previous.checkpointMiss = true;
+        }
+      }
+      recordedFlowSteps.splice(index, pairedCheckpoint ? 2 : 1);
+      pruneFlowInputs();
+      flowSafety.checked = false;
+      setFlowFileStatus('');
+      renderRecordedFlow();
+    });
+    controls.append(up, remove);
+    item.append(number, copy, controls);
+    flowStepList.append(item);
+  });
+
+  const count = recordedFlowSteps.length;
+  const incomplete = excludedUnrecordedActions;
+  const missingInputs = missingFlowInputs().length;
+  flowEmpty.hidden = count > 0;
+  flowCount.textContent = `${count} / 24 步`;
+  recordingPill.textContent = `录制中 · ${count} 步${flowCheckpointPending ? ' · 检查中' : ''}`;
+  recordingPill.hidden = !flowRecording;
+  flowState.textContent = flowRunning
+    ? '正在运行全部步骤'
+    : flowStarting
+      ? '正在建立语义基线'
+      : flowFinalizing
+        ? '正在完成最后一个检查点'
+    : flowRecording
+      ? `正在录制${flowCheckpointPending ? ' · 正在生成检查点' : ''}${incomplete ? ` · ${incomplete} 个动作未录入` : ''}`
+      : count
+        ? incomplete
+          ? `流程不完整 · ${incomplete} 个动作未录入`
+          : missingInputs
+            ? `等待填写 ${missingInputs} 个运行参数`
+          : '等待审核'
+        : '尚未录制';
+  flowRecord.textContent = flowStarting
+    ? '正在准备…'
+    : flowFinalizing
+      ? '正在完成…'
+      : flowRecording
+        ? '停止录制并审核'
+        : count
+          ? '继续录制'
+          : '开始录制';
+  flowRecord.classList.toggle('recording', flowRecording);
+  flowRecord.classList.toggle('primary', !flowRecording && count === 0);
+  flowDownload.textContent = incomplete ? '保存草稿' : '保存脚本';
+  syncFlowControls();
+}
+
+function flowUnavailableCopy() {
+  if (backendType !== 'direct') {
+    return '自动化流程目前只支持已连接的真实 iPhone。';
+  }
+  if (backendStatus?.setup_blocked_on === 'usb') {
+    return '目标 iPhone 尚未通过 USB 连接。连接、解锁并保持亮屏后，这里会自动恢复。';
+  }
+  if (backendStatus?.setup_blocked_on === 'trust') {
+    return '请在 iPhone 上完成信任确认并保持解锁；完成后这里会自动恢复。';
+  }
+  if (backendStatus?.drivable === true) {
+    return '正在等待最新手机画面；画面出现后即可录制或运行。';
+  }
+  return '设备控制尚未就绪；恢复连接后即可录制或运行流程。';
+}
+
+function syncFlowControls() {
+  const hasSteps = recordedFlowSteps.length > 0;
+  const incomplete = excludedUnrecordedActions;
+  const missingInputs = missingFlowInputs().length;
+  const checkpointBusy = flowCheckpointPending > 0 || flowStarting || flowFinalizing;
+  const drivable = backendType === 'direct' && directControlReady;
+  const showOpen =
+    !hasSteps &&
+    !flowRecording &&
+    !flowStarting &&
+    !flowFinalizing &&
+    !flowRunning;
+  flowSafetyGate.hidden = !hasSteps;
+  flowOpen.hidden = !showOpen;
+  flowOpen.disabled = flowImportBusy;
+  flowOpen.textContent = flowImportBusy ? '正在打开…' : '打开脚本';
+  flowOpen.classList.toggle('primary', showOpen && !drivable);
+  flowRecord.classList.toggle('wide', !showOpen);
+  flowDownload.hidden = !hasSteps;
+  flowRun.hidden = !hasSteps;
+  flowClear.hidden = !hasSteps;
+  flowAvailability.hidden = drivable || flowRecording || flowRunning;
+  flowAvailability.textContent = flowAvailability.hidden ? '' : flowUnavailableCopy();
+  flowRecord.disabled =
+    flowImportBusy ||
+    flowRunning ||
+    flowStarting ||
+    flowFinalizing ||
+    (!flowRecording && !drivable);
+  flowDownload.disabled = flowRunning || checkpointBusy || !hasSteps;
+  flowRun.disabled =
+    flowRunning ||
+    flowRecording ||
+    checkpointBusy ||
+    !hasSteps ||
+    incomplete > 0 ||
+    missingInputs > 0 ||
+    !drivable ||
+    !flowSafety.checked;
+  flowClear.disabled = flowRunning || checkpointBusy || !hasSteps;
+  flowName.disabled = flowImportBusy || flowRunning || flowStarting || flowFinalizing;
+  flowSafety.disabled = flowRunning || checkpointBusy || !hasSteps;
+}
+
+function addRecordedFlowStep(step, { fragile = false, checkpoint = false } = {}) {
+  if (!flowRecording) return;
+  if (recordedFlowSteps.length >= 24) {
+    flowRecording = false;
+    toast('已达到 24 步上限，录制已停止，请打开「流程」审核');
+    renderRecordedFlow();
+    return null;
+  }
+  const entry = {
+    id: ++flowEntrySequence,
+    step,
+    fragile,
+    checkpoint,
+    checkpointMiss: false,
+  };
+  recordedFlowSteps.push(entry);
+  flowSafety.checked = false;
+  renderRecordedFlow();
+  return entry;
+}
+
+function flowObservationRows(body) {
+  return Array.isArray(body?.elements)
+    ? body.elements.filter(row => row && typeof row === 'object').slice(0, 500)
+    : [];
+}
+
+async function readFlowObservation(timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch('/agent/elements', {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: controller.signal,
+    });
+    if (response.status === 401) {
+      location.replace('/login');
+      return null;
+    }
+    if (!response.ok) return null;
+    const body = await response.json().catch(() => null);
+    const snapshot = typeof body?.snapshot === 'string' ? body.snapshot : '';
+    if (!snapshot) return null;
+    return { snapshot, rows: flowObservationRows(body) };
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function flowSemanticKey(row, field) {
+  const value = String(row?.[field] || '').trim();
+  const kind = String(row?.kind || '').trim();
+  if (!value || !kind || value.length > 500 || kind.length > 100) return '';
+  return `${kind}\u0000${value}`;
+}
+
+function flowUniqueRows(rows, field) {
+  const counts = new Map();
+  for (const row of rows) {
+    const key = flowSemanticKey(row, field);
+    if (key) counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return rows.filter(row => {
+    const key = flowSemanticKey(row, field);
+    return key && counts.get(key) === 1;
+  });
+}
+
+function flowHealthyElement(row) {
+  return row?.kind !== 'Application' && row?.enabled !== false && row?.visible !== false;
+}
+
+function chooseFlowCheckpoint(before, after) {
+  if (!before || !after || before.snapshot === after.snapshot) return null;
+  const previousIdentifiers = new Set(
+    before.rows.map(row => flowSemanticKey(row, 'identifier')).filter(Boolean),
+  );
+  const identifierRow = flowUniqueRows(after.rows, 'identifier')
+    .find(row => flowHealthyElement(row) &&
+      !previousIdentifiers.has(flowSemanticKey(row, 'identifier')));
+  if (identifierRow) {
+    return {
+      present: [{
+        identifier: String(identifierRow.identifier).trim(),
+        kind: String(identifierRow.kind).trim(),
+        enabled: true,
+        visible: true,
+      }],
+    };
+  }
+
+  const beforeApplication = before.rows.find(row => row?.kind === 'Application');
+  const afterApplication = after.rows.find(row => row?.kind === 'Application');
+  const application = String(afterApplication?.label || '').trim();
+  if (application && application !== String(beforeApplication?.label || '').trim()) {
+    return { application };
+  }
+  return null;
+}
+
+function markFlowCheckpointMiss(entryId) {
+  const entry = recordedFlowSteps.find(candidate => candidate.id === entryId);
+  if (entry && entry.step.kind !== 'wait_for') entry.checkpointMiss = true;
+}
+
+async function captureFlowCheckpoint({
+  entryId,
+  session,
+  serial,
+  baseline,
+}) {
+  if (session !== flowCheckpointSession || serial !== flowActionSerial) {
+    markFlowCheckpointMiss(entryId);
+    return;
+  }
+  if (!baseline) {
+    const recovered = await readFlowObservation(2600);
+    if (
+      recovered &&
+      session === flowCheckpointSession &&
+      serial === flowActionSerial
+    ) {
+      flowLastObservation = recovered;
+    }
+    markFlowCheckpointMiss(entryId);
+    return;
+  }
+  const deadline = performance.now() + 2600;
+  let latest = null;
+  while (
+    performance.now() < deadline &&
+    session === flowCheckpointSession &&
+    serial === flowActionSerial
+  ) {
+    latest = await readFlowObservation(Math.max(800, deadline - performance.now()));
+    if (!latest) break;
+    if (latest.snapshot !== baseline.snapshot) break;
+    await new Promise(resolve => setTimeout(resolve, 180));
+  }
+  if (
+    !latest ||
+    latest.snapshot === baseline.snapshot ||
+    session !== flowCheckpointSession ||
+    serial !== flowActionSerial
+  ) {
+    markFlowCheckpointMiss(entryId);
+    return;
+  }
+
+  flowLastObservation = latest;
+  const expect = chooseFlowCheckpoint(baseline, latest);
+  const actionIndex = recordedFlowSteps.findIndex(entry => entry.id === entryId);
+  if (!expect || actionIndex < 0 || recordedFlowSteps.length >= 24) {
+    markFlowCheckpointMiss(entryId);
+    return;
+  }
+  const actionEntry = recordedFlowSteps[actionIndex];
+  actionEntry.step.after_ms = 0;
+  actionEntry.checkpointMiss = false;
+  recordedFlowSteps.splice(actionIndex + 1, 0, {
+    id: ++flowEntrySequence,
+    step: {
+      kind: 'wait_for',
+      expect,
+      timeout_ms: 5000,
+      poll_ms: 250,
+    },
+    fragile: false,
+    checkpoint: true,
+    checkpointMiss: false,
+  });
+  flowSafety.checked = false;
+}
+
+function queueFlowCheckpoint(entry) {
+  if (!entry || entry.step.kind === 'wait_for') return;
+  const request = {
+    entryId: entry.id,
+    session: flowCheckpointSession,
+    serial: flowActionSerial,
+    baseline: flowLastObservation,
+  };
+  flowCheckpointPending++;
+  renderRecordedFlow();
+  flowCheckpointTail = flowCheckpointTail
+    .then(() => captureFlowCheckpoint(request))
+    .catch(() => markFlowCheckpointMiss(request.entryId))
+    .finally(() => {
+      flowCheckpointPending = Math.max(0, flowCheckpointPending - 1);
+      renderRecordedFlow();
+    });
+}
+
+function nextFlowInputKey() {
+  let key;
+  do {
+    key = `text_${++flowInputSequence}`;
+  } while (recordedFlowInputs.some(input => input.key === key));
+  return key;
+}
+
+function recordSuccessfulControl(action) {
+  if (!flowRecording || backendType !== 'direct') return;
+  flowActionSerial++;
+  if (action.type === 'text') {
+    const key = nextFlowInputKey();
+    const inputNumber = flowInputSequence;
+    recordedFlowInputs.push({
+      key,
+      label: `文字参数 ${inputNumber}`,
+      description: `录制时第 ${inputNumber} 个文字输入；值仅在每次运行时提供。`,
+    });
+    flowInputValues.set(key, '');
+    const entry = addRecordedFlowStep({
+      kind: 'type',
+      input: key,
+      clear: Boolean(action.clear),
+      after_ms: 350,
+    });
+    queueFlowCheckpoint(entry);
+    return;
+  }
+  let entry = null;
+  if (action.type === 'tap' && typeof action.label === 'string') {
+    entry = addRecordedFlowStep({
+      kind: 'tap_label',
+      label: action.label,
+      after_ms: 350,
+    });
+  } else if (action.type === 'tap' && Number.isInteger(action.element)) {
+    excludedUnrecordedActions++;
+    flowLastObservation = null;
+    flowSafety.checked = false;
+    renderRecordedFlow();
+    toast('这个控件没有稳定标签：操作已执行，但没有写入流程');
+    return;
+  } else if (action.type === 'tap') {
+    entry = addRecordedFlowStep({
+      kind: 'tap',
+      x: roundedFlowCoord(action.x),
+      y: roundedFlowCoord(action.y),
+      after_ms: 350,
+    }, { fragile: true });
+  } else if (action.type === 'longpress') {
+    entry = addRecordedFlowStep({
+      kind: 'longpress',
+      x: roundedFlowCoord(action.x),
+      y: roundedFlowCoord(action.y),
+      duration_ms: Number(action.duration_ms) || 600,
+      after_ms: 350,
+    }, { fragile: true });
+  } else if (action.type === 'swipe' || action.type === 'drag') {
+    const step = {
+      kind: action.type,
+      x1: roundedFlowCoord(action.x1),
+      y1: roundedFlowCoord(action.y1),
+      x2: roundedFlowCoord(action.x2),
+      y2: roundedFlowCoord(action.y2),
+      duration_ms: Number(action.duration_ms) || 300,
+      after_ms: 350,
+    };
+    if (action.type === 'drag') step.hold_ms = Number(action.hold_ms) || LONGPRESS_MS;
+    entry = addRecordedFlowStep(step, { fragile: true });
+  } else if (action.type === 'shortcut') {
+    entry = addRecordedFlowStep({ kind: 'shortcut', name: action.name, after_ms: 350 });
+  } else if (action.type === 'scroll') {
+    entry = addRecordedFlowStep({
+      kind: 'scroll',
+      x: roundedFlowCoord(action.x ?? 0.5),
+      y: roundedFlowCoord(action.y ?? 0.5),
+      dx: Number(action.dx),
+      dy: Number(action.dy),
+      after_ms: 350,
+    }, { fragile: true });
+  } else if (action.type === 'key') {
+    entry = addRecordedFlowStep({ kind: 'key', name: action.name, after_ms: 350 });
+  } else if (action.type === 'back') {
+    entry = addRecordedFlowStep({ kind: 'back', after_ms: 350 });
+  }
+  queueFlowCheckpoint(entry);
+}
+
+function flowDocument() {
+  const safeName = flowName.value.trim().slice(0, 100) || '未命名流程';
+  const omitted = excludedUnrecordedActions;
+  const description = omitted
+    ? `由 iphone-use 流程录制生成；有 ${omitted} 个动作未写入，当前仅为不完整草稿，补齐并审核后才能运行。`
+    : recordedFlowInputs.length
+      ? '由 iphone-use 流程录制生成；文字保存为运行参数，不包含录制时输入的原文。执行前请填写参数并逐项审核。'
+      : '由 iphone-use 流程录制生成；已自动建议语义检查点，执行前请逐项审核。';
+  const document = {
+    version: 1,
+    name: safeName,
+    description,
+    steps: recordedFlowSteps.map(entry => ({ ...entry.step })),
+  };
+  if (recordedFlowInputs.length) {
+    document.inputs = Object.fromEntries(recordedFlowInputs.map(input => [
+      input.key,
+      {
+        type: 'string',
+        description: input.description,
+        required: true,
+      },
+    ]));
+  }
+  return document;
+}
+
+function flowStepToBatchStep(step, inputValues = flowInputValues) {
+  if (step.kind === 'pause') return { kind: 'pause', ms: step.ms };
+  if (step.kind === 'wait_for') return { ...step };
+  const { kind, after_ms = 0, ...payload } = step;
+  let action;
+  if (kind === 'tap_label') {
+    action = { type: 'tap', label: payload.label };
+  } else if (kind === 'tap_locator') {
+    action = { type: 'tap_locator', locator: payload.locator };
+  } else if (kind === 'type') {
+    const text = inputValues.get(payload.input);
+    if (typeof text !== 'string' || text.length === 0) {
+      throw new Error(`missing flow input: ${payload.input}`);
+    }
+    action = { type: 'text', text, clear: Boolean(payload.clear) };
+  } else {
+    action = { type: kind, ...payload };
+  }
+  return { kind: 'action', action, after_ms };
+}
+
+const FLOW_FILE_MAX_BYTES = 64 * 1024;
+const FLOW_MAX_TOTAL_WAIT_MS = 60_000;
+const FLOW_KEY_NAMES = new Set([
+  'return', 'enter', 'escape', 'space', 'tab', 'delete', 'backspace',
+  'up', 'down', 'left', 'right', 'dismiss', 'hide',
+]);
+
+function flowPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function requireFlow(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function requireFlowKeys(value, required, optional, context) {
+  requireFlow(flowPlainObject(value), `${context} 必须是对象`);
+  const allowed = new Set([...required, ...optional]);
+  for (const key of required) {
+    requireFlow(Object.prototype.hasOwnProperty.call(value, key), `${context} 缺少 ${key}`);
+  }
+  for (const key of Object.keys(value)) {
+    requireFlow(allowed.has(key), `${context} 包含未知字段 ${key}`);
+  }
+}
+
+function flowCharacterCount(value) {
+  return [...value].length;
+}
+
+function requireFlowString(value, context, {
+  min = 1,
+  max,
+  trim = true,
+} = {}) {
+  requireFlow(typeof value === 'string', `${context} 必须是文字`);
+  const count = flowCharacterCount(value);
+  const meaningful = trim ? value.trim().length > 0 : count >= min;
+  requireFlow(meaningful && count >= min, `${context} 不能为空`);
+  if (max !== undefined) {
+    requireFlow(count <= max, `${context} 不能超过 ${max} 个字符`);
+  }
+  requireFlow(!/\p{Cc}/u.test(value), `${context} 不能包含控制字符`);
+  return value;
+}
+
+function requireFlowInteger(value, min, max, context) {
+  requireFlow(
+    Number.isInteger(value) && value >= min && value <= max,
+    `${context} 必须是 ${min}–${max} 的整数`,
+  );
+  return value;
+}
+
+function requireFlowNumber(value, min, max, context) {
+  requireFlow(
+    typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max,
+    `${context} 必须是 ${min}–${max} 的数字`,
+  );
+  return value;
+}
+
+function importedAfterMs(step, context) {
+  return Object.prototype.hasOwnProperty.call(step, 'after_ms')
+    ? requireFlowInteger(step.after_ms, 0, 3000, `${context}.after_ms`)
+    : 0;
+}
+
+function normalizeImportedLocator(locator, context) {
+  const stringFields = ['label', 'identifier', 'kind', 'value'];
+  const booleanFields = ['focused', 'enabled', 'visible'];
+  requireFlowKeys(locator, [], [...stringFields, ...booleanFields], context);
+  requireFlow(Object.keys(locator).length > 0, `${context} 至少需要一个定位条件`);
+  const normalized = {};
+  for (const field of stringFields) {
+    if (!Object.prototype.hasOwnProperty.call(locator, field)) continue;
+    const limit = field === 'kind' ? 100 : 500;
+    normalized[field] = requireFlowString(locator[field], `${context}.${field}`, { max: limit });
+  }
+  for (const field of booleanFields) {
+    if (!Object.prototype.hasOwnProperty.call(locator, field)) continue;
+    requireFlow(typeof locator[field] === 'boolean', `${context}.${field} 必须是 true 或 false`);
+    normalized[field] = locator[field];
+  }
+  return normalized;
+}
+
+function normalizeImportedExpectation(expect, context) {
+  requireFlowKeys(expect, [], ['application', 'present', 'absent'], context);
+  const normalized = {};
+  if (Object.prototype.hasOwnProperty.call(expect, 'application')) {
+    normalized.application = requireFlowString(
+      expect.application,
+      `${context}.application`,
+      { max: 500 },
+    );
+  }
+  for (const field of ['present', 'absent']) {
+    if (!Object.prototype.hasOwnProperty.call(expect, field)) continue;
+    requireFlow(Array.isArray(expect[field]), `${context}.${field} 必须是数组`);
+    normalized[field] = expect[field].map((locator, index) =>
+      normalizeImportedLocator(locator, `${context}.${field}[${index}]`));
+  }
+  const hasLocator =
+    (normalized.present?.length || 0) > 0 ||
+    (normalized.absent?.length || 0) > 0;
+  requireFlow(normalized.application || hasLocator, `${context} 至少需要一个界面条件`);
+  return normalized;
+}
+
+function normalizeImportedStep(step, index, inputDefinitions) {
+  const context = `第 ${index + 1} 步`;
+  requireFlow(flowPlainObject(step), `${context} 必须是对象`);
+  const kind = requireFlowString(step.kind, `${context}.kind`, { max: 40 });
+  const withAfter = (required, optional = []) =>
+    requireFlowKeys(step, ['kind', ...required], [...optional, 'after_ms'], context);
+  const finishAction = normalized => {
+    const after_ms = importedAfterMs(step, context);
+    return {
+      step: { kind, ...normalized, after_ms },
+      declaredWaitMs: after_ms,
+    };
+  };
+
+  switch (kind) {
+    case 'tap': {
+      withAfter(['x', 'y']);
+      return finishAction({
+        x: requireFlowNumber(step.x, 0, 1, `${context}.x`),
+        y: requireFlowNumber(step.y, 0, 1, `${context}.y`),
+      });
+    }
+    case 'longpress': {
+      withAfter(['x', 'y'], ['duration_ms']);
+      return finishAction({
+        x: requireFlowNumber(step.x, 0, 1, `${context}.x`),
+        y: requireFlowNumber(step.y, 0, 1, `${context}.y`),
+        duration_ms: Object.prototype.hasOwnProperty.call(step, 'duration_ms')
+          ? requireFlowInteger(step.duration_ms, 1, 10_000, `${context}.duration_ms`)
+          : 600,
+      });
+    }
+    case 'swipe':
+    case 'drag': {
+      const optional = kind === 'drag'
+        ? ['hold_ms', 'duration_ms']
+        : ['duration_ms'];
+      withAfter(['x1', 'y1', 'x2', 'y2'], optional);
+      const x1 = requireFlowNumber(step.x1, 0, 1, `${context}.x1`);
+      const y1 = requireFlowNumber(step.y1, 0, 1, `${context}.y1`);
+      const x2 = requireFlowNumber(step.x2, 0, 1, `${context}.x2`);
+      const y2 = requireFlowNumber(step.y2, 0, 1, `${context}.y2`);
+      requireFlow(x1 !== x2 || y1 !== y2, `${context} 的起点和终点不能相同`);
+      const normalized = {
+        x1, y1, x2, y2,
+        duration_ms: Object.prototype.hasOwnProperty.call(step, 'duration_ms')
+          ? requireFlowInteger(step.duration_ms, 1, 10_000, `${context}.duration_ms`)
+          : 300,
+      };
+      if (kind === 'drag') {
+        normalized.hold_ms = Object.prototype.hasOwnProperty.call(step, 'hold_ms')
+          ? requireFlowInteger(step.hold_ms, 0, 10_000, `${context}.hold_ms`)
+          : 500;
+      }
+      return finishAction(normalized);
+    }
+    case 'tap_label':
+      withAfter(['label']);
+      return finishAction({
+        label: requireFlowString(step.label, `${context}.label`, { max: 500 }),
+      });
+    case 'tap_locator':
+      withAfter(['locator']);
+      return finishAction({
+        locator: normalizeImportedLocator(step.locator, `${context}.locator`),
+      });
+    case 'type': {
+      requireFlow(
+        !Object.prototype.hasOwnProperty.call(step, 'text'),
+        `${context} 写死了文字；请改用 input 运行参数，避免把隐私保存进脚本`,
+      );
+      withAfter(['input'], ['clear']);
+      const input = requireFlowString(step.input, `${context}.input`, { max: 64 });
+      requireFlow(inputDefinitions.has(input), `${context} 引用了未定义参数 ${input}`);
+      if (Object.prototype.hasOwnProperty.call(step, 'clear')) {
+        requireFlow(typeof step.clear === 'boolean', `${context}.clear 必须是 true 或 false`);
+      }
+      return finishAction({ input, clear: Boolean(step.clear) });
+    }
+    case 'key': {
+      withAfter(['name']);
+      const name = requireFlowString(step.name, `${context}.name`, { max: 20 })
+        .trim().toLowerCase();
+      requireFlow(FLOW_KEY_NAMES.has(name), `${context} 使用了不支持的按键 ${name}`);
+      return finishAction({ name });
+    }
+    case 'shortcut': {
+      withAfter(['name']);
+      const name = requireFlowString(step.name, `${context}.name`, { max: 20 })
+        .trim().toLowerCase();
+      requireFlow(name === 'home' || name === 'spotlight', `${context} 使用了不支持的快捷操作 ${name}`);
+      return finishAction({ name });
+    }
+    case 'scroll': {
+      withAfter(['x', 'y', 'dx', 'dy']);
+      const dx = requireFlowNumber(step.dx, -1000, 1000, `${context}.dx`);
+      const dy = requireFlowNumber(step.dy, -1000, 1000, `${context}.dy`);
+      requireFlow(dx !== 0 || dy !== 0, `${context} 的滚动距离不能全为 0`);
+      return finishAction({
+        x: requireFlowNumber(step.x, 0, 1, `${context}.x`),
+        y: requireFlowNumber(step.y, 0, 1, `${context}.y`),
+        dx,
+        dy,
+      });
+    }
+    case 'launch_app': {
+      withAfter(['bundle']);
+      const bundle = requireFlowString(step.bundle, `${context}.bundle`, { max: 200 });
+      requireFlow(
+        new TextEncoder().encode(bundle).length <= 200 && /^[A-Za-z0-9.-]+$/.test(bundle),
+        `${context}.bundle 必须是合法的应用标识`,
+      );
+      return finishAction({ bundle });
+    }
+    case 'back':
+      withAfter([]);
+      return finishAction({});
+    case 'picker': {
+      withAfter(['value'], ['column']);
+      return finishAction({
+        column: Object.prototype.hasOwnProperty.call(step, 'column')
+          ? requireFlowInteger(step.column, 0, 20, `${context}.column`)
+          : 0,
+        value: requireFlowString(step.value, `${context}.value`, { max: 500 }),
+      });
+    }
+    case 'wait_for': {
+      requireFlowKeys(step, ['kind', 'expect'], ['timeout_ms', 'poll_ms'], context);
+      const timeout_ms = Object.prototype.hasOwnProperty.call(step, 'timeout_ms')
+        ? requireFlowInteger(step.timeout_ms, 1, 10_000, `${context}.timeout_ms`)
+        : 5000;
+      const poll_ms = Object.prototype.hasOwnProperty.call(step, 'poll_ms')
+        ? requireFlowInteger(step.poll_ms, 50, 1000, `${context}.poll_ms`)
+        : 250;
+      return {
+        step: {
+          kind,
+          expect: normalizeImportedExpectation(step.expect, `${context}.expect`),
+          timeout_ms,
+          poll_ms,
+        },
+        declaredWaitMs: timeout_ms,
+      };
+    }
+    case 'pause': {
+      requireFlowKeys(step, ['kind', 'ms'], [], context);
+      const ms = requireFlowInteger(step.ms, 1, 3000, `${context}.ms`);
+      return { step: { kind, ms }, declaredWaitMs: ms };
+    }
+    default:
+      throw new Error(`${context} 使用了不支持的类型 ${kind}`);
+  }
+}
+
+function validateImportedFlowDocument(document) {
+  requireFlowKeys(
+    document,
+    ['version', 'name', 'steps'],
+    ['description', 'inputs'],
+    '流程文件',
+  );
+  requireFlow(document.version === 1, '只支持 version 1 的流程文件');
+  const name = requireFlowString(document.name, '流程名称', { max: 100 }).trim();
+  if (document.description !== undefined && document.description !== null) {
+    requireFlowString(document.description, '流程说明', { min: 0, max: 1000, trim: false });
+  }
+
+  const inputObject = document.inputs === undefined ? {} : document.inputs;
+  requireFlow(flowPlainObject(inputObject), 'inputs 必须是对象');
+  const inputEntries = Object.entries(inputObject);
+  requireFlow(inputEntries.length <= 16, '运行参数不能超过 16 个');
+  const inputDefinitions = new Map();
+  for (const [key, definition] of inputEntries) {
+    requireFlow(
+      /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key),
+      `参数名 ${key} 的格式不正确`,
+    );
+    requireFlowKeys(definition, ['type'], ['description', 'required'], `参数 ${key}`);
+    requireFlow(definition.type === 'string', `参数 ${key} 只支持 string 类型`);
+    if (definition.description !== undefined) {
+      requireFlowString(definition.description, `参数 ${key} 的说明`, {
+        min: 0,
+        max: 200,
+        trim: false,
+      });
+    }
+    if (definition.required !== undefined) {
+      requireFlow(typeof definition.required === 'boolean', `参数 ${key}.required 必须是 true 或 false`);
+    }
+    requireFlow(definition.required !== false, `参数 ${key} 必须设为 required: true`);
+    inputDefinitions.set(key, {
+      key,
+      label: definition.description?.trim().slice(0, 60) || key,
+      description: definition.description || `每次运行时填写参数 ${key}`,
+    });
+  }
+
+  requireFlow(Array.isArray(document.steps), 'steps 必须是数组');
+  requireFlow(
+    document.steps.length >= 1 && document.steps.length <= 24,
+    '流程必须包含 1–24 步',
+  );
+  const normalizedSteps = [];
+  const referencedInputs = new Set();
+  let declaredWaitMs = 0;
+  document.steps.forEach((step, index) => {
+    const normalized = normalizeImportedStep(step, index, inputDefinitions);
+    normalizedSteps.push(normalized.step);
+    declaredWaitMs += normalized.declaredWaitMs;
+    if (normalized.step.kind === 'type') referencedInputs.add(normalized.step.input);
+  });
+  requireFlow(
+    declaredWaitMs <= FLOW_MAX_TOTAL_WAIT_MS,
+    '流程声明的总等待时间不能超过 60 秒',
+  );
+  const unused = [...inputDefinitions.keys()].filter(key => !referencedInputs.has(key));
+  requireFlow(unused.length === 0, `存在未使用的运行参数：${unused.join('、')}`);
+
+  return {
+    name,
+    steps: normalizedSteps,
+    inputs: [...inputDefinitions.values()],
+  };
+}
+
+function setFlowFileStatus(message, tone = '') {
+  flowFileStatus.hidden = !message;
+  flowFileStatus.textContent = message;
+  if (tone) flowFileStatus.dataset.tone = tone;
+  else delete flowFileStatus.dataset.tone;
+}
+
+function applyImportedFlow(validated, filename) {
+  flowEntrySequence = 0;
+  recordedFlowSteps = validated.steps.map(step => ({
+    id: ++flowEntrySequence,
+    step,
+    fragile: ['tap', 'longpress', 'swipe', 'drag', 'scroll'].includes(step.kind),
+    checkpoint: step.kind === 'wait_for',
+    checkpointMiss: false,
+  }));
+  recordedFlowInputs = validated.inputs.map(input => ({
+    key: input.key,
+    label: input.label,
+    description: input.description,
+  }));
+  flowInputValues = new Map();
+  flowInputSequence = 0;
+  excludedUnrecordedActions = 0;
+  flowRecording = false;
+  flowStarting = false;
+  flowFinalizing = false;
+  flowCheckpointPending = 0;
+  flowCheckpointSession++;
+  flowCheckpointTail = Promise.resolve();
+  flowLastObservation = null;
+  flowActionSerial = 0;
+  flowSafety.checked = false;
+  flowName.value = validated.name;
+  flowClear.textContent = '清空步骤';
+  setFlowFileStatus(
+    `已打开「${filename}」，共 ${recordedFlowSteps.length} 步。请填写运行参数并逐项审核。`,
+    'success',
+  );
+  renderRecordedFlow();
+  flowPanel.querySelector('.flow-body').scrollTop = 0;
+}
+
+function openFlowPanel() {
+  if (textPanel.classList.contains('open')) {
+    closeTextPanel({ restoreFocus: false });
+  }
+  if (elementPanel.classList.contains('open')) {
+    closeElementPanel({ restoreFocus: false });
+  }
+  clearTimeout(flowPanelCloseTimer);
+  flowPanel.hidden = false;
+  flowPanel.inert = false;
+  void flowPanel.offsetHeight;
+  flowPanel.classList.add('open');
+  document.body.classList.add('flow-panel-open');
+  btnFlow.classList.add('active');
+  btnFlow.setAttribute('aria-expanded', 'true');
+  renderRecordedFlow();
+  setTimeout(() => {
+    if (flowPanel.classList.contains('open')) flowName.focus();
+  }, 60);
+}
+
+function closeFlowPanel({ restoreFocus = true } = {}) {
+  clearTimeout(flowPanelCloseTimer);
+  flowPanel.classList.remove('open');
+  document.body.classList.remove('flow-panel-open');
+  flowPanel.inert = true;
+  btnFlow.classList.remove('active');
+  btnFlow.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) btnFlow.focus();
+  flowPanelCloseTimer = setTimeout(() => {
+    if (!flowPanel.classList.contains('open')) flowPanel.hidden = true;
+  }, 270);
+}
+
+btnFlow.addEventListener('click', () => {
+  flowPanel.classList.contains('open') ? closeFlowPanel() : openFlowPanel();
+});
+recordingPill.addEventListener('click', openFlowPanel);
+flowClose.addEventListener('click', () => closeFlowPanel());
+flowPanel.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeFlowPanel();
+  }
+});
+flowSafety.addEventListener('change', syncFlowControls);
+flowRecord.addEventListener('click', () => { void toggleFlowRecording(); });
+flowOpen.addEventListener('click', () => {
+  if (flowImportBusy || recordedFlowSteps.length > 0) return;
+  flowOpenFile.click();
+});
+flowOpenFile.addEventListener('change', async () => {
+  const file = flowOpenFile.files?.[0];
+  flowOpenFile.value = '';
+  if (!file || flowImportBusy || recordedFlowSteps.length > 0) return;
+  flowImportBusy = true;
+  setFlowFileStatus('正在检查脚本格式和安全边界…');
+  syncFlowControls();
+  try {
+    requireFlow(
+      file.size >= 1 && file.size <= FLOW_FILE_MAX_BYTES,
+      '脚本文件大小必须在 1B–64KB 之间',
+    );
+    const text = await file.text();
+    const document = JSON.parse(text);
+    const validated = validateImportedFlowDocument(document);
+    const filename =
+      (file.name || '').replace(/\p{Cc}/gu, '').slice(0, 120) ||
+      '流程脚本';
+    applyImportedFlow(validated, filename);
+  } catch (error) {
+    const detail = error instanceof SyntaxError
+      ? 'JSON 格式不正确'
+      : String(error?.message || '无法读取这个文件');
+    setFlowFileStatus(`无法打开脚本：${detail}`, 'error');
+  } finally {
+    flowImportBusy = false;
+    renderRecordedFlow();
+    if (recordedFlowSteps.length === 0) flowOpen.focus();
+  }
+});
+
+async function toggleFlowRecording() {
+  if (flowRunning || flowStarting || flowFinalizing) return;
+  if (flowRecording) {
+    flowRecording = false;
+    flowFinalizing = flowCheckpointPending > 0;
+    renderRecordedFlow();
+    if (flowFinalizing) await flowCheckpointTail;
+    flowFinalizing = false;
+    renderRecordedFlow();
+    toast('录制已停止，请逐项审核后下载或执行');
+    return;
+  }
+  if (backendType !== 'direct' || !directControlReady) {
+    toast('设备连接未就绪，暂时不能开始录制');
+    return;
+  }
+  setFlowFileStatus('');
+  flowStarting = true;
+  renderRecordedFlow();
+  const session = ++flowCheckpointSession;
+  const baseline = await readFlowObservation();
+  if (
+    session !== flowCheckpointSession ||
+    backendType !== 'direct' ||
+    !directControlReady
+  ) {
+    flowStarting = false;
+    renderRecordedFlow();
+    toast('设备状态已变化，没有开始录制');
+    return;
+  }
+  flowLastObservation = baseline;
+  flowActionSerial = 0;
+  flowCheckpointTail = Promise.resolve();
+  flowStarting = false;
+  flowRecording = true;
+  flowSafety.checked = false;
+  renderRecordedFlow();
+  closeFlowPanel({ restoreFocus: false });
+  toast(baseline
+    ? '已开始录制；页面变化会自动生成检查点'
+    : '已开始录制；暂时无法读取控件，将保留短等待并标注');
+}
+flowDownload.addEventListener('click', () => {
+  if (!recordedFlowSteps.length || flowRunning || flowCheckpointPending) return;
+  const json = `${JSON.stringify(flowDocument(), null, 2)}\n`;
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
+  link.href = url;
+  link.download = `iphone-use-flow-${stamp}.json`;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(excludedUnrecordedActions
+    ? '不完整草稿已保存：请补齐安全参数后再运行'
+    : recordedFlowInputs.length
+      ? '流程脚本已保存；参数值未写入文件，运行时用 --input 提供'
+      : '流程脚本已保存；可用 iphone-use-mcp flow validate/run');
+});
+flowRun.addEventListener('click', async () => {
+  if (
+    flowRunning ||
+    flowRecording ||
+    flowStarting ||
+    flowFinalizing ||
+    flowCheckpointPending ||
+    !recordedFlowSteps.length ||
+    excludedUnrecordedActions > 0 ||
+    missingFlowInputs().length > 0 ||
+    !flowSafety.checked ||
+    backendType !== 'direct' ||
+    !directControlReady
+  ) return;
+  let batchSteps;
+  try {
+    batchSteps = recordedFlowSteps.map(entry => flowStepToBatchStep(entry.step));
+  } catch (_) {
+    toast('请先填写全部运行参数');
+    return;
+  }
+  flowRunning = true;
+  renderRecordedFlow();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 80000);
+  try {
+    const response = await fetch('/agent/actions', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Phone-Control': '1',
+      },
+      body: JSON.stringify({
+        steps: batchSteps,
+      }),
+    });
+    if (response.status === 401) {
+      location.replace('/login');
+      return;
+    }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || result.ok !== true) {
+      const completed = Number(result.applied_actions ?? result.completed ?? 0);
+      const failed = Number.isInteger(result.failed_step) ? result.failed_step + 1 : null;
+      toast(result.outcome === 'unknown'
+        ? `结果未知：已确认完成 ${completed} 个动作，请先查看手机，不要直接重试`
+        : `流程已停止：完成 ${completed} 个动作${failed ? `，第 ${failed} 步失败` : ''}`);
+      void pollAgentMode();
+      return;
+    }
+    toast(`流程完成：共执行 ${recordedFlowSteps.length} 步`);
+    flowSafety.checked = false;
+    void pollAgentMode();
+  } catch (_) {
+    toast('流程结果未知，请先查看手机状态，不要直接重试');
+    void pollAgentMode();
+  } finally {
+    clearTimeout(timeout);
+    flowRunning = false;
+    renderRecordedFlow();
+  }
+});
+flowClear.addEventListener('click', () => {
+  if (!recordedFlowSteps.length || flowRunning) return;
+  const now = Date.now();
+  if (now > clearFlowArmedUntil) {
+    clearFlowArmedUntil = now + 3500;
+    flowClear.textContent = '再次点击确认清空';
+    setTimeout(() => {
+      if (Date.now() >= clearFlowArmedUntil) flowClear.textContent = '清空步骤';
+    }, 3600);
+    return;
+  }
+  clearFlowArmedUntil = 0;
+  recordedFlowSteps = [];
+  recordedFlowInputs = [];
+  flowInputValues = new Map();
+  flowInputSequence = 0;
+  excludedUnrecordedActions = 0;
+  flowRecording = false;
+  flowStarting = false;
+  flowFinalizing = false;
+  flowCheckpointPending = 0;
+  flowCheckpointSession++;
+  flowCheckpointTail = Promise.resolve();
+  flowLastObservation = null;
+  flowActionSerial = 0;
+  flowSafety.checked = false;
+  flowClear.textContent = '清空步骤';
+  setFlowFileStatus('');
+  renderRecordedFlow();
+  toast('已清空这次录制');
+});
+
 /* ── Toolbar handlers (v1 parity) ─────────────────────────────── */
-document.getElementById('btnHome').addEventListener('click', () => { sendControl({ type:'shortcut', name:'home' }); toast('Home'); });
-document.getElementById('btnSearch').addEventListener('click', () => { sendControl({ type:'shortcut', name:'spotlight' }); toast('Spotlight'); });
-document.getElementById('btnSwitcher').addEventListener('click', () => {
+async function runShortcut(name, successText) {
+  const result = await sendControl({ type:'shortcut', name });
+  toast(result.ok ? successText : controlFailureText(result, '操作失败，设备未连接'));
+}
+document.getElementById('btnHome').addEventListener('click', () => {
+  void runShortcut('home', '已返回主屏幕');
+});
+document.getElementById('btnSearch').addEventListener('click', () => {
+  void runShortcut('spotlight', '已打开搜索');
+});
+
+const btnSwitcher = document.getElementById('btnSwitcher');
+btnSwitcher.addEventListener('click', () => {
   // The App Switcher is a home-indicator system gesture WDA can't synthesize, so
-  // it's unreachable in agent mode (works in mirror mode via L3). Guide the user
+  // it is only offered by the explicit mirror backend. Guide the user
   // to Spotlight, which IS wired up on-device, instead of sending a no-op.
-  if (agentMode) { toast('切换器在 agent 模式不可用 — 用「搜索」找 app'); return; }
-  sendControl({ type:'shortcut', name:'switcher' }); toast('切换器');
+  if (backendType === 'direct') { toast('请使用「搜索」打开其他 App'); return; }
+  void runShortcut('switcher', '已打开切换器');
 });
 
 const btnFreeze = document.getElementById('btnFreeze');
 const freezeLbl = btnFreeze.querySelector('.lbl');
 btnFreeze.addEventListener('click', () => {
+  if (backendType !== 'mirror') return;
   frozen = !frozen;
-  if (frozen) { video.pause(); btnFreeze.classList.add('active'); if (freezeLbl) freezeLbl.textContent = '继续'; toast('已冻结'); }
-  else        { video.play().catch(()=>{}); btnFreeze.classList.remove('active'); if (freezeLbl) freezeLbl.textContent = '冻结'; toast('继续'); }
+  btnFreeze.setAttribute('aria-pressed', String(frozen));
+  if (frozen) {
+    video.pause(); btnFreeze.classList.add('active');
+    if (freezeLbl) freezeLbl.textContent = '继续';
+    toast('画面已冻结');
+  } else {
+    video.play().catch(()=>{}); btnFreeze.classList.remove('active');
+    if (freezeLbl) freezeLbl.textContent = '冻结';
+    toast('画面继续');
+  }
 });
 
-document.getElementById('btnGrid').addEventListener('click', () => {
+const btnGrid = document.getElementById('btnGrid');
+btnGrid.addEventListener('click', () => {
   gridOn = !gridOn;
   gridCanvas.classList.toggle('on', gridOn);
-  document.getElementById('btnGrid').classList.toggle('active', gridOn);
+  btnGrid.classList.toggle('active', gridOn);
+  btnGrid.setAttribute('aria-pressed', String(gridOn));
   drawGrid();
 });
 
-function sendText() {
-  const text = textInput.value.trim().slice(0, 500);
-  if (!text) return;
-  sendControl({ type:'text', text });
-  textInput.value = ''; toast('已输入');
+const btnSend = document.getElementById('btnSend');
+async function sendText() {
+  const text = textInput.value.slice(0, 500);
+  if (text.length === 0 || textSendBusy ||
+      (backendType === 'direct' && !directControlReady)) return false;
+  textSendBusy = true;
+  syncDirectControlAvailability();
+  btnSend.textContent = '发送中…';
+  const result = await sendControl({ type:'text', text });
+  textSendBusy = false;
+  syncDirectControlAvailability();
+  btnSend.textContent = '发送';
+  if (!result.ok) {
+    toast(controlFailureText(result, '输入失败，文字已保留'));
+    if (textPanel.classList.contains('open')) textInput.focus();
+    return false;
+  }
+  textInput.value = '';
+  toast(flowRecording
+    ? '文字已变成运行参数；刚才输入的原文没有保存'
+    : '文字已输入');
+  closeTextPanel();
+  return true;
 }
-document.getElementById('btnSend').addEventListener('click', sendText);
-textInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+btnSend.addEventListener('click', () => { void sendText(); });
+textInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); void sendText(); }
+});
+
+function updateModeControls() {
+  const direct = backendType === 'direct';
+  if (!direct && flowRecording) {
+    flowRecording = false;
+    flowCheckpointSession++;
+    flowLastObservation = null;
+    renderRecordedFlow();
+    toast('流程录制只支持真实设备模式，录制已停止');
+  }
+  // These two controls describe behavior the WDA path cannot honestly provide.
+  // Removing them in Direct also keeps the primary mobile toolbar within reach.
+  btnSwitcher.hidden = direct;
+  btnFreeze.hidden = direct;
+  btnElements.hidden = !direct;
+  if (!direct && elementPanel.classList.contains('open')) {
+    closeElementPanel({ restoreFocus: false });
+  }
+  syncDirectControlAvailability();
+  if (typeof syncToolbarReserve === 'function') syncToolbarReserve();
+}
 
 document.getElementById('btnLogout').addEventListener('click', () => { location.href = '/logout'; });
 
@@ -991,10 +3891,11 @@ async function pollStats() {
 
 /* ── ICE restart [SIG §restart] ───────────────────────────────── */
 function scheduleIceRestart() {
-  if (iceRestartTimer) return;
+  if (!mirrorTransportEnabled || backendType !== 'mirror' || iceRestartTimer) return;
   iceRestartTimer = setTimeout(() => {
     iceRestartTimer = null;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!mirrorTransportEnabled || backendType !== 'mirror' ||
+        !ws || ws.readyState !== WebSocket.OPEN) return;
     wsSend({ type:'restart' }); toast('ICE 重连中…');
   }, ICE_RESTART_DEBOUNCE_MS);
 }
@@ -1056,21 +3957,84 @@ function onControlMessage(e) {
 
 /* ── Signaling loop [SIG] ─────────────────────────────────────── */
 let relayAttempt = false;
+function startMirrorTransport() {
+  if (mirrorTransportEnabled) return;
+  mirrorTransportEnabled = true;
+  reconnectDelay = RECONNECT_BASE_MS;
+  connectWs();
+}
+
+function stopMirrorTransport() {
+  mirrorTransportEnabled = false;
+  clearTimeout(reconnectTimer); reconnectTimer = null;
+  clearTimeout(iceRestartTimer); iceRestartTimer = null;
+  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+  _stopStallWatch();
+  _stopStallChecker();
+
+  if (ws) {
+    const oldWs = ws;
+    ws = null;
+    oldWs.onopen = null;
+    oldWs.onmessage = null;
+    oldWs.onerror = null;
+    oldWs.onclose = null;
+    try { oldWs.close(); } catch (_) {}
+  }
+  if (pc) {
+    const oldPc = pc;
+    pc = null;
+    oldPc.ontrack = null;
+    oldPc.ondatachannel = null;
+    oldPc.onicecandidate = null;
+    oldPc.oniceconnectionstatechange = null;
+    oldPc.onconnectionstatechange = null;
+    try { oldPc.close(); } catch (_) {}
+  }
+  controlCh = null;
+  moveCh = null;
+  video.srcObject = null;
+  connState = 'direct';
+  lastRtt = '--';
+  relayAttempt = false;
+  hidePlayOverlay();
+}
+
 async function connectWs() {
-  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  if (!mirrorTransportEnabled || backendType !== 'mirror') return;
+  if (ws) {
+    const oldWs = ws;
+    ws = null;
+    oldWs.onclose = null;
+    try { oldWs.close(); } catch (_) {}
+  }
   clearTimeout(iceRestartTimer); iceRestartTimer = null;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   connState = 'connecting'; updateStatusLine();
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onopen = () => { connState = 'ws-open'; updateStatusLine(); reconnectDelay = RECONNECT_BASE_MS; relayAttempt = false; };
-  ws.onerror = () => {};
-  ws.onclose = () => {
+  const socket = new WebSocket(`${proto}//${location.host}/ws`);
+  ws = socket;
+  socket.onopen = () => {
+    if (!mirrorTransportEnabled || backendType !== 'mirror' || ws !== socket) {
+      socket.onclose = null;
+      try { socket.close(); } catch (_) {}
+      return;
+    }
+    connState = 'ws-open';
+    updateStatusLine();
+    reconnectDelay = RECONNECT_BASE_MS;
+    relayAttempt = false;
+  };
+  socket.onerror = () => {};
+  socket.onclose = () => {
+    if (ws === socket) ws = null;
+    if (!mirrorTransportEnabled || backendType !== 'mirror') return;
     connState = 'ws-closed'; updateStatusLine();
     if (pc) { try { pc.close(); } catch (_) {} pc = null; }
     reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
     clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connectWs, reconnectDelay);
   };
-  ws.onmessage = async (ev) => {
+  socket.onmessage = async (ev) => {
+    if (!mirrorTransportEnabled || backendType !== 'mirror' || ws !== socket) return;
     let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (msg.type === 'offer') await handleOffer(msg.sdp);
     else if (msg.type === 'ice' && pc && msg.candidate) { try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (_) {} }
@@ -1078,32 +4042,31 @@ async function connectWs() {
       // Daemon-side truth about the Mirroring window. Keepalive frames keep
       // flowing when the window vanishes, so this signal (not frame flow)
       // drives the "phone gone" overlay.
-      // In agent/WDA mode the Mirroring window is INTENTIONALLY gone (we drive
-      // on-device + show the MJPEG), so the "phone disconnected — reconnect
-      // mirror" overlay would be wrong and misleading. Only show it in mirror
-      // mode. Agent mode keeps the live MJPEG with no overlay.
       if (msg.present === false) {
-        if (agentMode) { startStills(); hideOverlay(); }
-        else { showOverlay('gone'); startStills(); }
+        showOverlay('gone');
       }
-      else { if (overlayState === 'gone') hideOverlay(); if (!agentMode) stopStills(); }
+      else if (overlayState === 'gone') hideOverlay();
     }
     else if (msg.type === 'session_status') {
       // issue #8 (queue + notify): another viewer holds the live session.
-      // In agent mode video is MJPEG (per-viewer, no single-viewer lease), so a
-      // queued WebRTC session must NOT block the picture.
-      if (msg.state === 'queued') { queuedAhead = msg.ahead || 0; if (!agentMode) showOverlay('queued'); }
+      if (msg.state === 'queued') { queuedAhead = msg.ahead || 0; showOverlay('queued'); }
       else if (msg.state === 'active') { if (overlayState === 'queued') hideOverlay(); }
     }
   };
 }
 async function handleOffer(sdp) {
+  if (!mirrorTransportEnabled || backendType !== 'mirror') return;
   const iceServers = await fetchIceServers();
+  if (!mirrorTransportEnabled || backendType !== 'mirror') return;
   /* FORCE_RELAY (?relay=1) always uses relay-only transport; otherwise fall back
      to the relay path only after an SDP error (relayAttempt flag). */
   const newPc = (FORCE_RELAY || relayAttempt)
     ? await buildPeerConnectionRelayOnly(iceServers)
     : await buildPeerConnection(iceServers);
+  if (!mirrorTransportEnabled || backendType !== 'mirror') {
+    try { newPc.close(); } catch (_) {}
+    return;
+  }
   wirePc(newPc);
   try {
     await pc.setRemoteDescription({ type:'offer', sdp });
@@ -1118,15 +4081,262 @@ async function handleOffer(sdp) {
 
 /* ── Chrome: text panel + immersive (mobile UI) ───────────────── */
 const textPanel = document.getElementById('textPanel');
-function openTextPanel() { textPanel.classList.add('open'); setTimeout(() => textInput.focus(), 60); }
-function closeTextPanel() { textPanel.classList.remove('open'); textInput.blur(); }
-document.getElementById('btnKeyboard').addEventListener('click', () => {
+const btnKeyboard = document.getElementById('btnKeyboard');
+let textPanelCloseTimer = null;
+function openTextPanel() {
+  if (elementPanel.classList.contains('open')) {
+    closeElementPanel({ restoreFocus: false });
+  }
+  if (flowPanel.classList.contains('open')) {
+    closeFlowPanel({ restoreFocus: false });
+  }
+  clearTimeout(textPanelCloseTimer);
+  textPanel.hidden = false;
+  textPanel.inert = false;
+  // Commit the non-hidden state before animating it into view.
+  void textPanel.offsetHeight;
+  textPanel.classList.add('open');
+  btnKeyboard.setAttribute('aria-expanded', 'true');
+  setTimeout(() => {
+    if (textPanel.classList.contains('open')) textInput.focus();
+  }, 60);
+}
+function closeTextPanel({ restoreFocus = true } = {}) {
+  clearTimeout(textPanelCloseTimer);
+  textPanel.classList.remove('open');
+  textPanel.inert = true;
+  btnKeyboard.setAttribute('aria-expanded', 'false');
+  textInput.blur();
+  if (restoreFocus) btnKeyboard.focus();
+  textPanelCloseTimer = setTimeout(() => {
+    if (!textPanel.classList.contains('open')) textPanel.hidden = true;
+  }, 270);
+}
+btnKeyboard.addEventListener('click', () => {
   textPanel.classList.contains('open') ? closeTextPanel() : openTextPanel();
 });
 document.getElementById('btnTextClose').addEventListener('click', closeTextPanel);
-// close the panel right after a send (additive listeners; sendText already ran)
-document.getElementById('btnSend').addEventListener('click', () => setTimeout(closeTextPanel, 40));
-textInput.addEventListener('keydown', e => { if (e.key === 'Enter') setTimeout(closeTextPanel, 40); });
+textPanel.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeTextPanel();
+  }
+});
+
+const btnElements = document.getElementById('btnElements');
+const elementPanel = document.getElementById('elementPanel');
+const elementStatus = document.getElementById('elementStatus');
+const elementList = document.getElementById('elementList');
+const elementRefresh = document.getElementById('elementRefresh');
+const elementClose = document.getElementById('elementClose');
+const ELEMENTS_REQUEST_TIMEOUT_MS = 36000;
+const ACCESSIBLE_ELEMENT_LIMIT = 100;
+let elementPanelCloseTimer = null;
+let elementRequestController = null;
+let elementRequestGeneration = 0;
+
+function closeElementPanel({ restoreFocus = true } = {}) {
+  clearTimeout(elementPanelCloseTimer);
+  elementRequestGeneration++;
+  if (elementRequestController) {
+    elementRequestController.abort();
+    elementRequestController = null;
+  }
+  elementPanel.classList.remove('open');
+  elementPanel.inert = true;
+  btnElements.classList.remove('active');
+  btnElements.setAttribute('aria-expanded', 'false');
+  if (restoreFocus && !btnElements.disabled) btnElements.focus();
+  elementPanelCloseTimer = setTimeout(() => {
+    if (!elementPanel.classList.contains('open')) elementPanel.hidden = true;
+  }, 270);
+}
+
+function elementFailureText(error) {
+  if (error?.name === 'AbortError') return '读取超时，请确认设备已解锁后重试';
+  switch (error?.code) {
+    case 'device_transition_in_progress':
+      return '设备正在切换连接状态，请稍后刷新';
+    case 'target_not_configured':
+      return '尚未选择 iPhone，请先完成设备设置';
+    case 'wda_source_timeout':
+      return '读取控件超时，请保持 iPhone 解锁和亮屏';
+    case 'wda_source_failed':
+    case 'wda_not_configured':
+      return '当前无法读取 iPhone 控件，请检查设备连接';
+    default:
+      return '控件列表读取失败，请稍后刷新';
+  }
+}
+
+function appendAccessibleElement(row, index, snapshot, duplicateLabels) {
+  const kind = String(row?.kind || 'Element');
+  const rawLabel = String(row?.label || '').trim();
+  const value = row?.value == null ? '' : String(row.value);
+  const label = rawLabel || `${kind} ${index + 1}`;
+  const rect = Array.isArray(row?.rect) ? row.rect.map(Number) : [];
+  const rectValid =
+    rect.length === 4 &&
+    rect.every(Number.isFinite) &&
+    rect[2] > 0 && rect[3] > 0;
+  const uniqueLabel = Boolean(rawLabel && duplicateLabels.get(rawLabel) === 1);
+  const snapshotRefValid = Boolean(rectValid && snapshot);
+  const actionable = uniqueLabel || snapshotRefValid;
+
+  const item = document.createElement('li');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'element-control';
+  button.disabled = !actionable;
+  button.setAttribute(
+    'aria-label',
+    `${label}，${kind}${value ? `，当前值 ${value}` : ''}${actionable ? '' : '，当前不可操作'}`,
+  );
+
+  const labelNode = document.createElement('span');
+  labelNode.className = 'element-label';
+  labelNode.textContent = label;
+  const kindNode = document.createElement('span');
+  kindNode.className = 'element-meta';
+  kindNode.textContent = kind;
+  button.append(labelNode, kindNode);
+  if (value) {
+    const valueNode = document.createElement('span');
+    valueNode.className = 'element-value';
+    valueNode.textContent = `当前值：${value}`;
+    button.append(valueNode);
+  }
+
+  button.addEventListener('click', async () => {
+    if (!actionable || !directControlReady) {
+      toast('设备连接未就绪，请刷新后再试');
+      return;
+    }
+    button.disabled = true;
+    setTextIfChanged(elementStatus, `正在点按「${label}」…`);
+    let action;
+    if (uniqueLabel) {
+      // A unique accessibility label survives layout movement better than an
+      // old coordinate and is resolved fresh immediately before the click.
+      action = { type: 'tap', label: rawLabel };
+    } else {
+      // Duplicate and unlabeled controls are only meaningful inside this exact
+      // element snapshot. The daemon re-reads the tree and refuses the tap if
+      // anything changed; never fall back to stale coordinates.
+      action = { type: 'tap', element: index, snapshot };
+    }
+    const result = await sendControl(action);
+    if (!result.ok) {
+      if (result.failure === 'stale_element_snapshot') {
+        toast(controlFailureText(result, '控件列表已变化，请重新选择'));
+        void loadAccessibleElements();
+        return;
+      }
+      closeElementPanel({ restoreFocus: false });
+      toast(controlFailureText(result, '控件操作失败，请查看设备状态'));
+      return;
+    }
+    closeElementPanel();
+    toast(`已点按「${label}」`);
+  });
+
+  item.append(button);
+  elementList.append(item);
+}
+
+async function loadAccessibleElements() {
+  const generation = ++elementRequestGeneration;
+  if (elementRequestController) elementRequestController.abort();
+  const controller = new AbortController();
+  elementRequestController = controller;
+  const timeout = setTimeout(() => controller.abort(), ELEMENTS_REQUEST_TIMEOUT_MS);
+  elementPanel.setAttribute('aria-busy', 'true');
+  elementRefresh.disabled = true;
+  setTextIfChanged(elementStatus, '正在读取当前 iPhone 控件…');
+  elementList.replaceChildren();
+  try {
+    const response = await fetch('/agent/elements', {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: controller.signal,
+    });
+    if (response.status === 401) {
+      location.replace('/login');
+      return;
+    }
+    const body = await response.json().catch(() => ({}));
+    if (generation !== elementRequestGeneration) return;
+    if (!response.ok) {
+      const error = new Error('elements rejected');
+      error.code = body.error;
+      throw error;
+    }
+    const rows = Array.isArray(body.elements)
+      ? body.elements.slice(0, ACCESSIBLE_ELEMENT_LIMIT)
+      : [];
+    const snapshot = typeof body.snapshot === 'string' ? body.snapshot : '';
+    const duplicateLabels = new Map();
+    for (const row of rows) {
+      const label = String(row?.label || '').trim();
+      if (label) duplicateLabels.set(label, (duplicateLabels.get(label) || 0) + 1);
+    }
+    for (let index = 0; index < rows.length; index++) {
+      appendAccessibleElement(rows[index], index, snapshot, duplicateLabels);
+    }
+    setTextIfChanged(
+      elementStatus,
+      rows.length
+        ? `已读取 ${rows.length} 个控件。选择一项可在 iPhone 上点按`
+        : '当前画面没有可访问控件，请返回 iPhone 后刷新',
+    );
+  } catch (error) {
+    if (generation !== elementRequestGeneration) return;
+    setTextIfChanged(elementStatus, elementFailureText(error));
+  } finally {
+    clearTimeout(timeout);
+    if (generation === elementRequestGeneration) {
+      elementRequestController = null;
+      elementPanel.removeAttribute('aria-busy');
+      elementRefresh.disabled = false;
+    }
+  }
+}
+
+function openElementPanel() {
+  if (backendType !== 'direct' || !directControlReady) {
+    toast('设备连接未就绪，暂时无法读取控件');
+    return;
+  }
+  if (textPanel.classList.contains('open')) {
+    closeTextPanel({ restoreFocus: false });
+  }
+  if (flowPanel.classList.contains('open')) {
+    closeFlowPanel({ restoreFocus: false });
+  }
+  clearTimeout(elementPanelCloseTimer);
+  elementPanel.hidden = false;
+  elementPanel.inert = false;
+  void elementPanel.offsetHeight;
+  elementPanel.classList.add('open');
+  btnElements.classList.add('active');
+  btnElements.setAttribute('aria-expanded', 'true');
+  void loadAccessibleElements();
+  setTimeout(() => {
+    if (elementPanel.classList.contains('open')) elementClose.focus();
+  }, 60);
+}
+
+btnElements.addEventListener('click', () => {
+  elementPanel.classList.contains('open') ? closeElementPanel() : openElementPanel();
+});
+elementRefresh.addEventListener('click', () => { void loadAccessibleElements(); });
+elementClose.addEventListener('click', () => closeElementPanel());
+elementPanel.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeElementPanel();
+  }
+});
 
 const btnImmersive = document.getElementById('btnImmersive');
 const grabber = document.getElementById('grabber');
@@ -1152,13 +4362,31 @@ window.addEventListener('orientationchange', () => setTimeout(syncToolbarReserve
 syncToolbarReserve();
 
 /* ── Status pill dot colour ───────────────────────────────────── */
-/* Reads overlayState + connState directly (more reliable than text scraping). */
+/* Reads backend truth directly rather than scraping the localized label. */
 const connDot = document.querySelector('#statusPill .conn-dot');
 function paintDot() {
   let cls;
-  if (overlayState === 'disconnected' || /(failed|closed|error)/.test(connState)) {
+  if (backendType === 'direct') {
+    if (overlayState === 'status-error' || overlayState === 'offline') {
+      cls = 'bad';
+    } else if (
+      overlayState === 'released' ||
+      overlayState === 'releasing' ||
+      overlayState === 'reconnecting' ||
+      overlayState === 'locked' ||
+      overlayState === 'connecting' ||
+      overlayState === 'frame-stale' ||
+      !backendStatus
+    ) {
+      cls = 'warn';
+    } else if (backendStatus.mode === 'agent' && backendStatus.drivable === true) {
+      cls = 'ok';
+    } else {
+      cls = 'warn';
+    }
+  } else if (overlayState === 'disconnected' || /(failed|closed|error)/.test(connState)) {
     cls = 'bad';
-  } else if (overlayState === 'stalled') {
+  } else if (overlayState === 'stalled' || overlayState === 'queued' || overlayState === 'gone') {
     cls = 'warn';
   } else if (/(connected|completed)/.test(connState)) {
     cls = 'ok';
@@ -1260,14 +4488,28 @@ video.addEventListener('pause', () => {
 video.addEventListener('emptied', () => { _stopStallWatch(); _stopStallChecker(); });
 
 /* ── Boot ─────────────────────────────────────────────────────── */
-document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
-document.addEventListener('contextmenu', e => e.preventDefault());
-video.addEventListener('pause', () => { if (!frozen && !agentMode) playOverlay.classList.remove('hidden'); });
-video.addEventListener('playing', () => { playOverlay.classList.add('hidden'); });
+videoArea.addEventListener('contextmenu', e => e.preventDefault());
+video.addEventListener('pause', () => {
+  if (backendType === 'mirror' && !frozen) showPlayOverlay();
+});
+video.addEventListener('playing', hidePlayOverlay);
 video.addEventListener('stalled', tryPlay);
 video.addEventListener('waiting', tryPlay);
-paintDot();
-connectWs();
+function pollAgentModeOnInterval() {
+  // A hidden Direct tab must not continually trigger action-level WDA probes;
+  // visibilitychange/pageshow performs an authoritative poll before restoring
+  // its feed and input. Mirror keeps its legacy background status behavior.
+  if (backendType === 'direct' && document.visibilityState !== 'visible') return;
+  void pollAgentMode();
+}
+async function boot() {
+  updateModeControls();
+  updateStatusLine();
+  paintDot();
+  await pollAgentMode();
+  setInterval(pollAgentModeOnInterval, 3000);
+}
+void boot();
 </script>
 </body>
 </html>

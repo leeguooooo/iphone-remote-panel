@@ -1,0 +1,1487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>iphone-use · Direct Device 架构与真机验收</title>
+  <style>
+    :root {
+      --bg: #f6f7f5;
+      --surface: #ffffff;
+      --surface-soft: #eef4f2;
+      --fg: #1c2525;
+      --muted: #667170;
+      --faint: #8d9695;
+      --border: #d8dfdd;
+      --border-strong: #aeb9b6;
+      --accent: #0f766e;
+      --accent-dark: #0a5b55;
+      --code-bg: #edf0ef;
+      --shadow: 0 12px 32px rgba(24, 42, 40, .07);
+      --radius: 12px;
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Inter", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--bg);
+    }
+
+    body {
+      margin: 0;
+      color: var(--fg);
+      background: var(--bg);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.68;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    a {
+      color: var(--accent-dark);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    code, pre {
+      font-family: var(--mono);
+    }
+
+    code {
+      padding: .12em .38em;
+      border-radius: 4px;
+      background: var(--code-bg);
+      font-size: .88em;
+    }
+
+    pre {
+      margin: 1rem 0;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--code-bg);
+      font-size: .84rem;
+      line-height: 1.55;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      font-size: inherit;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 2rem));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 4.5rem 0 2.4rem;
+      border-bottom: 1px solid var(--border-strong);
+    }
+
+    .eyebrow {
+      margin: 0 0 .65rem;
+      color: var(--accent-dark);
+      font-family: var(--mono);
+      font-size: .78rem;
+      font-weight: 700;
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.25;
+      letter-spacing: -.02em;
+    }
+
+    h1 {
+      max-width: 880px;
+      margin: 0;
+      font-size: clamp(2.15rem, 5vw, 3.65rem);
+      font-weight: 720;
+    }
+
+    .lede {
+      max-width: 820px;
+      margin: 1.15rem 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      margin-top: 1.35rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: .22rem .66rem;
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: .78rem;
+      font-weight: 650;
+    }
+
+    .badge.primary {
+      border-color: var(--accent);
+      color: var(--accent-dark);
+      background: var(--surface-soft);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 218px minmax(0, 1fr);
+      gap: 2.7rem;
+      align-items: start;
+      padding: 2.2rem 0 5rem;
+    }
+
+    .toc {
+      position: sticky;
+      top: 1.25rem;
+      padding: 1rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, .78);
+      backdrop-filter: blur(10px);
+    }
+
+    .toc strong {
+      display: block;
+      margin-bottom: .55rem;
+      color: var(--muted);
+      font-size: .74rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .toc a {
+      display: block;
+      padding: .28rem .2rem;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: .86rem;
+    }
+
+    .toc a:hover {
+      color: var(--accent-dark);
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    section {
+      scroll-margin-top: 1.2rem;
+      margin-bottom: 3.3rem;
+    }
+
+    h2 {
+      margin: 0 0 1.15rem;
+      padding-bottom: .6rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 1.55rem;
+    }
+
+    h3 {
+      margin: 1.7rem 0 .6rem;
+      font-size: 1.04rem;
+    }
+
+    p {
+      margin: .7rem 0;
+    }
+
+    ul, ol {
+      padding-left: 1.35rem;
+    }
+
+    li + li {
+      margin-top: .34rem;
+    }
+
+    .decision {
+      margin: 1.1rem 0 1.4rem;
+      padding: 1rem 1.1rem;
+      border: 1px solid var(--accent);
+      border-left-width: 4px;
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }
+
+    .decision strong {
+      color: var(--accent-dark);
+    }
+
+    .note {
+      margin: 1rem 0;
+      padding: .85rem 1rem;
+      border-left: 3px solid var(--border-strong);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: .92rem;
+    }
+
+    .note strong {
+      color: var(--fg);
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+
+    .card {
+      padding: 1rem 1.05rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .card p:last-child {
+      margin-bottom: 0;
+    }
+
+    .table-wrap {
+      margin: 1rem 0;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 1px 0 rgba(20, 38, 36, .02);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .91rem;
+    }
+
+    th, td {
+      padding: .7rem .78rem;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      background: #f2f4f3;
+      font-size: .76rem;
+      font-weight: 700;
+      letter-spacing: .035em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    td:first-child {
+      font-weight: 620;
+    }
+
+    .nowrap {
+      white-space: nowrap;
+    }
+
+    .architecture {
+      margin: 1.3rem 0;
+      padding: 1.1rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .architecture figcaption {
+      margin-bottom: .9rem;
+      color: var(--muted);
+      font-size: .82rem;
+      font-weight: 650;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: minmax(130px, .9fr) 34px minmax(160px, 1.2fr) 34px minmax(160px, 1.1fr);
+      gap: .45rem;
+      align-items: stretch;
+    }
+
+    .flow + .flow {
+      margin-top: .75rem;
+      padding-top: .75rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .node {
+      display: flex;
+      min-height: 86px;
+      flex-direction: column;
+      justify-content: center;
+      padding: .72rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fafbfa;
+    }
+
+    .node b {
+      margin-bottom: .18rem;
+      font-size: .9rem;
+    }
+
+    .node span {
+      color: var(--muted);
+      font-size: .76rem;
+      line-height: 1.42;
+    }
+
+    .arrow {
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 1.2rem;
+      font-weight: 800;
+    }
+
+    .boundary {
+      margin-top: .9rem;
+      padding: .72rem .85rem;
+      border: 1px dashed var(--accent);
+      border-radius: 8px;
+      color: var(--accent-dark);
+      background: var(--surface-soft);
+      font-size: .86rem;
+      font-weight: 640;
+    }
+
+    .sequence {
+      margin: 1rem 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: step;
+    }
+
+    .sequence li {
+      position: relative;
+      min-height: 58px;
+      margin: 0;
+      padding: .1rem 0 1.2rem 3rem;
+      counter-increment: step;
+    }
+
+    .sequence li::before {
+      position: absolute;
+      left: 0;
+      top: 0;
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border: 1px solid var(--accent);
+      border-radius: 50%;
+      color: var(--accent-dark);
+      background: var(--surface);
+      content: counter(step);
+      font-family: var(--mono);
+      font-size: .8rem;
+      font-weight: 750;
+    }
+
+    .sequence li::after {
+      position: absolute;
+      left: 16px;
+      top: 34px;
+      bottom: 0;
+      width: 1px;
+      background: var(--border);
+      content: "";
+    }
+
+    .sequence li:last-child::after {
+      display: none;
+    }
+
+    .sequence b {
+      display: block;
+      margin-bottom: .15rem;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: .86rem;
+    }
+
+    .phase-gate {
+      border-top: 3px solid var(--accent);
+    }
+
+    .sources code {
+      white-space: nowrap;
+    }
+
+    footer {
+      padding: 1.7rem 0 3.5rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: .82rem;
+    }
+
+    @media (max-width: 860px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .toc {
+        position: static;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .toc strong {
+        grid-column: 1 / -1;
+      }
+
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .arrow {
+        min-height: 22px;
+        transform: rotate(90deg);
+      }
+    }
+
+    @media (max-width: 620px) {
+      .page {
+        width: min(100% - 1.1rem, 1120px);
+      }
+
+      .hero {
+        padding-top: 2.7rem;
+      }
+
+      .grid-2, .toc {
+        grid-template-columns: 1fr;
+      }
+
+      th, td {
+        padding: .62rem;
+      }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .page { width: 100%; }
+      .layout { display: block; }
+      .toc { display: none; }
+      .hero { padding-top: 1rem; }
+      .card, .architecture, .table-wrap { box-shadow: none; break-inside: avoid; }
+      section { break-inside: auto; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="page">
+      <p class="eyebrow">iphone-use / Architecture &amp; Acceptance</p>
+      <h1>Direct Device 架构与真机验收</h1>
+      <p class="lede">
+        当前默认链路是 WebDriverAgent 输入与 WDA MJPEG 画面。浏览器通过守护进程控制手机，
+        不读取 Mac 屏幕，也不向 Mac 注入事件。本文记录现有实现、迁移步骤和可执行验收条件。
+      </p>
+      <div class="meta" aria-label="文档状态">
+        <span class="badge primary">Phase 1 · 已实现，待逐机验收</span>
+        <span class="badge">Phase 2 · 研究闸门，未实现</span>
+        <span class="badge">工作树基线 · 2026-07-28</span>
+        <span class="badge">默认 backend · direct</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="page layout">
+    <nav class="toc" aria-label="目录">
+      <strong>目录</strong>
+      <a href="#decision">决策边界</a>
+      <a href="#current">当前架构</a>
+      <a href="#contract">控制契约</a>
+      <a href="#state">状态模型</a>
+      <a href="#security">安全边界</a>
+      <a href="#migration">迁移顺序</a>
+      <a href="#lifecycle">安装与生命周期</a>
+      <a href="#acceptance">真机验收矩阵</a>
+      <a href="#commands">现场检查命令</a>
+      <a href="#limits">已知限制</a>
+      <a href="#phase2">Phase 2 闸门</a>
+      <a href="#sources">实现依据</a>
+    </nav>
+
+    <main>
+      <section id="decision">
+        <h2>决策边界</h2>
+        <div class="decision">
+          <strong>Direct 失败时不得退回 Mirroring。</strong>
+          WDA 不可用、请求无效或设备已释放时，服务返回失败；Mac 侧的 ScreenCaptureKit、
+          CGEvent 和 iPhone Mirroring 路径保持关闭。
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>问题</th>
+                <th>当前决定</th>
+                <th>验收证据</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>默认后端</td>
+                <td><code>direct</code>。服务端遇到未设置或未知值也选 direct；安装器遇到未知值会直接报错。</td>
+                <td><code>/agent/status.backend == "direct"</code>，启动日志写出 <code>backend: direct</code>。</td>
+              </tr>
+              <tr>
+                <td>画面与输入</td>
+                <td>Phase 1 使用 WDA 的 MJPEG 与 WDA actions。画面与控制共享同一台手机，但经不同的 loopback relay。</td>
+                <td><code>127.0.0.1:8100/status</code> 可用；<code>/agent/mjpeg</code> 持续返回 multipart 帧；控制请求收到 ACK。</td>
+              </tr>
+              <tr>
+                <td>旧路径</td>
+                <td>只有显式设置 <code>PHONE_REMOTE_BACKEND=mirror</code> 才启用 legacy Mirroring。</td>
+                <td>Direct 模式不启动 TCC preflight、AppKit、ScreenCaptureKit pipeline 或 CGEvent injector。</td>
+              </tr>
+              <tr>
+                <td>Phase 2</td>
+                <td>仅评估 iOS ScreenCaptureKit companion app。当前仓库没有 companion target，也没有 entitlement 可用性证据。</td>
+                <td>Xcode、iOS 27 真机和 entitlement 三道闸门全部通过后，才允许进入实现评审。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="note">
+          <strong>“已实现”不等于“已在每台目标机验收”。</strong>
+          Phase 1 已有代码和安装链路；发布结论仍要附上本文矩阵中的真机证据。源码检查、单元测试和
+          “进程在跑”都不能替代画面、输入、锁屏恢复与卸载检查。
+        </aside>
+      </section>
+
+      <section id="current">
+        <h2>当前架构</h2>
+
+        <figure class="architecture">
+          <figcaption>Phase 1：浏览器只连接 iphone-use daemon；WDA 端口不暴露给 LAN。</figcaption>
+          <div class="flow" aria-label="画面链路">
+            <div class="node">
+              <b>iPhone Safari</b>
+              <span><code>&lt;img src="/agent/mjpeg"&gt;</code><br>同源 session cookie</span>
+            </div>
+            <div class="arrow" aria-hidden="true">→</div>
+            <div class="node">
+              <b>iphone-use daemon</b>
+              <span>鉴权、代理 MJPEG<br>PNG fallback：<code>/agent/screenshot</code></span>
+            </div>
+            <div class="arrow" aria-hidden="true">→</div>
+            <div class="node">
+              <b>WDA on iPhone</b>
+              <span>设备端 MJPEG :9100<br>Mac loopback relay :9100</span>
+            </div>
+          </div>
+          <div class="flow" aria-label="控制链路">
+            <div class="node">
+              <b>iPhone Safari</b>
+              <span><code>POST /control</code><br><code>X-Phone-Control: 1</code></span>
+            </div>
+            <div class="arrow" aria-hidden="true">→</div>
+            <div class="node">
+              <b>iphone-use daemon</b>
+              <span>校验 backend、状态与消息<br>只在成功后返回 <code>{"ok":true}</code></span>
+            </div>
+            <div class="arrow" aria-hidden="true">→</div>
+            <div class="node">
+              <b>WDA actions</b>
+              <span>设备坐标、文字、按键、手势<br>Mac loopback relay :8100</span>
+            </div>
+          </div>
+          <div class="boundary">
+            Direct 的 Mac 侧边界：NullPipeline + null injector；不枚举 Mirroring 窗口，不抓 Mac 屏幕，不移动 Mac 光标，不请求 Screen Recording 或 Accessibility。
+          </div>
+        </figure>
+
+        <div class="grid-2">
+          <article class="card">
+            <h3>画面</h3>
+            <p>
+              默认画面来自 WDA MJPEG。<code>setup-wda.sh</code> 把设备端 :9100 转发到
+              <code>127.0.0.1:9100</code>，daemon 再通过 <code>/agent/mjpeg</code> 代理给浏览器。
+            </p>
+            <p>
+              MJPEG relay 是 best-effort。它失效时，浏览器每 2.5 秒请求一次 WDA PNG 截图；
+              控制链路可以继续工作。降级画面不能冒充实时画面。
+            </p>
+          </article>
+          <article class="card">
+            <h3>控制</h3>
+            <p>
+              Direct 浏览器不建立 <code>/ws</code>、RTCPeerConnection 或 WebRTC data channel。
+              每个完整手势在 pointer-up 后变成一次 HTTP 请求。
+            </p>
+            <p>
+              tap、longpress、swipe、drag、text、key、keyboard、Home、Back 和 Spotlight
+              走 WDA。Mirroring 时代的连续 down/move/up 协议在 direct 中不接受。
+            </p>
+          </article>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>维度</th>
+                <th>Direct（默认）</th>
+                <th>Mirror（兼容模式）</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>选择方式</td>
+                <td>未设置、<code>direct</code> 或服务端未知值</td>
+                <td>仅支持显式 <code>PHONE_REMOTE_BACKEND=mirror</code></td>
+              </tr>
+              <tr>
+                <td>画面</td>
+                <td>WDA MJPEG；失败后 WDA PNG 降级</td>
+                <td>ScreenCaptureKit → VideoToolbox H.264 → WebRTC</td>
+              </tr>
+              <tr>
+                <td>输入</td>
+                <td><code>POST /control</code> → WDA action</td>
+                <td>WebRTC data channel → CGEvent</td>
+              </tr>
+              <tr>
+                <td>Mac 权限</td>
+                <td>不需要 Screen Recording / Accessibility</td>
+                <td>两项 TCC 都需要</td>
+              </tr>
+              <tr>
+                <td>失败行为</td>
+                <td>返回 4xx/503；不碰 Mac</td>
+                <td>只在用户明确选择后维持旧逻辑</td>
+              </tr>
+              <tr>
+                <td>App Switcher</td>
+                <td>不支持</td>
+                <td>保留旧 L3 shortcut</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="contract">
+        <h2>浏览器控制契约</h2>
+        <p>
+          浏览器发出的 direct 控制必须满足四个条件：同源登录 cookie 有效、请求头
+          <code>X-Phone-Control: 1</code> 存在、backend 是 direct、WDA 成功执行动作。
+          客户端只有在 HTTP 成功且 JSON 为 <code>{"ok":true}</code> 时才能展示成功反馈。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>HTTP</th>
+                <th>响应</th>
+                <th>含义与客户端行为</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="nowrap"><code>200</code></td>
+                <td><code>{"ok":true}</code></td>
+                <td>WDA 调用返回成功。客户端可给出成功反馈；端到端验收还要观察手机界面发生预期变化。</td>
+              </tr>
+              <tr>
+                <td><code>400</code></td>
+                <td><code>invalid_control_message</code></td>
+                <td>body 不是对象或消息结构无效。不得重试成其他 backend。</td>
+              </tr>
+              <tr>
+                <td><code>401</code></td>
+                <td><code>unauthorized</code></td>
+                <td>session cookie 无效。回到登录流程，不显示“设备离线”。</td>
+              </tr>
+              <tr>
+                <td><code>403</code></td>
+                <td><code>missing_control_header</code></td>
+                <td>缺少 CSRF 防护头。修复客户端请求，不放宽服务端。</td>
+              </tr>
+              <tr>
+                <td><code>409</code></td>
+                <td><code>legacy_mirror_uses_webrtc</code></td>
+                <td>当前是 mirror。HTTP direct endpoint 不接管旧 data channel。</td>
+              </tr>
+              <tr>
+                <td><code>422</code></td>
+                <td><code>unsupported_control</code></td>
+                <td>WDA 可操作，但动作不支持。Switcher 属于这一类。</td>
+              </tr>
+              <tr>
+                <td><code>503</code></td>
+                <td><code>released</code>、<code>wda_not_configured</code> 或 <code>wda_unavailable</code></td>
+                <td>停止成功提示。released 由用户点“重新连接”；其余检查 WDA runner、relay、锁屏与签名。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="note">
+          <strong>网络超时、非 JSON 响应和 <code>ok !== true</code> 都算失败。</strong>
+          不允许“请求已经发出”就画点击圆点、清空文字输入框或弹出成功 toast。当前 web client 的
+          direct 分支按 ACK 更新反馈；验收时要覆盖失败分支。
+        </aside>
+      </section>
+
+      <section id="state">
+        <h2>四轴状态模型</h2>
+        <p>
+          backend、device、screen 和 control 要分开记录。任意一轴正常都不能替其他轴背书。
+          当前 <code>/agent/status</code> 已输出前三轴的一部分；control 没有独立字段，必须由
+          <code>wda_actionable</code>、<code>drivable</code> 和单次 ACK 推导。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>轴</th>
+                <th>当前字段 / 值</th>
+                <th>如何解释</th>
+                <th>不能推导什么</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>backend</td>
+                <td><code>backend: direct | mirror</code></td>
+                <td>进程启动时确定，健康探测抖动不会改变。浏览器取不到 status 时默认 direct，并停止 mirror transport。</td>
+                <td><code>direct</code> 不代表 WDA 或画面在线。</td>
+              </tr>
+              <tr>
+                <td>device</td>
+                <td><code>device_state: ready | locked | blocked | offline | released</code></td>
+                <td>
+                  released 优先；之后依次看 <code>wda_actionable</code>、<code>wda_locked</code>、
+                  <code>wda</code>。<code>mode=agent</code> 只说明 WDA runner 可达，不保证它能操作。
+                </td>
+                <td><code>wda=true</code> 可能是 locked 或 zombie ready。</td>
+              </tr>
+              <tr>
+                <td>screen</td>
+                <td>Direct 当前只返回 <code>screen_state: waiting | offline</code></td>
+                <td>
+                  WDA 可达时是 waiting，否则 offline。真实画面要看 MJPEG 是否持续出帧；
+                  MJPEG 失败而 PNG 可用时，验收记录为 degraded。
+                </td>
+                <td><code>waiting</code> 不是 live 证明，也不表示帧在更新。</td>
+              </tr>
+              <tr>
+                <td>control</td>
+                <td>当前没有 <code>control_state</code> 字段</td>
+                <td>
+                  候选 ready 条件是 direct、未 released、<code>wda_actionable=true</code>；
+                  最终以每次 <code>POST /control</code> 的 <code>{"ok":true}</code> 和手机可见结果为准。
+                </td>
+                <td><code>drivable=true</code> 不能证明某个具体动作已执行。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Direct 状态组合</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>条件</th>
+                <th>device</th>
+                <th>screen API</th>
+                <th>control</th>
+                <th>用户界面</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>released=true</code></td>
+                <td>released</td>
+                <td>不作为画面证据</td>
+                <td>503 released</td>
+                <td>显示“手机已交还给你”，由用户重新连接。</td>
+              </tr>
+              <tr>
+                <td><code>wda_actionable=true</code></td>
+                <td>ready</td>
+                <td>waiting</td>
+                <td>按动作 ACK 判定</td>
+                <td>连接 MJPEG；成功出帧后才算 screen live。</td>
+              </tr>
+              <tr>
+                <td><code>wda_locked=true</code></td>
+                <td>locked</td>
+                <td>waiting</td>
+                <td>503 或动作失败</td>
+                <td>要求解锁并保持唤醒，不退回 Mirroring。</td>
+              </tr>
+              <tr>
+                <td><code>wda=true</code>，但不可操作</td>
+                <td>blocked</td>
+                <td>waiting</td>
+                <td>503 wda_unavailable</td>
+                <td>重启 direct device service，检查 Code=41、CoreDevice tunnel。</td>
+              </tr>
+              <tr>
+                <td><code>wda=false</code></td>
+                <td>offline</td>
+                <td>offline</td>
+                <td>503</td>
+                <td>检查 WDA、8100/9100 relay 与签名，不启动 mirror。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="security">
+        <h2>安全边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>边界</th>
+                <th>要求</th>
+                <th>失败方式</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Mac 权限</td>
+                <td>Direct 不调用 TCC preflight，不加载 AppKit，不构造 ScreenCaptureKit pipeline 或 CGEvent sink。</td>
+                <td>任何 direct 启动中的 Screen Recording / Accessibility 提示都算回归。</td>
+              </tr>
+              <tr>
+                <td>后端选择</td>
+                <td>只有 <code>PHONE_REMOTE_BACKEND=mirror</code> 可进入 legacy。状态读取失败时，web client 留在 direct。</td>
+                <td>不得因 WDA、MJPEG、status 或控制失败而自动切换。</td>
+              </tr>
+              <tr>
+                <td>WDA 暴露面</td>
+                <td>
+                  Mac 的 8100/9100 <code>iproxy</code> relay 必须只绑定
+                  <code>127.0.0.1</code>，且都指向同一 UDID。WDA 自身没有鉴权；
+                  loopback relay 不能阻止同一可路由网络上的主机直连手机端 WDA。
+                </td>
+                <td>
+                  发现 relay 监听 <code>0.0.0.0</code>、控制/画面目标不一致，或手机处于不可信网络时停止验收。
+                  Phase 1 只用于可信隔离网络；必要时关闭手机 Wi‑Fi。
+                </td>
+              </tr>
+              <tr>
+                <td>浏览器鉴权</td>
+                <td>安装器为 LAN 模式生成或复用密码；<code>/control</code> 使用 session cookie 和自定义请求头。</td>
+                <td>未登录请求必须 401，缺头请求必须 403。</td>
+              </tr>
+              <tr>
+                <td>Agent 鉴权</td>
+                <td>配置 <code>PHONE_REMOTE_AGENT_TOKEN</code> 时，机器调用只接受专用 bearer；否则沿用密码。</td>
+                <td>不要把 token、密码或 live cookie 写进日志和验收附件。</td>
+              </tr>
+              <tr>
+                <td>空闲释放</td>
+                <td>默认空闲窗口后停止 WDA，把手机交还用户；有 live stream 时不释放。</td>
+                <td>released 状态下控制必须 503，不能在后台悄悄重启或注入。</td>
+              </tr>
+              <tr>
+                <td>WDA 所有权</td>
+                <td>
+                  只有 installer 管理的 loopback supervisor 可设置
+                  <code>PHONE_REMOTE_WDA_MANAGED=true</code>。自定义或远程 WDA 是 external。
+                </td>
+                <td>external endpoint 不得触发本机 stop、idle release 或 bootstrap；状态要明确由操作者恢复。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="migration">
+        <h2>从 Mirroring 迁移到 Direct</h2>
+        <p>
+          安装器会保留现有 plist 中的 backend。旧安装已经写入 mirror 时，仅重跑安装命令不会迁移；
+          必须显式传入 direct。
+        </p>
+
+        <ol class="sequence">
+          <li>
+            <b>记录回滚点</b>
+            记录当前 release、backend、端口、设备 UDID 和两条 launchd label。密码与 token 只确认“存在”，不要复制进文档。
+          </li>
+          <li>
+            <b>准备目标设备</b>
+            在 Xcode 登录 Apple ID；完成配对、Developer Mode 和开发者信任。第一次设置保持 USB、解锁和亮屏，并明确
+            <code>WDA_UDID</code>，避免多设备自动选择。
+          </li>
+          <li>
+            <b>显式安装 direct</b>
+            <pre><code>PHONE_REMOTE_BACKEND=direct \
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+            安装器会停止旧 daemon、保留密码和受支持的配置，并写入 loopback WDA endpoints。WDA 尚未验证时，
+            direct daemon 仍启动其 HTTP/登录/状态控制面，但明确报告设备层 offline；不会假装 WDA 已就绪。
+          </li>
+          <li>
+            <b>建立 WDA 与两条 relay</b>
+            <pre><code>~/.iphone-use/setup-wda.sh doctor
+~/.iphone-use/setup-wda.sh</code></pre>
+            setup 必须验证 8100 控制 relay，把 runner 交给独立的
+            <code>com.leeguoo.iphone-use.wda</code> LaunchAgent，再启动产品 daemon。9100 MJPEG relay
+            也必须由本次进程持有、绑定 loopback，并指向同一 UDID；失败时不得把任意已有 listener
+            写成可用画面 URL。运行中断流时，浏览器才降级为静帧并退避重试实时流。
+          </li>
+          <li>
+            <b>跑完真机矩阵</b>
+            至少验证无 TCC、无 Mirroring、实时画面、文字、tap、longpress、swipe、Home、Spotlight、锁屏、
+            idle release、重连和卸载。Switcher 按“已知不支持”验收。
+          </li>
+          <li>
+            <b>关闭旧权限</b>
+            Direct 证据完整后，再在系统设置撤销 iPhoneUse 的 Screen Recording 与 Accessibility。
+            撤权后重跑一遍 direct 启动、画面和控制，证明旧权限不是隐性依赖。
+          </li>
+        </ol>
+
+        <h3>回滚到 mirror</h3>
+        <p>
+          回滚是人工选择，不是运行时 fallback。先停 WDA supervisor、runner 和 relay，再显式安装 mirror：
+        </p>
+        <pre><code>~/.iphone-use/setup-wda.sh stop
+PHONE_REMOTE_BACKEND=mirror \
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+        <p class="small">
+          回滚后重新授予并验证 Screen Recording 与 Accessibility。仅看到 daemon loaded 不算回滚完成。
+        </p>
+      </section>
+
+      <section id="lifecycle">
+        <h2>安装、升级与卸载要求</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>阶段</th>
+                <th>必须做到</th>
+                <th>完成证据</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>全新安装</td>
+                <td>
+                  由已登录的 GUI 用户执行，不用 root。准备 Xcode/Apple ID、配对、Developer Mode、
+                  <code>iproxy</code>。支持路径只用 USB loopback，不自动回退 Wi‑Fi 或
+                  <code>socat</code>。默认写入 direct 与受管 loopback endpoints。
+                </td>
+                <td>两个 LaunchAgent 状态明确；8100 可用；daemon HTTP 可用；没有 TCC 提示。</td>
+              </tr>
+              <tr>
+                <td>升级</td>
+                <td>
+                  配置优先级保持“显式环境变量 &gt; 现有 plist &gt; 默认值”；不能轮换既有密码，不能丢失
+                  backend、UDID、WDA endpoints 或 agent token。每次升级刷新
+                  <code>~/.iphone-use/setup-wda.sh</code>。
+                </td>
+                <td>升级前后 status 中 backend/设备一致；新二进制版本正确；WDA supervisor 接管后的替代 runner 可用。</td>
+              </tr>
+              <tr>
+                <td>签名续期</td>
+                <td>免费 Apple ID profile 可能约 7 天到期。WDA 失效时重新运行 setup，不得切换到 mirror 掩盖问题。</td>
+                <td>WDA app 能启动，8100 status 和 action-level probe 都成功。</td>
+              </tr>
+              <tr>
+                <td>停止</td>
+                <td><code>setup-wda.sh stop</code> 要停 WDA supervisor、runner、8100/9100 relay；daemon 单独 bootout。</td>
+                <td>两个 launchd job 不存在，相关进程与监听端口消失。</td>
+              </tr>
+              <tr>
+                <td>完整卸载</td>
+                <td>
+                  移除两个 LaunchAgent plist、<code>iPhoneUse.app</code>、产品日志和
+                  <code>~/.iphone-use</code>。如不再需要，在手机上删除 WDA runner。共享的 Xcode、
+                  Homebrew 和 iproxy 不应自动删除；操作者自行安装的实验性 socat 也不在卸载范围。
+                </td>
+                <td>重登后 job 不复活；44321/8100/9100 不监听；手机端 runner 按用户选择清除。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="note">
+          <strong>安装包现在包含 ownership-gated、幂等的完整卸载器。</strong>
+          它只删除能够证明属于 iphone-use 的 LaunchAgent、PID 记录、应用、日志和状态；
+          遇到进程身份、路径或仓库状态不明时会保留恢复证据并以非零状态退出。
+          默认不会动手机上的 WDA runner，也不会删除 Xcode、Homebrew、iproxy 或 socat。
+        </aside>
+
+        <h3>完整卸载</h3>
+        <pre><code># 先预览；不修改进程、文件、应用或手机。
+~/.iphone-use/uninstall.sh --dry-run
+
+# 只卸载当前 Mac 用户下、经 ownership 校验的本机组件。
+~/.iphone-use/uninstall.sh
+
+# 如需同时删除手机 runner，必须显式给出目标设备和已安装 bundle id。
+~/.iphone-use/uninstall.sh --remove-phone-runner \
+  --udid '&lt;exact-iphone-udid&gt;' \
+  --bundle-id '&lt;installed-runner-bundle-id&gt;'</code></pre>
+        <p class="small">
+          卸载器拒绝 root、非规范 HOME、符号链接命名空间、脏的 WDA checkout 和无法核验的活动 PID。
+          失败时不要手动批量删除保留文件；先按错误输出核对进程与归属，再重试。
+        </p>
+      </section>
+
+      <section id="acceptance">
+        <h2>真机验收矩阵</h2>
+        <p>
+          每一行都要记录设备型号、iOS、macOS、Xcode、连接方式、构建版本、时间和实际结果。
+          “通过”需要表内证据，不能用另一行的结果代替。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>场景</th>
+                <th>操作</th>
+                <th>预期</th>
+                <th>证据</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>D01</td>
+                <td>无 Mirroring</td>
+                <td>退出 iPhone Mirroring，启动 direct。</td>
+                <td>daemon、画面、WDA 控制可用；不自动打开 Mirroring。</td>
+                <td>status JSON、进程列表、浏览器录屏。</td>
+              </tr>
+              <tr>
+                <td>D02</td>
+                <td>无 TCC</td>
+                <td>在测试机撤销 Screen Recording 与 Accessibility，重启 daemon。</td>
+                <td>无权限提示；direct 仍能看和控制。</td>
+                <td>系统设置截图、启动日志、操作录像。</td>
+              </tr>
+              <tr>
+                <td>D03</td>
+                <td>默认选择</td>
+                <td>全新安装，不传 backend。</td>
+                <td><code>backend=direct</code>；安装器不打开 TCC 设置。</td>
+                <td>live plist、安装日志、status。</td>
+              </tr>
+              <tr>
+                <td>D04</td>
+                <td>旧安装迁移</td>
+                <td>从 persisted mirror 运行显式 direct 安装和 setup。</td>
+                <td>旧 daemon 停止；WDA 验证后新 daemon 加载；密码不变。</td>
+                <td>升级前后 plist 摘要、launchctl、登录验证。</td>
+              </tr>
+              <tr>
+                <td>D05</td>
+                <td>实时画面</td>
+                <td>在手机上持续滚动 10 秒。</td>
+                <td>MJPEG 连续更新，无周期性整屏停顿；screen 记为 live。</td>
+                <td>Safari 录屏、响应 Content-Type、接收字节增长。</td>
+              </tr>
+              <tr>
+                <td>D06</td>
+                <td>画面降级</td>
+                <td>只中断 9100 relay，保留 8100。</td>
+                <td>约 2.5 秒 PNG 刷新；页面明确不是实时；控制仍成功。</td>
+                <td>页面录屏、9100 失败、两次不同 PNG、控制 ACK。</td>
+              </tr>
+              <tr>
+                <td>D07</td>
+                <td>基础控制</td>
+                <td>执行 tap、longpress、swipe、drag、Home、Back、Spotlight。</td>
+                <td>每次先收到 <code>{"ok":true}</code>，手机随后出现对应变化。</td>
+                <td>请求/响应与前后画面对照。</td>
+              </tr>
+              <tr>
+                <td>D08</td>
+                <td>文字输入</td>
+                <td>在文本框输入 ASCII、中文、emoji，再收起键盘。</td>
+                <td>字符不丢失、不重复；输入成功后才清空网页文本框。</td>
+                <td>手机结果截图、浏览器网络记录。</td>
+              </tr>
+              <tr>
+                <td>D09</td>
+                <td>错误 ACK</td>
+                <td>未登录、删掉控制头、发送无效 JSON。</td>
+                <td>依次得到 401、403、400；页面不画成功反馈。</td>
+                <td>HTTP 状态与页面录像。</td>
+              </tr>
+              <tr>
+                <td>D10</td>
+                <td>WDA 不可用</td>
+                <td>停 WDA supervisor 后发送控制。</td>
+                <td>503；Mac 光标、焦点、屏幕采集均无变化；backend 仍是 direct。</td>
+                <td>HTTP、status、Mac 录屏、无 CGEvent 进程证据。</td>
+              </tr>
+              <tr>
+                <td>D11</td>
+                <td>锁屏与 zombie</td>
+                <td>锁屏；再制造 runner 可达但 action probe 失败的状态。</td>
+                <td>device 分别显示 locked/blocked；<code>drivable=false</code>；提示要求解锁或重启。</td>
+                <td>两份 status JSON、恢复时间。</td>
+              </tr>
+              <tr>
+                <td>D12</td>
+                <td>空闲释放</td>
+                <td>按配置时长停止操作且关闭 live stream。</td>
+                <td><code>released=true</code>；控制 503；点“重新连接”后 WDA 恢复。</td>
+                <td>释放前后 status、launchctl、恢复录像。</td>
+              </tr>
+              <tr>
+                <td>D13</td>
+                <td>状态接口失联</td>
+                <td>让 <code>/agent/status</code> 临时失败。</td>
+                <td>web client 保持 direct、停止 mirror transport、显示状态错误。</td>
+                <td>浏览器网络记录；无 <code>/ws</code> 或 PeerConnection。</td>
+              </tr>
+              <tr>
+                <td>D14</td>
+                <td>Switcher</td>
+                <td>检查 direct 工具栏并发送 switcher 负向请求。</td>
+                <td>按钮隐藏或提示改用“搜索”；服务返回 unsupported，不假成功。</td>
+                <td>页面截图、422 响应。</td>
+              </tr>
+              <tr>
+                <td>D15</td>
+                <td>多设备稳定性</td>
+                <td>连接两台已配对设备，重启 WDA 和 daemon。</td>
+                <td>始终使用已固定 UDID；不因重连静默换手机。</td>
+                <td>配置 UDID、两次 status 与设备画面。</td>
+              </tr>
+              <tr>
+                <td>D16</td>
+                <td>完整卸载</td>
+                <td>按 lifecycle 清单卸载并重新登录。</td>
+                <td>两个 job 不复活；44321/8100/9100 不监听；App、plist、日志和状态目录已清理。</td>
+                <td>launchctl、lsof、文件检查、手机 runner 检查。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="commands">
+        <h2>现场检查命令</h2>
+        <p>以下命令不打印 token。运行结束后清空 shell 变量和临时 cookie。</p>
+
+        <h3>1. 后端、设备与 WDA</h3>
+        <pre><code>DAEMON_PLIST="$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.plist"
+TOKEN="$(/usr/libexec/PlistBuddy \
+  -c 'Print :EnvironmentVariables:PHONE_REMOTE_AGENT_TOKEN' \
+  "$DAEMON_PLIST" 2&gt;/dev/null || true)"
+[ -n "$TOKEN" ] || TOKEN="$(/usr/libexec/PlistBuddy \
+  -c 'Print :EnvironmentVariables:PHONE_REMOTE_PASSWORD' \
+  "$DAEMON_PLIST")"
+
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:44321/agent/status |
+  jq '{backend,mode,device_state,screen_state,wda,wda_actionable,wda_locked,
+       drivable,released,hint}'
+
+curl -fsS http://127.0.0.1:8100/status &gt;/dev/null
+launchctl print "gui/$(id -u)/com.leeguoo.iphone-use"
+launchctl print "gui/$(id -u)/com.leeguoo.iphone-use.wda"</code></pre>
+
+        <h3>2. 浏览器 cookie 与控制 ACK</h3>
+        <pre><code>COOKIE_JAR="$(mktemp)"
+PASSWORD="$(/usr/libexec/PlistBuddy \
+  -c 'Print :EnvironmentVariables:PHONE_REMOTE_PASSWORD' \
+  "$DAEMON_PLIST")"
+
+curl -sS -c "$COOKIE_JAR" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode "password=$PASSWORD" \
+  http://127.0.0.1:44321/login &gt;/dev/null
+
+curl -fsS -b "$COOKIE_JAR" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Phone-Control: 1' \
+  -d '{"type":"shortcut","name":"home"}' \
+  http://127.0.0.1:44321/control |
+  jq -e '.ok == true'</code></pre>
+
+        <h3>3. MJPEG 与 loopback 监听</h3>
+        <pre><code># 流式请求在 5 秒后超时是预期的；期间应收到 multipart 响应和非零字节。
+curl -sS -b "$COOKIE_JAR" --max-time 5 -D /tmp/iphone-use-mjpeg.headers \
+  http://127.0.0.1:44321/agent/mjpeg \
+  -o /tmp/iphone-use-mjpeg.sample || true
+grep -i '^content-type:.*multipart' /tmp/iphone-use-mjpeg.headers
+test -s /tmp/iphone-use-mjpeg.sample
+
+lsof -nP -iTCP:8100 -sTCP:LISTEN
+lsof -nP -iTCP:9100 -sTCP:LISTEN
+# 两条 relay 的 Local Address 必须是 127.0.0.1，不是 0.0.0.0。</code></pre>
+
+        <h3>4. 收尾</h3>
+        <pre><code>rm -f "$COOKIE_JAR" \
+  /tmp/iphone-use-mjpeg.headers \
+  /tmp/iphone-use-mjpeg.sample
+unset TOKEN PASSWORD COOKIE_JAR</code></pre>
+      </section>
+
+      <section id="limits">
+        <h2>已知限制</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>限制</th>
+                <th>当前行为</th>
+                <th>处理方式</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>App Switcher</td>
+                <td>WDA 无法合成 home-indicator 系统手势，也没有可点的 WDA element。Direct 不支持。</td>
+                <td>工具栏隐藏 Switcher，提示用 Spotlight 打开其他 App；不得返回假成功。</td>
+              </tr>
+              <tr>
+                <td>WDA 与 Mirroring 互斥</td>
+                <td>WDA runner 启动会断开 Mirroring，反向也成立。</td>
+                <td>Direct 验收不依赖 Mirroring；回滚前先停 WDA。</td>
+              </tr>
+              <tr>
+                <td>锁屏与休眠</td>
+                <td>runner 可能仍回答 status，但所有 action 失败。</td>
+                <td>看 <code>wda_actionable</code> 和 <code>wda_locked</code>，不要只看 <code>wda</code>。</td>
+              </tr>
+              <tr>
+                <td>签名有效期</td>
+                <td>免费 Apple ID 的 WDA profile 可能约 7 天到期。</td>
+                <td>重跑 setup；发布/长期设备使用稳定签名配置。</td>
+              </tr>
+              <tr>
+                <td>MJPEG relay</td>
+                <td>setup 必须证明 9100 listener 属于本次受管进程、只绑定 loopback、并与 8100 指向同一 UDID。</td>
+                <td>setup 失败时不得继续发布错误 URL；运行期断流时页面降级到 2.5 秒 WDA PNG，并退避重试实时流。</td>
+              </tr>
+              <tr>
+                <td>CoreDevice tunnel</td>
+                <td>睡眠、USB 抖动或 VPN/WARP 可能让 devicectl 卡住或产生 zombie session。</td>
+                <td>setup 对 devicectl 有超时；由 WDA supervisor 重建，验收记录恢复时间。</td>
+              </tr>
+              <tr>
+                <td>screen_state 粒度</td>
+                <td>Direct 当前只报告 waiting/offline，不能表示 live/degraded。</td>
+                <td>用实际帧观测补齐证据；若以后扩展 API，要保持向后兼容。</td>
+              </tr>
+              <tr>
+                <td>完整卸载</td>
+                <td>卸载器只清理 ownership 可证实的本机组件；手机 runner 需要显式 UDID 与 bundle id。</td>
+                <td>先执行 dry-run，再卸载并验证重登后 job 不复活、端口不监听；需要时单独核验手机 runner 已删除。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="phase2" class="phase-gate">
+        <h2>Phase 2：iOS ScreenCaptureKit companion app 研究闸门</h2>
+        <div class="decision">
+          <strong>当前状态：未实现，也未承诺可行。</strong>
+          Phase 2 只研究新的设备端画面来源。WDA input 继续保留，除非另一个独立项目证明了可替代的输入方案。
+        </div>
+
+        <p>
+          不在文档中猜 entitlement 名称，也不根据 simulator、头文件片段或 WWDC 演示宣布可用。
+          进入实现评审前，下表每一项都要有 Xcode 和 iOS 27 真机证据。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>闸门</th>
+                <th>要回答的问题</th>
+                <th>通过证据</th>
+                <th>失败处理</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>P2-1 工具链</td>
+                <td>目标 Xcode 是否包含可编译、可签名的 iOS 27 SDK 接口？</td>
+                <td>最小 target 在指定 Xcode 上 clean build，API availability 明确。</td>
+                <td>停止研究，不用私有 header 或弱链接绕过。</td>
+              </tr>
+              <tr>
+                <td>P2-2 Entitlement</td>
+                <td>第三方开发者能否获得所需 entitlement，并写入目标设备接受的 provisioning profile？</td>
+                <td>签名检查显示 entitlement；真机安装和启动成功；不是 simulator 结果。</td>
+                <td>判定不可交付，不落 companion 生产代码。</td>
+              </tr>
+              <tr>
+                <td>P2-3 用户授权</td>
+                <td>用户需要看到什么授权、录制提示或系统 UI？能否清楚停止采集？</td>
+                <td>首启、拒绝、允许、撤销四条路径录像和状态记录。</td>
+                <td>不能清楚授权或停止时，不进入产品。</td>
+              </tr>
+              <tr>
+                <td>P2-4 真机采集</td>
+                <td>前台、后台、锁屏、受保护内容、旋转与多窗口下分别能捕获什么？</td>
+                <td>iOS 27 真机帧样本、时间戳、尺寸、像素格式、失败码和系统提示。</td>
+                <td>把限制写进状态模型；不能用黑帧或旧帧冒充 live。</td>
+              </tr>
+              <tr>
+                <td>P2-5 性能</td>
+                <td>延迟、帧率、功耗、温升和内存是否比 WDA MJPEG 有明确收益？</td>
+                <td>同设备、同场景 A/B 数据，包含持续运行与旋转。</td>
+                <td>收益不成立时继续使用 Phase 1。</td>
+              </tr>
+              <tr>
+                <td>P2-6 传输安全</td>
+                <td>companion 如何与 Mac 配对、鉴权、撤销和升级？是否新增 LAN 暴露面？</td>
+                <td>威胁模型、最小权限、密钥生命周期与抓包验证。</td>
+                <td>不得先开未鉴权端口再补安全。</td>
+              </tr>
+              <tr>
+                <td>P2-7 集成</td>
+                <td>新画面源如何映射 backend/device/screen/control，如何与 WDA input 共存？</td>
+                <td>独立 feature flag、状态契约、回滚方案和端到端测试。</td>
+                <td>失败时回到 Phase 1 direct，不回到 mirror。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="note">
+          <strong>Phase 2 的“可行”定义不是能抓到一帧。</strong>
+          entitlement 可交付、用户授权清楚、持续帧稳定、状态可观测、传输有鉴权、升级可回滚，缺一项都不能替换 WDA MJPEG。
+        </aside>
+      </section>
+
+      <section id="sources" class="sources">
+        <h2>实现依据与完成条件</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>本文采用的当前事实</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>crates/server/src/config.rs</code></td>
+                <td>Direct 默认、显式 mirror、未知服务端值 fail-closed 到 direct、持久设备 UDID。</td>
+              </tr>
+              <tr>
+                <td><code>crates/server/src/main.rs</code></td>
+                <td>Direct 跳过 TCC/AppKit，使用 NullPipeline、placeholder geometry 和 null injector；WDA 默认 loopback endpoints。</td>
+              </tr>
+              <tr>
+                <td><code>crates/server/src/http.rs</code></td>
+                <td><code>/control</code> ACK/error 契约、WDA action dispatcher、status 字段、MJPEG proxy、idle release。</td>
+              </tr>
+              <tr>
+                <td><code>web/index.html</code></td>
+                <td>Direct 的 MJPEG/PNG、HTTP control、gesture 聚合、fail-closed status handling、Switcher UI。</td>
+              </tr>
+              <tr>
+                <td><code>crates/server/src/wda.rs</code></td>
+                <td>WDA session、健康探测、设备坐标、文字、按键、手势、截图与 MJPEG 设置。</td>
+              </tr>
+              <tr>
+                <td><code>install.sh</code></td>
+                <td>默认 direct、旧 mirror 配置迁移、固定 release 事务、配置保留、原子替换、离线控制面与 backend-specific 首次设置。</td>
+              </tr>
+              <tr>
+                <td><code>scripts/setup-wda.sh</code></td>
+                <td>WDA build/sign/install、8100/9100 relay、独立 supervisor、daemon handoff、stop/status/doctor。</td>
+              </tr>
+              <tr>
+                <td>
+                  <a href="https://developer.apple.com/documentation/screencapturekit/capturing-screen-content-on-ios">
+                    Apple · Capturing screen content on iOS
+                  </a>
+                </td>
+                <td>Phase 2 的 iOS ScreenCaptureKit API 入口；只作为研究依据，不等于 entitlement、签名与真机交付已成立。</td>
+              </tr>
+              <tr>
+                <td>
+                  <a href="https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.persistent-content-capture">
+                    Apple · Persistent content capture entitlement
+                  </a>
+                </td>
+                <td>Phase 2 entitlement 闸门的官方入口；必须用目标账号、profile 和 iOS 27 真机重新验证可获得性。</td>
+              </tr>
+              <tr>
+                <td>
+                  <a href="https://github.com/appium/appium-xcuitest-driver/blob/master/docs/reference/capabilities.md">
+                    Appium XCUITest driver capabilities
+                  </a>
+                </td>
+                <td>真实设备不能依赖 simulator-only 的 WDA bind-address 能力；Phase 1 因此把 Mac relay 固定在 USB loopback，并把手机网络视为独立风险面。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Phase 1 可以宣布完成的条件</h3>
+        <ul>
+          <li>全新安装默认 direct，旧 mirror 安装按迁移顺序升级成功。</li>
+          <li>D01–D16 在目标设备组合上全部有证据；不适用项写明原因和替代验证，不能留空。</li>
+          <li>Direct 在无 Mirroring、无 Screen Recording、无 Accessibility 下通过画面和控制验收。</li>
+          <li>WDA、MJPEG、status、网络或控制失败时均 fail-closed，没有 Mac 输入或自动 mirror fallback。</li>
+          <li>安装、升级、回滚、停止和完整卸载都在真实 GUI 用户环境跑过。</li>
+          <li>Switcher 以 unsupported 交付，不隐藏成“偶发失效”。</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="page">
+      iphone-use · Direct Device Architecture · 基于 2026-07-28 当前工作树。
+      本文描述 Phase 1 的现有实现与验收要求；Phase 2 内容仅是研究闸门。
+    </div>
+  </footer>
+</body>
+</html>

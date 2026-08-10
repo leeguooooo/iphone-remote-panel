@@ -124,6 +124,18 @@ pub struct InputInjector {
 }
 
 impl InputInjector {
+    /// Build an injector that deliberately has no OS sink.
+    ///
+    /// Direct-device mode must never construct a `CgEventSink`, probe
+    /// iPhone Mirroring, or inject into the Mac.  Keeping a closed sender here
+    /// lets the legacy WebRTC plumbing remain structurally present while every
+    /// accidental L3 event is dropped without starting an injector thread.
+    pub fn null() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
+        drop(rx);
+        Self { tx }
+    }
+
     /// Enqueue an event for injection. Non-blocking; drops the event if the
     /// injector thread has gone away.
     pub fn send(&self, ev: InputEvent) {

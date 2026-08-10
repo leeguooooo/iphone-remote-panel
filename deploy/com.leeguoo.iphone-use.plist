@@ -4,7 +4,8 @@
 <!--
   LaunchAgent plist for iphone-use daemon.
   Label and filename MUST match: com.leeguoo.iphone-use
-  Bundle id is stable so TCC grants survive upgrades.
+  Bundle id stays stable across upgrades. TCC identity matters only when the
+  explicit legacy mirror backend is used.
 
   This file is a TEMPLATE.  install.sh generates the live copy under
   ~/Library/LaunchAgents/com.leeguoo.iphone-use.plist by substituting
@@ -45,8 +46,9 @@
     <string>Interactive</string>
 
     <!--
-      Aqua: only load in a desktop GUI session (not in SSH / system session 0).
-      Required so the daemon has a WindowServer connection for ScreenCaptureKit.
+      Aqua: install as the signed-in user's LaunchAgent, not a system daemon.
+      Direct/WDA itself does not need WindowServer capture; the explicit legacy
+      mirror backend still requires this session for ScreenCaptureKit.
     -->
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
@@ -55,16 +57,25 @@
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
-        <!-- The iPhone reaches the daemon over the LAN, so bind 0.0.0.0 (the
-             daemon's own default is 127.0.0.1, which the phone can't reach).
-             A password is mandatory when bound to the LAN. install.sh fills
-             these in (generating a password if none is supplied). -->
+        <!-- Remote browsers/agents reach the daemon over the LAN, so this
+             template binds 0.0.0.0. A password is mandatory for that binding;
+             install.sh generates one when none is supplied. -->
         <key>PHONE_REMOTE_HOST</key>
         <string>0.0.0.0</string>
         <key>PHONE_REMOTE_PORT</key>
         <string>44321</string>
         <key>PHONE_REMOTE_PASSWORD</key>
         <string>__PASSWORD__</string>
+        <!-- Direct/WDA is the default. The installer owns these loopback USB
+             relays; custom or remote WDA endpoints must set managed=false. -->
+        <key>PHONE_REMOTE_BACKEND</key>
+        <string>direct</string>
+        <key>PHONE_REMOTE_WDA_URL</key>
+        <string>http://127.0.0.1:8100</string>
+        <key>PHONE_REMOTE_WDA_MJPEG_URL</key>
+        <string>http://127.0.0.1:9100</string>
+        <key>PHONE_REMOTE_WDA_MANAGED</key>
+        <string>true</string>
     </dict>
 </dict>
 </plist>

@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>连接真实 iPhone · iphone-use</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08090c;
+      --panel: #11131a;
+      --panel-2: #171a24;
+      --fg: #eef2ff;
+      --muted: #9199ad;
+      --border: #292e3d;
+      --accent: #4f8cff;
+      --accent-dim: rgba(79, 140, 255, .13);
+      --ok: #57d68d;
+      --warn: #f6c85f;
+      --danger: #ff6570;
+      --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { min-height: 100%; background: var(--bg); }
+    body {
+      min-height: 100vh; margin: 0; color: var(--fg); background:
+        radial-gradient(circle at 50% -20%, rgba(79,140,255,.15), transparent 42%),
+        var(--bg);
+      font-family: var(--sans); line-height: 1.55;
+    }
+    a { color: inherit; }
+    button, a.button { min-height: 44px; }
+    .shell {
+      width: min(100% - 32px, 760px);
+      margin: 0 auto;
+      padding: max(24px, env(safe-area-inset-top)) 0
+               max(36px, env(safe-area-inset-bottom));
+    }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; margin-bottom: 28px;
+    }
+    .brand { font-size: 13px; font-weight: 750; letter-spacing: .05em; }
+    .back {
+      min-height: 40px; display: inline-flex; align-items: center;
+      padding: 7px 12px; border: 1px solid var(--border); border-radius: 10px;
+      color: var(--muted); text-decoration: none; font-size: 13px;
+    }
+    .back:hover { color: var(--fg); border-color: #46506a; }
+    main {
+      overflow: hidden; border: 1px solid var(--border); border-radius: 20px;
+      background: rgba(17,19,26,.96); box-shadow: 0 24px 80px rgba(0,0,0,.34);
+    }
+    header { padding: 28px 28px 24px; border-bottom: 1px solid var(--border); }
+    .eyebrow {
+      margin: 0 0 8px; color: #a9c3ff; font: 700 11px/1.3 var(--mono);
+      letter-spacing: .09em; text-transform: uppercase;
+    }
+    h1 { margin: 0; font-size: clamp(24px, 5vw, 34px); line-height: 1.2; }
+    .lede { max-width: 600px; margin: 10px 0 0; color: var(--muted); font-size: 14px; }
+    .live-state {
+      display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+      gap: 12px; align-items: center; margin-top: 20px; padding: 13px 14px;
+      border: 1px solid var(--border); border-radius: 13px; background: var(--panel-2);
+    }
+    .state-dot {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--warn);
+      box-shadow: 0 0 0 5px rgba(246,200,95,.09);
+    }
+    .live-state[data-tone="ok"] .state-dot {
+      background: var(--ok); box-shadow: 0 0 0 5px rgba(87,214,141,.09);
+    }
+    .live-state[data-tone="danger"] .state-dot {
+      background: var(--danger); box-shadow: 0 0 0 5px rgba(255,101,112,.09);
+    }
+    .state-copy strong { display: block; font-size: 14px; }
+    .state-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+    #refresh {
+      border: 1px solid var(--border); border-radius: 9px; padding: 8px 12px;
+      background: transparent; color: var(--fg); font: 650 12px var(--sans); cursor: pointer;
+    }
+    #refresh:disabled { opacity: .5; cursor: default; }
+    .content { padding: 24px 28px 28px; }
+    h2 { margin: 0 0 14px; font-size: 16px; }
+    .steps { list-style: none; margin: 0; padding: 0; counter-reset: setup; }
+    .step {
+      position: relative; display: grid; grid-template-columns: 34px minmax(0,1fr);
+      gap: 12px; padding: 14px 0; border-top: 1px solid var(--border);
+      counter-increment: setup;
+    }
+    .step:first-child { border-top: 0; padding-top: 0; }
+    .step::before {
+      content: counter(setup); display: grid; place-items: center;
+      width: 30px; height: 30px; border-radius: 9px;
+      background: var(--accent-dim); color: #bcd0ff; font: 750 12px var(--mono);
+    }
+    .step strong { display: block; font-size: 14px; }
+    .step p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .command {
+      display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px;
+      margin-top: 10px;
+    }
+    .command code {
+      min-width: 0; padding: 11px 12px; overflow-x: auto;
+      border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+      color: #dbe6ff; font: 12px/1.4 var(--mono); white-space: nowrap;
+    }
+    .mono { color: #dbe6ff; font: 12px/1.4 var(--mono); }
+    #copy {
+      border: 1px solid rgba(79,140,255,.58); border-radius: 10px;
+      padding: 9px 14px; background: var(--accent-dim); color: #dbe6ff;
+      font: 700 12px var(--sans); cursor: pointer;
+    }
+    .callout {
+      margin-top: 18px; padding: 14px 15px; border: 1px solid var(--border);
+      border-radius: 12px; background: rgba(255,255,255,.025);
+    }
+    .callout strong { display: block; font-size: 13px; }
+    .callout p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .callout.warn { border-color: rgba(246,200,95,.32); background: rgba(246,200,95,.055); }
+    .callout.danger { border-color: rgba(255,101,112,.32); background: rgba(255,101,112,.055); }
+    .actions {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px;
+    }
+    .button {
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 10px 16px; border: 1px solid var(--border); border-radius: 11px;
+      background: transparent; color: var(--fg); text-decoration: none;
+      font: 700 13px var(--sans);
+    }
+    .button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .button[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+    .footnote { margin: 18px 0 0; color: var(--muted); font-size: 11px; }
+    :focus-visible { outline: 3px solid rgba(79,140,255,.42); outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 560px) {
+      .shell { width: min(100% - 20px, 760px); padding-top: max(14px, env(safe-area-inset-top)); }
+      .topbar { margin-bottom: 14px; }
+      main { border-radius: 16px; }
+      header, .content { padding-left: 18px; padding-right: 18px; }
+      .live-state { grid-template-columns: auto minmax(0,1fr); }
+      #refresh { grid-column: 1 / -1; width: 100%; }
+      .command { grid-template-columns: 1fr; }
+      #copy { width: 100%; }
+      .actions { display: grid; grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="brand">iphone-use</div>
+      <a class="back" href="/phone">返回控制页</a>
+    </div>
+    <main>
+      <header>
+        <p class="eyebrow">Direct · WebDriverAgent</p>
+        <h1>连接真实 iPhone</h1>
+        <p class="lede">这里会持续检查设备状态。设置仍由这台 Mac 上的受控脚本完成；页面不会擅自断开 VPN、修改代理、选择另一台手机或绕过系统信任。</p>
+        <div id="liveState" class="live-state" data-tone="warn" role="status" aria-live="polite" aria-atomic="true">
+          <span class="state-dot" aria-hidden="true"></span>
+          <div class="state-copy">
+            <strong id="stateTitle">正在检查设备状态</strong>
+            <span id="stateDetail">请稍候…</span>
+          </div>
+          <button id="refresh" type="button">立即检查</button>
+        </div>
+      </header>
+      <div class="content">
+        <section id="localSetup" aria-labelledby="stepsTitle">
+          <h2 id="stepsTitle">首次设置只做这四步</h2>
+          <ol class="steps">
+            <li class="step">
+              <div>
+                <strong>准备签名环境</strong>
+                <p>安装完整 Xcode，在 Xcode 设置中登录 Apple ID；iPhone 已开启开发者模式。</p>
+              </div>
+            </li>
+            <li class="step">
+              <div>
+                <strong>连接并解锁目标 iPhone</strong>
+                <p>首次使用 USB，保持亮屏；手机弹窗出现时点“信任”。多设备时脚本会拒绝猜测。</p>
+              </div>
+            </li>
+            <li class="step">
+              <div>
+                <strong>在这台 Mac 的终端运行一次设置</strong>
+                <p>它会检查 Xcode、网络、签名、设备信任以及 8100/9100 本地中继。</p>
+                <div class="command">
+                  <code id="setupCommand">~/.iphone-use/setup-wda.sh setup</code>
+                  <button id="copy" type="button">复制命令</button>
+                </div>
+              </div>
+            </li>
+            <li class="step">
+              <div>
+                <strong>回到这里等待绿色状态</strong>
+                <p>本页每 3 秒检查一次；只有 <span class="mono">drivable:true</span> 才会开放控制。</p>
+              </div>
+            </li>
+          </ol>
+        </section>
+
+        <aside id="blocker" class="callout" hidden>
+          <strong id="blockerTitle"></strong>
+          <p id="blockerDetail"></p>
+        </aside>
+        <aside id="externalHelp" class="callout warn" hidden>
+          <strong>这台服务不拥有 WDA</strong>
+          <p>请到 WDA 实际运行的主机恢复它。本页只会重新检查连接，不会在本机启动、停止或替换外部服务。</p>
+        </aside>
+
+        <div class="actions">
+          <a id="openPhone" class="button primary" href="/phone"
+             aria-disabled="true" tabindex="-1">进入控制页</a>
+        </div>
+        <p class="footnote">隐私边界：状态接口只返回连接状态和首要阻塞项；这个页面不会读取手机画面、元素树、账号或通知内容。</p>
+      </div>
+    </main>
+  </div>
+  <script>
+    'use strict';
+    const liveState = document.getElementById('liveState');
+    const stateTitle = document.getElementById('stateTitle');
+    const stateDetail = document.getElementById('stateDetail');
+    const refresh = document.getElementById('refresh');
+    const openPhone = document.getElementById('openPhone');
+    const copy = document.getElementById('copy');
+    const setupCommand = document.getElementById('setupCommand');
+    const blocker = document.getElementById('blocker');
+    const blockerTitle = document.getElementById('blockerTitle');
+    const blockerDetail = document.getElementById('blockerDetail');
+    const localSetup = document.getElementById('localSetup');
+    const externalHelp = document.getElementById('externalHelp');
+    let polling = false;
+    let pollTimer = null;
+
+    const blockers = {
+      warp: {
+        title: 'WARP 设备配置需要调整',
+        setup: '若 WARP 只用于特定站点，请管理员使用 Traffic only mode，并在 Split Tunnels Include 中只加入目标 IP；若仍使用全隧道，则排除 fe80::/10 与 fd00::/8。',
+        retry: '请管理员使用 Traffic only + Include 目标 IP，或在全隧道模式排除 fe80::/10 与 fd00::/8；策略生效后服务会自动继续。',
+      },
+      proxy: {
+        title: '系统代理当前不可用',
+        setup: '启动对应代理应用，或在系统网络设置中关闭已经失效的代理项，再重新运行一次设置命令。',
+        retry: '启动对应代理应用，或关闭已经失效的代理项；恢复后服务会自动继续。',
+      },
+      usb: {
+        title: '请连接目标 iPhone',
+        setup: '使用 USB 连接目标 iPhone，解锁并保持亮屏；出现提示时点“信任”。',
+        retry: '使用 USB 连接这台 iPhone，解锁并保持亮屏；连接后服务会自动继续。',
+      },
+      trust: {
+        title: '开发者证书尚未信任',
+        setup: '在 iPhone 的“设置 → 通用 → VPN 与设备管理”中信任对应开发者证书。',
+        retry: '在 iPhone 中信任对应开发者证书；完成后服务会自动继续。',
+      },
+      ddi: {
+        title: 'iPhone 开发者服务尚未就绪',
+        setup: '保持 USB、解锁和亮屏，等待开发者服务完成挂载后再检查。',
+        retry: '保持 USB、解锁和亮屏；开发者服务就绪后会自动继续。',
+      },
+      wda: {
+        title: '设备服务启动失败',
+        setup: '保持手机解锁，重新运行设置命令；若仍失败，再查看 setup-wda 的终端错误。',
+        retry: '保持手机解锁，重新运行设置命令；若仍失败，再查看 setup-wda 的终端错误。',
+      },
+    };
+    const managedRetryBlockers = new Set(['warp', 'proxy', 'usb', 'trust', 'ddi']);
+
+    function setState(title, detail, tone = 'warn') {
+      stateTitle.textContent = title;
+      stateDetail.textContent = detail;
+      liveState.dataset.tone = tone;
+    }
+
+    function managedSetupWillRetry(status) {
+      return status?.backend === 'direct' &&
+        status?.recovery_owner === 'daemon' &&
+        status?.managed_wda === true &&
+        managedRetryBlockers.has(status?.setup_blocked_on);
+    }
+
+    function showBlocker(code, managedRetry = false) {
+      const blockerCopy = blockers[code];
+      blocker.hidden = !blockerCopy;
+      blocker.className = `callout${blockerCopy ? (code === 'wda' ? ' danger' : ' warn') : ''}`;
+      if (blockerCopy) {
+        blockerTitle.textContent = blockerCopy.title;
+        blockerDetail.textContent = managedRetry ? blockerCopy.retry : blockerCopy.setup;
+      }
+    }
+
+    function renderStatus(status) {
+      const ready = status?.backend === 'direct' && status?.drivable === true;
+      const external = status?.recovery_owner === 'external';
+      const setupRequired =
+        status?.recovery_owner === 'unconfigured' ||
+        status?.managed_wda_pending === true;
+      const managedRetry = managedSetupWillRetry(status);
+      localSetup.hidden = ready || external || !setupRequired;
+      externalHelp.hidden = !external || ready;
+      showBlocker(status?.setup_blocked_on || '', managedRetry);
+      if (ready) {
+        openPhone.removeAttribute('aria-disabled');
+        openPhone.removeAttribute('tabindex');
+      } else {
+        openPhone.setAttribute('aria-disabled', 'true');
+        openPhone.setAttribute('tabindex', '-1');
+      }
+
+      if (ready) {
+        setState('iPhone 已连接，可以开始控制', '设备控制服务已通过检查，可以进入控制页。', 'ok');
+        return;
+      }
+      if (status?.setup_blocked_on && blockers[status.setup_blocked_on]) {
+        if (managedRetry) {
+          setState('等待一个连接条件恢复', '按下方提示处理一次；完成后服务会自动继续。');
+        } else if (setupRequired) {
+          setState('首次连接尚未完成', '先处理下方首要提示，再继续首次设置。');
+        } else {
+          setState(blockers[status.setup_blocked_on].title, '按下方提示处理后再检查。', 'danger');
+        }
+        return;
+      }
+      if (status?.releasing === true) {
+        setState('正在释放设备连接', '请等待释放完成，再重新连接。');
+        return;
+      }
+      if (status?.reconnecting === true) {
+        setState('正在恢复设备服务', '保持 iPhone 解锁、亮屏，本页会继续检查。');
+        return;
+      }
+      if (external) {
+        setState('外部 WDA 未连接', '请在设备服务所在主机恢复；本页会自动重新检查。', 'danger');
+        return;
+      }
+      if (setupRequired) {
+        setState('还差一次真机设置', '完成下面四步后，状态会自动变绿。');
+        return;
+      }
+      if (status?.wda_locked === true) {
+        setState('iPhone 当前不可操作', '解锁并保持亮屏，连接会自动恢复。', 'danger');
+        return;
+      }
+      setState('设备服务尚未就绪', '保持手机连接和解锁，然后重新检查。', 'danger');
+    }
+
+    async function pollStatus() {
+      if (polling) return;
+      polling = true;
+      refresh.disabled = true;
+      refresh.textContent = '检查中…';
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 7000);
+      try {
+        const response = await fetch('/agent/status', {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          signal: controller.signal,
+        });
+        if (response.status === 401) {
+          location.replace('/login?next=%2Fsetup');
+          return;
+        }
+        if (!response.ok) throw new Error('status rejected');
+        renderStatus(await response.json());
+      } catch (_) {
+        setState('无法获取设备状态', '确认 iphone-use 服务仍在运行，然后重新检查。', 'danger');
+        showBlocker('');
+      } finally {
+        clearTimeout(timeout);
+        polling = false;
+        refresh.disabled = false;
+        refresh.textContent = '立即检查';
+        clearTimeout(pollTimer);
+        if (document.visibilityState === 'visible') {
+          pollTimer = setTimeout(pollStatus, 3000);
+        }
+      }
+    }
+
+    async function copyText(source, button, defaultLabel) {
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(source.textContent);
+        copied = true;
+      } catch (_) {
+        const range = document.createRange();
+        range.selectNodeContents(source);
+        const selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+          selection.addRange(range);
+          try { copied = document.execCommand('copy'); } catch (_) {}
+          selection.removeAllRanges();
+        }
+      }
+      button.textContent = copied ? '已复制' : '长按复制';
+      setTimeout(() => { button.textContent = defaultLabel; }, 1800);
+    }
+
+    async function copyCommand() {
+      await copyText(setupCommand, copy, '复制命令');
+    }
+
+    refresh.addEventListener('click', pollStatus);
+    copy.addEventListener('click', copyCommand);
+    openPhone.addEventListener('click', (event) => {
+      if (openPhone.getAttribute('aria-disabled') === 'true') {
+        event.preventDefault();
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      clearTimeout(pollTimer);
+      if (document.visibilityState === 'visible') void pollStatus();
+    });
+    window.addEventListener('pagehide', () => clearTimeout(pollTimer));
+    void pollStatus();
+  </script>
+</body>
+</html>

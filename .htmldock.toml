@@ -1,0 +1,8 @@
+team = "legacy"
+project_slug = "iphone-remote-panel"
+sync = true
+visibility = "team"
+default_owner = ""
+module_root = ""
+ignore = ["draft/**", "scratch/*.html"]
+auto_module = true

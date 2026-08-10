@@ -2,6 +2,7 @@
 //!
 //! Routes (contract from `web/index.html`):
 //!   * `GET  /phone`       — auth-gated; serves the embedded web client.
+//!   * `GET  /setup`       — auth-gated; serves the live iPhone connection guide.
 //!   * `GET  /login`       — password form.
 //!   * `POST /login`       — password check → set signed `phone_session` cookie.
 //!   * `GET  /logout`      — clear the cookie.
@@ -31,7 +32,7 @@ fn recover<T>(r: std::sync::LockResult<T>) -> T {
 
 use axum::{
     body::Body,
-    extract::{ws::WebSocketUpgrade, State},
+    extract::{ws::WebSocketUpgrade, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -47,6 +48,9 @@ use crate::input_bridge::InputInjector;
 
 /// The embedded web client served at `/phone`.
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
+
+/// The embedded first-connect and recovery guide served at `/setup`.
+const SETUP_HTML: &str = include_str!("../../../web/setup.html");
 
 /// The cookie name the web client and daemon agree on.
 const SESSION_COOKIE: &str = "phone_session";
@@ -73,6 +77,52 @@ pub struct AuthLimiter {
     pub(crate) locked_until: Option<Instant>,
 }
 
+/// Control arbitration and its currently-authorized injector lease.
+///
+/// These values used to live behind two independent mutexes.  Some call sites
+/// locked `control → current_lease` while the injector gate locked them in the
+/// opposite order, which could deadlock the daemon permanently.  One mutex also
+/// prevents observers from seeing a newly-acquired control holder paired with a
+/// stale lease.
+pub struct LeaseState {
+    control: Control,
+    current: Option<Lease>,
+}
+
+impl LeaseState {
+    pub fn new() -> Self {
+        Self {
+            control: Control::new(),
+            current: None,
+        }
+    }
+
+    pub fn acquire(&mut self, holder: core::control::Holder, now: u64) -> Lease {
+        let lease = self.control.acquire(holder, now);
+        self.current = Some(lease.clone());
+        lease
+    }
+
+    pub fn allows_injection(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|lease| self.control.is_current(lease))
+    }
+
+    pub fn release_if_current(&mut self, lease: &Lease) {
+        if self.control.is_current(lease) {
+            self.control.release(lease);
+            self.current = None;
+        }
+    }
+}
+
+impl Default for LeaseState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Number of consecutive failures that trigger a lockout.
 const AUTH_MAX_FAILURES: u32 = 5;
 
@@ -81,7 +131,10 @@ const AUTH_LOCKOUT_SECS: u64 = 30;
 
 impl AuthLimiter {
     pub fn new() -> Self {
-        AuthLimiter { failures: 0, locked_until: None }
+        AuthLimiter {
+            failures: 0,
+            locked_until: None,
+        }
     }
 
     /// Returns `true` if requests should be rejected right now.
@@ -97,9 +150,8 @@ impl AuthLimiter {
     pub fn record_failure(&mut self) {
         self.failures += 1;
         if self.failures >= AUTH_MAX_FAILURES {
-            self.locked_until = Some(
-                Instant::now() + std::time::Duration::from_secs(AUTH_LOCKOUT_SECS),
-            );
+            self.locked_until =
+                Some(Instant::now() + std::time::Duration::from_secs(AUTH_LOCKOUT_SECS));
         }
     }
 
@@ -108,6 +160,12 @@ impl AuthLimiter {
     pub fn record_success(&mut self) {
         self.failures = 0;
         self.locked_until = None;
+    }
+}
+
+impl Default for AuthLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -128,8 +186,112 @@ impl IceState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WdaLifecycleTransition {
+    Active = 0,
+    Releasing = 1,
+    Reconnecting = 2,
+}
+
+/// Single-owner arbitration for managed WDA start/stop transitions.
+///
+/// Release and reconnect are mutually exclusive device lifecycle operations.
+/// Keeping them in one atomic state means they cannot both win after stale
+/// prechecks and concurrently stop/bootstrap the same launchd supervisor.
+#[derive(Debug)]
+pub struct WdaLifecycle {
+    transition: std::sync::atomic::AtomicU8,
+}
+
+impl WdaLifecycle {
+    pub fn new() -> Self {
+        Self {
+            transition: std::sync::atomic::AtomicU8::new(WdaLifecycleTransition::Active as u8),
+        }
+    }
+
+    fn current(&self) -> WdaLifecycleTransition {
+        match self.transition.load(std::sync::atomic::Ordering::Acquire) {
+            value if value == WdaLifecycleTransition::Active as u8 => {
+                WdaLifecycleTransition::Active
+            }
+            value if value == WdaLifecycleTransition::Releasing as u8 => {
+                WdaLifecycleTransition::Releasing
+            }
+            value if value == WdaLifecycleTransition::Reconnecting as u8 => {
+                WdaLifecycleTransition::Reconnecting
+            }
+            _ => unreachable!("WDA lifecycle state is private and always valid"),
+        }
+    }
+
+    fn try_begin(&self, transition: WdaLifecycleTransition) -> bool {
+        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
+        self.transition
+            .compare_exchange(
+                WdaLifecycleTransition::Active as u8,
+                transition as u8,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self, transition: WdaLifecycleTransition) {
+        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
+        let result = self.transition.compare_exchange(
+            transition as u8,
+            WdaLifecycleTransition::Active as u8,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        debug_assert!(
+            result.is_ok(),
+            "only the current WDA lifecycle owner may finish its transition"
+        );
+    }
+
+    fn try_begin_releasing(&self) -> bool {
+        self.try_begin(WdaLifecycleTransition::Releasing)
+    }
+
+    fn finish_releasing(&self) {
+        self.finish(WdaLifecycleTransition::Releasing);
+    }
+
+    fn try_begin_reconnecting(&self) -> bool {
+        self.try_begin(WdaLifecycleTransition::Reconnecting)
+    }
+
+    fn finish_reconnecting(&self) {
+        self.finish(WdaLifecycleTransition::Reconnecting);
+    }
+
+    pub fn is_releasing(&self) -> bool {
+        self.current() == WdaLifecycleTransition::Releasing
+    }
+
+    pub fn is_reconnecting(&self) -> bool {
+        self.current() == WdaLifecycleTransition::Reconnecting
+    }
+
+    fn is_transitioning(&self) -> bool {
+        self.current() != WdaLifecycleTransition::Active
+    }
+}
+
+impl Default for WdaLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared application state for all handlers.
 pub struct AppState {
+    /// Selected device transport. Direct mode never probes, captures, or injects
+    /// through iPhone Mirroring; mirror mode keeps the original Mac-side path.
+    pub backend: crate::config::DeviceBackend,
     /// Running video pipeline the WebRTC feed subscribes to.
     pub pipeline: Arc<dyn VideoPipeline>,
     /// ICE servers + `/turn-creds` JSON. Behind an `ArcSwap` so the Cloudflare
@@ -144,11 +306,8 @@ pub struct AppState {
     pub session_ttl_secs: u64,
     /// Whether to mark the cookie `Secure` (true behind TLS).
     pub cookie_secure: bool,
-    /// Control lease arbitration (single shared cursor). Shared (same `Arc`) with
-    /// the input injector's gate so a lease change is visible to both.
-    pub control: Arc<Mutex<Control>>,
-    /// The lease held by the current viewer (if any). Shared with the injector gate.
-    pub current_lease: Arc<Mutex<Option<Lease>>>,
+    /// Control arbitration and current injector authorization under one lock.
+    pub lease_state: Arc<Mutex<LeaseState>>,
     /// Input injector (decoded events → CgEventSink on its own thread).
     pub injector: InputInjector,
     /// Rate limiter for login and agent bearer auth failures.
@@ -163,6 +322,8 @@ pub struct AppState {
     /// When `None`, the existing behavior applies: the password (if set) is used as
     /// the bearer check, and open mode (no password) passes everything through.
     pub agent_token: Option<String>,
+    /// Persisted target iPhone UDID used by every WDA start/restart.
+    pub device_udid: Option<String>,
     /// Inbox: structured results POSTed back BY the phone (e.g. an iOS Shortcut's
     /// "Get Contents of URL" action returning Health / battery / location JSON),
     /// for an agent to GET. This is the return path of the Shortcuts RPC bridge —
@@ -173,10 +334,22 @@ pub struct AppState {
     /// (`PHONE_REMOTE_WDA_URL`, e.g. `http://<phone-ip>:8100`). When present,
     /// agent input auto-routes through it (see [`agent_input`]): text goes in
     /// as Unicode (CJK lands cleanly), taps are synthesized on-device (no host
-    /// cursor), with the L3 pixel path as fallback on any WDA error.
+    /// cursor). Direct mode fails closed on WDA errors; only the explicit mirror
+    /// backend may use the L3 compatibility path.
     /// `tokio::sync::Mutex` because the client mutates its cached session and
     /// handlers hold the lock across awaits.
     pub wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
+    /// Whether this daemon owns the local WDA supervisor and relay lifecycle.
+    ///
+    /// Only a direct backend pointed at a loopback WDA URL is managed. A remote
+    /// `PHONE_REMOTE_WDA_URL` is externally owned: this process may use it, but
+    /// must never stop or bootstrap local launchd jobs on its behalf.
+    pub managed_wda: bool,
+    /// A local Direct backend whose managed ownership is waiting for a
+    /// canonical target UDID. Pending setup is neither daemon-managed nor
+    /// external: lifecycle actions stay disabled until setup persists a target
+    /// and the daemon restarts.
+    pub managed_wda_pending: bool,
     /// Latest released tag on GitHub (e.g. `"v0.3.0"`), refreshed by a
     /// background task every 24h (`main::spawn_update_check`). `None` until
     /// the first successful fetch (or when offline). Read by `agent_status`
@@ -197,13 +370,25 @@ pub struct AppState {
     /// Defaults to `127.0.0.1:9100` (the relay target), override via
     /// `PHONE_REMOTE_WDA_MJPEG_URL`.
     pub mjpeg_url: Option<String>,
-    /// Last-known "WDA can act on-device" flag, updated by every WebRTC
-    /// data-channel control event ([`wda_control_from_json`]). The control/move
-    /// channel handlers read it to decide: when true (agent mode), route to WDA
-    /// and DROP anything WDA can't take, so L3 never fires and iPhone Mirroring
-    /// is never yanked frontmost (no Mac focus steal). When false (mirror mode),
-    /// fall through to the L3 injector as before.
+    /// Last-known "WDA can act on-device" flag, updated by Direct health probes
+    /// and control events. Direct handlers use it as readiness evidence but
+    /// always fail closed when WDA cannot act; they never fall through to the
+    /// Mac injector. The explicit Mirror backend ignores WDA and retains its
+    /// legacy host-capture/input path.
     pub wda_actionable: Arc<std::sync::atomic::AtomicBool>,
+    /// Last completed WDA health probe. Status polling uses this cache whenever
+    /// the control client is busy, so a slow health check never queues behind or
+    /// blocks a time-sensitive browser gesture indefinitely.
+    pub wda_health: Arc<Mutex<crate::wda::WdaHealth>>,
+    /// Single in-flight background health probe. Status requests return the
+    /// cache immediately; a control request aborts this task before taking the
+    /// WDA mutex so a cold/slow probe cannot delay an input action.
+    pub wda_health_probe: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Number of Direct control requests currently waiting for or using WDA.
+    /// Health polling re-checks this while holding `wda_health_probe`'s mutex,
+    /// closing the race where a poll could start a new probe after input asked
+    /// the previous probe to stop.
+    pub wda_control_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Monotonic timestamp of the last remote-driving activity — any `/agent`
     /// control or live-view request, refreshed by [`AppState::touch_activity`].
     /// The idle-release watchdog ([`spawn_idle_release_watchdog`]) frees the
@@ -214,10 +399,18 @@ pub struct AppState {
     /// True while WDA has been auto-released for idle (runner stopped + its
     /// LaunchAgent booted out). The next `/agent/input` re-bootstraps it.
     pub released: Arc<std::sync::atomic::AtomicBool>,
+    /// Mutually-exclusive managed WDA stop/bootstrap transition. New
+    /// control/view requests fail fast while it is owned. `released` stays true
+    /// until bootstrap succeeds, so a failed recovery is never reported active.
+    pub wda_lifecycle: Arc<WdaLifecycle>,
     /// Open `/agent/mjpeg` live-view streams. A connected viewer counts as
     /// activity for as long as it watches, so passive viewing doesn't get
     /// released out from under the user.
     pub live_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-browser MJPEG byte activity keyed by a short, client-generated
+    /// stream id. The web client asks for its own stream age on `/agent/status`
+    /// so another viewer cannot make a frozen local image look fresh.
+    pub mjpeg_stream_activity: Arc<Mutex<std::collections::HashMap<String, (u64, Instant)>>>,
 }
 
 impl AppState {
@@ -240,6 +433,26 @@ impl AppState {
     fn idle_for(&self) -> std::time::Duration {
         recover(self.last_activity.lock()).elapsed()
     }
+
+    /// Give a Direct control operation priority over background health work.
+    fn begin_wda_control(&self) -> WdaControlPriorityGuard {
+        self.wda_control_pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(probe) = recover(self.wda_health_probe.lock()).take() {
+            probe.abort();
+        }
+        WdaControlPriorityGuard(self.wda_control_pending.clone())
+    }
+}
+
+/// RAII marker that prevents status polling from starting a competing WDA
+/// health probe while a time-sensitive Direct action is pending.
+struct WdaControlPriorityGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for WdaControlPriorityGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// RAII counter for in-flight `/agent/mjpeg` live-view streams. Increments
@@ -248,15 +461,77 @@ impl AppState {
 /// and the phone becomes eligible for idle release again.
 struct StreamGuard(Arc<std::sync::atomic::AtomicUsize>);
 impl StreamGuard {
-    fn new(c: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        StreamGuard(c)
+    fn try_reserve(c: Arc<std::sync::atomic::AtomicUsize>, maximum: usize) -> Option<Self> {
+        c.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current < maximum).then_some(current + 1),
+        )
+        .ok()
+        .map(|_| StreamGuard(c))
     }
 }
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+const MJPEG_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+static NEXT_MJPEG_ACTIVITY_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+struct MjpegActivityGuard {
+    activity: Arc<Mutex<std::collections::HashMap<String, (u64, Instant)>>>,
+    stream_id: String,
+    token: u64,
+}
+
+impl MjpegActivityGuard {
+    fn register(
+        activity: Arc<Mutex<std::collections::HashMap<String, (u64, Instant)>>>,
+        stream_id: String,
+    ) -> Self {
+        let token = NEXT_MJPEG_ACTIVITY_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        recover(activity.lock()).insert(stream_id.clone(), (token, Instant::now()));
+        Self {
+            activity,
+            stream_id,
+            token,
+        }
+    }
+
+    fn touch(&self) {
+        if let Some((token, last_chunk)) = recover(self.activity.lock()).get_mut(&self.stream_id) {
+            if *token == self.token {
+                *last_chunk = Instant::now();
+            }
+        }
+    }
+}
+
+impl Drop for MjpegActivityGuard {
+    fn drop(&mut self) {
+        let mut activity = recover(self.activity.lock());
+        if activity
+            .get(&self.stream_id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            activity.remove(&self.stream_id);
+        }
+    }
+}
+
+fn valid_mjpeg_stream_id(stream_id: &str) -> bool {
+    (8..=64).contains(&stream_id.len())
+        && stream_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+#[derive(Default, Deserialize)]
+struct MjpegStreamQuery {
+    stream_id: Option<String>,
 }
 
 /// One message in the [`AppState::inbox`] — arbitrary JSON the phone POSTed back,
@@ -277,21 +552,29 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/phone", get(phone))
+        .route("/setup", get(setup))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", get(logout))
         .route("/turn-creds", get(turn_creds))
         .route("/ws", get(ws_upgrade))
+        // Browser control in the direct backend is deliberately independent of
+        // WebRTC.  MJPEG viewers can still control the device when ICE/H.264 is
+        // unavailable, and every request receives an explicit HTTP ACK.
+        .route("/control", post(direct_control))
         // Agent operation entry (connect-in; reuses the validated injector +
         // control lease). Bearer-token auth; see `agent_input` / `agent_status`.
         .route("/agent/status", get(agent_status))
         .route("/agent/mode", post(agent_mode))
         .route("/agent/input", post(agent_input))
+        .route("/agent/actions", post(agent_actions))
         .route("/agent/screenshot", get(agent_screenshot))
         .route("/agent/mjpeg", get(agent_mjpeg))
         .route("/agent/elements", get(agent_elements))
-        // Shortcuts RPC return path: the phone POSTs structured results here;
-        // an agent GETs (and drains) them. See `AppState::inbox`.
+        // Shortcuts RPC return path: the phone POSTs structured results here.
+        // Safe GET only peeks; destructive consumption has an explicit,
+        // CSRF-protected POST endpoint.
         .route("/agent/inbox", get(agent_inbox_get).post(agent_inbox_post))
+        .route("/agent/inbox/drain", post(agent_inbox_drain))
         .with_state(state)
 }
 
@@ -304,7 +587,10 @@ fn with_security_headers(mut resp: Response) -> Response {
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     resp
 }
 
@@ -387,6 +673,13 @@ async fn phone(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     with_security_headers(Html(INDEX_HTML).into_response())
 }
 
+async fn setup(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_authed(&state, &headers) {
+        return with_security_headers(Redirect::to("/login?next=%2Fsetup").into_response());
+    }
+    with_security_headers(Html(SETUP_HTML).into_response())
+}
+
 /// The login form HTML (self-contained, no external assets).
 const LOGIN_HTML: &str = r#"<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -397,34 +690,79 @@ html,body{margin:0;height:100%;background:#08090c;color:#eef2ff;
   font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;
   display:flex;align-items:center;justify-content:center}
 form{background:#11131a;border:1px solid #272b38;border-radius:16px;padding:28px 24px;
-  width:min(86vw,320px);display:flex;flex-direction:column;gap:14px}
+  width:min(86vw,320px);display:flex;flex-direction:column;gap:12px}
 h1{font-size:17px;margin:0 0 4px;letter-spacing:.02em}
+label{font-size:13px;font-weight:600;color:#dbe6ff}
+.hint{margin:-4px 0 2px;color:#8b93a7;font-size:12px;line-height:1.45}
 input{background:#08090c;color:#eef2ff;border:1px solid #272b38;border-radius:12px;
   padding:12px 14px;font-size:16px;-webkit-appearance:none}
 input:focus{outline:none;border-color:#4f8cff}
+input[aria-invalid="true"]{border-color:#ff5a66}
+input:focus-visible,button:focus-visible{outline:3px solid rgba(79,140,255,.35);
+  outline-offset:2px}
+input[aria-invalid="true"]:focus-visible{outline-color:rgba(255,90,102,.32)}
 button{background:#4f8cff;border:1px solid #4f8cff;color:#fff;border-radius:12px;
   padding:12px;font-size:15px;font-weight:600;cursor:pointer}
-.err{color:#ff5a66;font-size:13px;min-height:1em}
+.err{color:#ff5a66;font-size:13px;line-height:1.4}
+.err:empty{display:none}
 </style></head><body>
-<form method="POST" action="/login">
+<form method="POST" action="/login" novalidate>
   <h1>iphone-use</h1>
-  <div class="err">__ERR__</div>
-  <input type="password" name="password" placeholder="密码" autofocus
-    autocomplete="current-password" />
+  <p class="hint" id="passwordHint">请输入这台 Mac 安装 iphone-use 时生成的控制密码。忘记后，请回到 Mac 重新运行安装程序查看或重设。</p>
+  __NEXT_INPUT__
+  <label for="password">控制密码</label>
+  <input id="password" type="password" name="password" autofocus required
+    autocomplete="current-password" autocapitalize="off" spellcheck="false"
+    aria-describedby="passwordHint loginError" aria-invalid="__INVALID__" />
+  <div class="err" id="loginError" role="alert" aria-live="assertive">__ERR__</div>
   <button type="submit">登录</button>
 </form></body></html>"#;
 
-async fn login_form(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    // Already authed → straight to the client.
-    if is_authed(&state, &headers) {
-        return with_security_headers(Redirect::to("/phone").into_response());
+fn login_destination(next: Option<&str>) -> &'static str {
+    match next {
+        Some("/setup") => "/setup",
+        _ => "/phone",
     }
-    with_security_headers(Html(LOGIN_HTML.replace("__ERR__", "")).into_response())
+}
+
+fn render_login(error: &str, next: Option<&str>) -> String {
+    let next_input = match login_destination(next) {
+        "/setup" => r#"<input type="hidden" name="next" value="/setup">"#,
+        _ => "",
+    };
+    LOGIN_HTML
+        .replace("__NEXT_INPUT__", next_input)
+        .replace("__ERR__", error)
+        .replace(
+            "__INVALID__",
+            if error.is_empty() { "false" } else { "true" },
+        )
+}
+
+#[derive(Default, Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+}
+
+async fn login_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let destination = login_destination(query.next.as_deref());
+    // Already authed → return to the allow-listed route the user originally
+    // requested instead of silently dropping them on the control page.
+    if is_authed(&state, &headers) {
+        return with_security_headers(Redirect::to(destination).into_response());
+    }
+    with_security_headers(Html(render_login("", Some(destination))).into_response())
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
     password: String,
+    #[serde(default)]
+    next: Option<String>,
 }
 
 async fn login_submit(
@@ -432,26 +770,42 @@ async fn login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let destination = login_destination(form.next.as_deref());
     let expected = match &state.password {
         // Open mode: any login succeeds (no password configured); no limiting.
-        None => return redirect_with_cookie(&state, "/phone", &headers),
+        None => return redirect_with_cookie(&state, destination, &headers),
         Some(p) => p.clone(),
     };
+    // The form deliberately uses `novalidate` so feedback is consistent across
+    // browsers and remains available to assistive technology. Do not count a
+    // missing value as an authentication failure: the user has not attempted a
+    // credential yet.
+    if form.password.is_empty() {
+        let mut resp = Html(render_login("请输入控制密码", Some(destination))).into_response();
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return with_security_headers(resp);
+    }
     // Check the limiter BEFORE verifying the password (prevents timing oracle).
     {
         let limiter = state.auth_limiter.lock().unwrap();
         if limiter.is_locked() {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            );
+            let mut resp = Html(render_login(
+                "尝试次数过多。为保护手机，请 30 秒后再试",
+                Some(destination),
+            ))
+            .into_response();
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            return with_security_headers(resp);
         }
     }
     if core::auth::verify_password(&form.password, &expected) {
         state.auth_limiter.lock().unwrap().record_success();
-        redirect_with_cookie(&state, "/phone", &headers)
+        redirect_with_cookie(&state, destination, &headers)
     } else {
         state.auth_limiter.lock().unwrap().record_failure();
-        let body = LOGIN_HTML.replace("__ERR__", "密码错误");
+        let body = render_login("密码错误，请检查安装时保存的控制密码", Some(destination));
         let mut resp = Html(body).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         with_security_headers(resp)
@@ -480,9 +834,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 
 async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_authed(&state, &headers) {
-        return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        );
+        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
     }
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -495,11 +847,9 @@ async fn turn_creds(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 // Agent operation entry (connect-in HTTP API)
 // ---------------------------------------------------------------------------
 //
-// An agent (Hermes, a Claude MCP client, a script) drives the phone by POSTing
-// control messages to the *already-running, TCC-granted* daemon — never by
-// spawning its own input process (macOS's responsible-process rule makes a
-// spawned child's CGEvents untrusted). The daemon injects through the same
-// validated path as the human WebRTC client, taking an `Agent` control lease.
+// An agent (Hermes, an MCP client, or a script) drives the selected backend by
+// POSTing to this already-running daemon. Direct dispatches only to on-device
+// WDA. The explicit Mirror compatibility backend uses the legacy Mac injector.
 
 /// Extract the bytes after `Authorization: Bearer `.
 ///
@@ -543,8 +893,7 @@ fn check_bearer(state: &AppState, headers: &HeaderMap) -> bool {
         // Open mode (neither configured) → always authed.
         (None, None) => return true,
     };
-    bearer_credential(headers)
-        .is_some_and(|token| ct_eq(token, expected.as_bytes()))
+    bearer_credential(headers).is_some_and(|token| ct_eq(token, expected.as_bytes()))
 }
 
 /// Outcome of an agent auth check (combines lockout + credential verify).
@@ -584,6 +933,59 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
     }
 }
 
+/// Authorize a route shared by the browser UI and bearer-authenticated agents.
+///
+/// A missing/expired browser cookie is not a bearer brute-force attempt. Only
+/// requests that actually present `Authorization` are allowed to advance the
+/// shared bearer limiter; otherwise a stale page polling in the background could
+/// repeatedly lock out a legitimate MCP client.
+fn browser_or_agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
+    if is_authed(state, headers) {
+        AgentAuth::Ok
+    } else if headers.contains_key(header::AUTHORIZATION) {
+        agent_auth(state, headers)
+    } else {
+        AgentAuth::Denied
+    }
+}
+
+/// Mutation endpoints require a non-simple custom header in addition to auth.
+///
+/// Cross-origin HTML forms and `text/plain` fetches cannot attach this header
+/// without a CORS preflight, and this daemon exposes no CORS policy. This keeps
+/// open-mode LAN deployments and cookie-authenticated browsers from becoming
+/// drive-by CSRF targets.
+fn has_phone_control_header(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-phone-control")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
+
+fn missing_phone_control_header_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"missing_control_header","required_header":"X-Phone-Control: 1","hint":"retry the same state-changing request with X-Phone-Control: 1"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn target_not_configured_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh to select and persist the canonical iPhone before using Direct control"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
 /// What the Mirroring window is showing (active / paused / in_use). Memoized for
 /// [`MIRROR_STATE_CACHE_TTL`] so `/agent/status` polling doesn't run a
 /// `screencapture` on every request. Detection is blocking (spawns
@@ -604,43 +1006,215 @@ async fn mirror_state_cached(state: &Arc<AppState>) -> core::capture::MirrorStat
     s
 }
 
-/// `GET /agent/status` — auth/health probe. `{"ok":true,"phone_target":bool}`.
+/// Return cached WDA health and, when idle, start one background refresh.
 ///
-/// `phone_target` is `true` when an iPhone Mirroring window is currently
-/// findable on-screen (cheap `find_mirroring_geometry` probe at request time;
-/// macOS only — non-macOS always returns `false`).  This replaces the old
-/// cua-driver window-target check: input is now fully native (CGEvent), so no
-/// external binary is needed for key/text/shortcut — `phone_target` simply
-/// tells the agent whether the Mirroring window is up right now.
-async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// A cold WDA session can legitimately take longer than the old 1.5-second
+/// status budget. Cancelling it on every poll meant the session was never
+/// cached and `drivable` stayed false forever. The refresh now gets a realistic
+/// deadline and survives the HTTP status request that started it. Direct input
+/// has priority: [`AppState::begin_wda_control`] aborts the probe before waiting
+/// for the shared WDA client, and the pending counter prevents a replacement
+/// probe from racing in behind it.
+async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
+    let cached = *recover(state.wda_health.lock());
+    let Some(wda) = &state.wda else {
+        return crate::wda::WdaHealth::down();
+    };
+    let mut probe_slot = recover(state.wda_health_probe.lock());
+    if probe_slot
+        .as_ref()
+        .is_some_and(|probe| !probe.is_finished())
+    {
+        return cached;
+    }
+    *probe_slot = None;
+    if state
+        .wda_control_pending
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        return cached;
+    }
+
+    let wda = wda.clone();
+    let health_cache = state.wda_health.clone();
+    let actionable = state.wda_actionable.clone();
+    let released = state.released.clone();
+    *probe_slot = Some(tokio::spawn(async move {
+        let Ok(mut client) = wda.try_lock() else {
+            return;
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(15), client.probe_health()).await
+        {
+            Ok(health) => {
+                apply_wda_health_probe(&health_cache, &actionable, &released, health);
+            }
+            Err(_) => {
+                // Preserve the last completed observation. A timeout is not an
+                // authoritative "down", and the next status poll may retry.
+                tracing::warn!("WDA health probe timed out; retaining cached health");
+            }
+        }
+    }));
+    cached
+}
+
+/// Commit one completed WDA health observation to every readiness cache.
+///
+/// `released` tracks whether the managed runner has relinquished the device.
+/// An authoritative `up` probe clears it immediately, including when launchd
+/// self-healed the runner outside an explicit `/agent/mode` readiness wait.
+fn apply_wda_health_probe(
+    health_slot: &Mutex<crate::wda::WdaHealth>,
+    actionable: &std::sync::atomic::AtomicBool,
+    released: &std::sync::atomic::AtomicBool,
+    health: crate::wda::WdaHealth,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    *recover(health_slot.lock()) = health;
+    actionable.store(health.actionable, Ordering::Release);
+    if health.up {
+        released.store(false, Ordering::Release);
+    }
+    health.actionable
+}
+
+fn finish_wda_readiness_wait(lifecycle: &WdaLifecycle) {
+    lifecycle.finish_reconnecting();
+}
+
+const WDA_READINESS_TIMEOUT_SECS: u64 = 420;
+
+fn spawn_wda_readiness_wait(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        // setup-wda.sh allows up to six minutes for xcodebuild to report the
+        // on-device server URL, and first startup after an Xcode update can use
+        // most of that budget. Ending the lifecycle after two minutes exposed
+        // `released` while launchd was still building, which invited a second
+        // reconnect against the same in-flight supervisor. Keep a small margin
+        // for prerequisite checks and relay verification.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(WDA_READINESS_TIMEOUT_SECS);
+        let mut ready = false;
+        let mut seen_up = false;
+        let mut setup_blocker = String::new();
+        while tokio::time::Instant::now() < deadline && !state.wda_lifecycle.is_releasing() {
+            // A concrete prerequisite failure is authoritative. Keeping the
+            // transition at `reconnecting` for the full two-minute WDA budget
+            // made an unplugged phone look like a slow-but-healthy startup and
+            // hid the actionable USB/trust/DDI message from clients.
+            // Lifecycle transitions must only trust the current helper's
+            // structured status. `read_setup_blocked_on` also has a narrow
+            // old-helper log fallback for display, but a stale log inference
+            // must never end an active reconnect and expose `released` while
+            // launchd is still rebuilding WDA.
+            setup_blocker = read_structured_setup_blocked_on();
+            if !setup_blocker.is_empty() {
+                break;
+            }
+            if let Some(wda) = &state.wda {
+                let _priority = state.begin_wda_control();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    wda.lock().await.probe_health().await
+                })
+                .await;
+                if let Ok(health) = result {
+                    seen_up |= health.up;
+                    if apply_wda_health_probe(
+                        &state.wda_health,
+                        &state.wda_actionable,
+                        &state.released,
+                        health,
+                    ) {
+                        ready = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if ready {
+            state.touch_activity();
+        } else if !setup_blocker.is_empty() {
+            tracing::warn!(
+                blocked_on = %setup_blocker,
+                "managed WDA reconnect stopped on a setup prerequisite"
+            );
+        } else if seen_up {
+            let health = *recover(state.wda_health.lock());
+            tracing::warn!(
+                locked = ?health.locked,
+                "managed WDA is running but did not become actionable before reconnect deadline"
+            );
+        } else {
+            tracing::warn!("managed WDA did not become actionable before reconnect deadline");
+        }
+        finish_wda_readiness_wait(&state.wda_lifecycle);
+    });
+}
+
+/// `GET /agent/status` — authenticated backend/readiness/lifecycle probe.
+///
+/// Direct callers gate on `drivable`; its legacy `phone_target` field is always
+/// false and no Mirroring API is touched. In explicit Mirror compatibility
+/// mode, `phone_target` reports whether a Mirroring window is currently
+/// findable on macOS.
+async fn agent_status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MjpegStreamQuery>,
+    headers: HeaderMap,
+) -> Response {
     // Same cookie-or-bearer rule as `agent_screenshot`: a logged-in browser
     // viewer may read the health/version probe (the web client uses it for
     // the update banner). Cookie first so polling never trips the limiter;
     // only honored when a password is configured (see agent_screenshot).
-    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
-    if !cookie_ok {
-        match agent_auth(&state, &headers) {
-            AgentAuth::Locked => return with_security_headers(
+    // Browser access follows the same contract as `/phone`: no configured
+    // password means an intentionally open browser UI, even when a separate
+    // agent bearer token protects machine callers.
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
                 (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            ),
-            AgentAuth::Denied => return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            ),
-            AgentAuth::Ok => {}
+            )
         }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
     }
-    // Cheap probe: returns Ok if ScreenCaptureKit can see the window.
+    if query
+        .stream_id
+        .as_deref()
+        .is_some_and(|stream_id| !valid_mjpeg_stream_id(stream_id))
+    {
+        return with_security_headers(
+            (StatusCode::BAD_REQUEST, "invalid MJPEG stream id").into_response(),
+        );
+    }
+    let direct = state.backend == crate::config::DeviceBackend::Direct;
+    let lifecycle = state.wda_lifecycle.current();
+    let releasing = lifecycle == WdaLifecycleTransition::Releasing;
+    let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
+    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    // Direct mode must not touch any iPhone Mirroring API. The legacy backend
+    // keeps the cheap geometry probe for compatibility status.
     #[cfg(target_os = "macos")]
-    let phone_target = core::capture::find_mirroring_geometry().is_ok();
+    let phone_target = !direct && core::capture::find_mirroring_geometry().is_ok();
     #[cfg(not(target_os = "macos"))]
     let phone_target = false;
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
     // locked or the test session was severed). `wda` stays "runner reachable"
     // for back-compat; `wda_actionable` is the honest "can it act right now".
-    let health = match &state.wda {
-        Some(w) => w.lock().await.probe_health().await,
-        None => crate::wda::WdaHealth::down(),
+    let health = if !direct || state.managed_wda_pending {
+        crate::wda::WdaHealth::down()
+    } else if reconnecting {
+        *recover(state.wda_health.lock())
+    } else {
+        cached_wda_health(&state).await
     };
     let wda = health.up;
     let wda_actionable = health.actionable;
@@ -649,11 +1223,15 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         Some(false) => "false",
         None => "null",
     };
-    // Derived mode (see `agent_mode`): WDA up wins — while the on-phone
-    // XCUITest runner is alive, Mirroring CANNOT connect (hardware-verified
-    // mutual exclusion), so phone_target at best shows the Interrupted screen.
-    let mode = if wda {
-        "agent"
+    // `backend` is configuration and never changes because a health probe
+    // flickered. `mode` remains for old clients, but in direct mode it can only
+    // be agent/offline — never an implicit switch back to Mirroring.
+    let mode = if direct {
+        if wda {
+            "agent"
+        } else {
+            "offline"
+        }
     } else if phone_target {
         "mirror"
     } else {
@@ -664,11 +1242,11 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // "in use" interstitial, where L3 taps land in the void. `drivable` is the
     // honest "can an agent act right now" signal: WDA always can (on-device);
     // the mirror path can only when the window isn't paused.
-    let (mirror_state, drivable) = if wda {
-        // WDA injects on-device regardless of the mirror window — but only if
-        // it can actually act. A "zombie ready" runner (locked / severed) is up
-        // yet undrivable, so gate drivable on the action-level probe.
-        ("active", wda_actionable)
+    let (mirror_state, drivable) = if direct {
+        (
+            "disabled",
+            wda_actionable && !releasing && !reconnecting && !released,
+        )
     } else if phone_target {
         let s = mirror_state_cached(&state).await;
         (s.as_str(), s.drivable())
@@ -682,7 +1260,7 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     // WILL interrupt them. (Agent/WDA mode injects on-device → no contention,
     // so this is always false there.) Passive NSWorkspace read — no focus steal.
     #[cfg(target_os = "macos")]
-    let human_active = !wda && drivable && !crate::macos::mirroring_is_frontmost();
+    let human_active = !direct && drivable && !crate::macos::mirroring_is_frontmost();
     #[cfg(not(target_os = "macos"))]
     let human_active = false;
     // Version + update hint. `latest_release` is fetched by a background
@@ -692,59 +1270,145 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     let latest = recover(state.latest_release.lock()).clone();
     let (latest_json, update_available) = match &latest {
         Some(tag) => (
-            format!(r#""{tag}""#),
+            serde_json::to_string(tag).unwrap_or_else(|_| "null".to_string()),
             tag.trim_start_matches('v') != version,
         ),
         None => ("null".to_string(), false),
     };
     // Connected `/ws` viewers (active + queued) — issue #8.
-    let viewer_count = recover(state.viewers.lock()).count();
+    let ws_viewer_count = recover(state.viewers.lock()).count();
+    let mjpeg_viewer_count = state
+        .live_streams
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let viewer_count = ws_viewer_count.saturating_add(mjpeg_viewer_count);
+    let mjpeg_stream_age_ms = query.stream_id.as_deref().and_then(|stream_id| {
+        recover(state.mjpeg_stream_activity.lock())
+            .get(stream_id)
+            .map(|(_, last_chunk)| {
+                u64::try_from(last_chunk.elapsed().as_millis()).unwrap_or(u64::MAX)
+            })
+    });
+    let mjpeg_stream_fresh = mjpeg_stream_age_ms.is_some_and(|age_ms| {
+        age_ms <= u64::try_from(MJPEG_INACTIVITY_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+    });
+    let mjpeg_stream_age_json = mjpeg_stream_age_ms
+        .map(|age_ms| age_ms.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let recovery_owner = if direct {
+        if state.managed_wda {
+            "daemon"
+        } else if state.managed_wda_pending {
+            "unconfigured"
+        } else {
+            "external"
+        }
+    } else {
+        "mirror"
+    };
+    // Setup progress: `setup-wda.sh` writes ~/.iphone-use/wda-setup-status.json
+    // ({phase, blocked_on, message, ts}) as it runs. Read it before selecting
+    // the recovery hint: a concrete prerequisite failure must take precedence
+    // over the generic "keep waiting" text while reconnecting.
+    let setup_status = if direct && state.managed_wda {
+        read_structured_setup_status()
+    } else {
+        None
+    };
+    let setup_blocked_on = if direct && state.managed_wda {
+        read_setup_blocked_on()
+    } else {
+        String::new()
+    };
+    let setup_phase_json = serde_json::to_string(
+        setup_status
+            .as_ref()
+            .map(|status| status.phase.as_str())
+            .unwrap_or(""),
+    )
+    .unwrap_or_else(|_| "\"\"".to_string());
+    let setup_message_json = serde_json::to_string(
+        setup_status
+            .as_ref()
+            .map(|status| status.message.as_str())
+            .unwrap_or(""),
+    )
+    .unwrap_or_else(|_| "\"\"".to_string());
     // When not drivable, tell the caller HOW to recover (the recovery differs by
     // state, and auto-recovery is blocked by macOS while the phone is in use).
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
-    let hint = if wda && !wda_actionable {
-        // "Zombie ready": runner answers /status but UI actions fail Code=41.
-        // Almost always the phone is locked/asleep; otherwise the test session
-        // was severed (sleep / WARP toggle / CoreDevice tunnel).
-        if wda_locked == "true" {
-            "WDA is up but the phone is LOCKED — XCUITest cannot act on a locked screen (every action fails Code=41). Unlock the phone and keep it awake (set Auto-Lock to Never for long agent sessions)."
+    let hint = if direct && releasing {
+        "direct device service is being released after inactivity — wait for confirmation before reconnecting"
+    } else if direct && !wda {
+        if state.managed_wda_pending {
+            "no canonical iPhone target is configured — run setup-wda.sh to persist PHONE_REMOTE_UDID; until then the daemon will not stop or bootstrap local WDA"
+        } else if let Some(blocker_hint) = setup_blocker_hint(&setup_blocked_on) {
+            blocker_hint
+        } else if reconnecting {
+            "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying"
+        } else if released && !state.managed_wda {
+            "the remote WDA endpoint is externally managed — restart it on the owning host; this daemon will not stop or bootstrap local services"
+        } else if released {
+            "direct device service was released after inactivity — reconnect to restart WDA, then keep the phone unlocked and awake"
+        } else if !state.managed_wda {
+            "the configured remote WDA endpoint is unreachable and externally managed — recover it on the owning host; this daemon will not run local setup or launchctl commands"
         } else {
-            "WDA answers /status but cannot perform UI actions (Code=41) — the test session was severed (phone sleep / WARP toggle / CoreDevice tunnel), a 'zombie ready' runner. Restart WDA via POST /agent/mode mode=agent (with the phone unlocked and awake)."
+            "direct device service is unreachable — start or repair WDA and the 8100/9100 relays; iPhone Mirroring is not used"
+        }
+    } else if direct && reconnecting {
+        "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying"
+    } else if direct && wda && !wda_actionable {
+        if wda_locked == "true" {
+            "WDA is reachable but the iPhone is locked — unlock it and keep it awake; direct control never falls back to iPhone Mirroring"
+        } else {
+            "WDA is reachable but cannot act — restart the direct device service; direct control is fail-closed and will not inject into the Mac"
         }
     } else if !drivable {
         match mirror_state {
             "paused" => "Mirroring needs reconnecting (paused / interrupted / timed out) — tap the Resume/Connect/Try Again button (x=0.5, y=0.64), once, then wait 45s+; do NOT loop",
             "in_use" => "iPhone in use — LOCK the phone to reconnect; the on-screen Connect button will not reconnect while it is in use",
-            "offline" => "no iPhone Mirroring window — open iPhone Mirroring on the Mac, or start WebDriverAgent for on-device control",
+            "offline" => "no iPhone Mirroring window — open it on the Mac; to use on-device control, persist PHONE_REMOTE_BACKEND=direct and restart the daemon",
             _ => "",
         }
     } else if human_active {
         // Issue #16: a human is on the Mac — yield instead of stealing focus.
-        "a human is using the Mac (iPhone Mirroring is not frontmost) — an L3 tap will steal their focus; pause until they are idle, or switch to agent mode (on-device, no focus steal) via POST /agent/mode mode=agent"
-    } else if !wda && state.wda.is_some() {
-        // WDA was configured but the probe is down — the on-phone XCUITest runner
-        // was almost certainly reaped by iOS (issue #14 §4). Spell out the
-        // recovery, not just "no WDA".
-        "WDA configured but unreachable (the on-phone runner was likely reaped) — taps/scroll still work but text typing is unreliable; restart WDA via POST /agent/mode mode=agent, then poll status for wda:true"
-    } else if !wda {
-        // No WDA configured at all. Taps/scroll land; text/key injection through
-        // the mirror is unreliable (Mirroring does not forward synthetic
-        // keystrokes — issue #15). Point the agent at the reliable path.
-        "no WDA: taps/scroll work but text typing is unreliable through the mirror — for reliable typing start WDA via POST /agent/mode mode=agent (needs the phone unlocked once)"
+        "a human is using the Mac (iPhone Mirroring is not frontmost) — an L3 tap will steal their focus; pause until they are idle, or persist PHONE_REMOTE_BACKEND=direct and restart for on-device control"
     } else {
         ""
     };
-    // Setup progress: `setup-wda.sh` writes ~/.iphone-use/wda-setup-status.json
-    // ({phase, blocked_on, message, ts}) as it runs. Surface `setup_blocked_on`
-    // so a caller (or POST /agent/mode) knows WHY a WDA bring-up is stuck —
-    // "warp" | "usb" | "trust" | "ddi" | "" — instead of polling wda:false
-    // blind. Only honored while fresh (< 5 min) so a stale file isn't reported.
-    let setup_blocked_on = read_setup_blocked_on();
-    // Idle auto-release: surface whether the phone was let go for inactivity, so
-    // the web client can show "released — tap to reconnect" instead of an error.
-    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    let device_state = if releasing {
+        "releasing"
+    } else if direct && !wda && !setup_blocked_on.is_empty() {
+        "blocked"
+    } else if reconnecting {
+        "reconnecting"
+    } else if released {
+        "released"
+    } else if wda_actionable {
+        "ready"
+    } else if wda_locked == "true" {
+        "locked"
+    } else if wda {
+        "blocked"
+    } else {
+        "offline"
+    };
+    let screen_state = if direct && wda && mjpeg_stream_fresh {
+        "live"
+    } else if direct && wda {
+        "waiting"
+    } else if direct {
+        "offline"
+    } else if phone_target {
+        "ready"
+    } else {
+        "offline"
+    };
     let body = format!(
-        r#"{{"ok":true,"phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","mirror_state":"{mirror_state}","released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","viewer_count":{viewer_count},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#
+        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        state.backend.as_str(),
+        state.device_udid.is_some(),
+        state.managed_wda,
+        state.managed_wda_pending,
     );
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -755,29 +1419,161 @@ async fn agent_status(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
 
 /// Read `blocked_on` from `setup-wda.sh`'s status file, but only if it was
 /// written in the last 5 minutes (a stale file from a finished run shouldn't be
-/// reported as a live blocker). Returns "" when absent/stale/unparseable —
-/// best-effort, never errors.
+/// reported as a live blocker).
+///
+/// Older installed helper copies predate the structured USB status write. For
+/// that one compatibility case, inspect only the latest, fresh setup-log
+/// attempt and recognize its exact USB failure text. This keeps a source-built
+/// daemon paired with an older installed helper from polling `reconnecting`
+/// blindly for two minutes. The fallback is deliberately narrow: it does not
+/// infer blockers from arbitrary log prose.
 fn read_setup_blocked_on() -> String {
-    let path = match std::env::var("HOME") {
-        Ok(h) => format!("{h}/.iphone-use/wda-setup-status.json"),
+    let blocker = read_structured_setup_blocked_on();
+    if !blocker.is_empty() {
+        return blocker;
+    }
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
         Err(_) => return String::new(),
     };
-    let txt = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return String::new(),
+    read_recent_setup_log_blocker(&format!("{home}/.iphone-use/wda-agent.log"))
+}
+
+/// Read only the current helper's timestamped structured prerequisite state.
+///
+/// Unlike [`read_setup_blocked_on`], this has no compatibility inference from
+/// historical log text and is therefore safe to drive reconnect lifecycle.
+fn read_structured_setup_blocked_on() -> String {
+    read_structured_setup_status()
+        .map(|status| status.blocked_on)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct WdaSetupStatus {
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    blocked_on: String,
+    #[serde(default)]
+    message: String,
+    ts: u64,
+}
+
+fn read_structured_setup_status() -> Option<WdaSetupStatus> {
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => return None,
     };
-    let v: serde_json::Value = match serde_json::from_str(&txt) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
+    let status_path = format!("{home}/.iphone-use/wda-setup-status.json");
+    std::fs::read_to_string(status_path)
+        .ok()
+        .and_then(|txt| parse_setup_status(&txt, now_secs()))
+}
+
+fn read_recent_setup_log_blocker(path: &str) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024;
+    const MAX_LOG_AGE_SECS: u64 = 300;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return String::new();
     };
-    let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-    if now_secs().saturating_sub(ts) > 300 {
+    let fresh = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age.as_secs() <= MAX_LOG_AGE_SECS);
+    if !fresh {
         return String::new();
     }
-    v.get("blocked_on")
-        .and_then(|b| b.as_str())
-        .unwrap_or("")
-        .to_string()
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let start = metadata.len().saturating_sub(MAX_LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().saturating_sub(start)).unwrap_or(0));
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    parse_setup_log_blocked_on(&String::from_utf8_lossy(&bytes))
+}
+
+fn parse_setup_log_blocked_on(txt: &str) -> String {
+    let latest_attempt = txt
+        .rsplit_once("== Checking prerequisites")
+        .map_or(txt, |(_, latest)| latest);
+    if latest_attempt.contains("WARP is ON and will block WDA")
+        || latest_attempt.contains("Split Tunnel exclusions do not cover the CoreDevice")
+    {
+        "warp".to_string()
+    } else if latest_attempt.contains("not currently connected over USB")
+        || latest_attempt.contains("no USB iPhone was found")
+        || latest_attempt.contains("no USB iPhone is connected")
+    {
+        "usb".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
+    match blocked_on {
+        "warp" => Some(
+            "WARP is capturing the CoreDevice device tunnel — for selected destinations, ask the Zero Trust administrator for Traffic only mode with Split Tunnels Include limited to those destination IPs/CIDRs; otherwise exclude fe80::/10 and fd00::/8 in full-tunnel mode (or temporarily run warp-cli disconnect), then wait for policy propagation and poll status; do not send another reconnect request while this blocker remains",
+        ),
+        "proxy" => Some(
+            "a system proxy is blocking CoreDevice/WDA — disable the proxy for the device tunnel, then poll status; do not send another reconnect request while this blocker remains",
+        ),
+        "usb" => Some(
+            "the configured iPhone is not available over USB — connect that phone, unlock it, and keep it awake while the managed service retries",
+        ),
+        "trust" => Some(
+            "the configured iPhone needs trust or developer-signing approval — unlock the phone, accept the prompt, then keep it awake while the managed service retries",
+        ),
+        "ddi" => Some(
+            "the iPhone Developer Disk Image is unavailable — open Xcode with the phone connected, let device preparation finish, then poll status",
+        ),
+        "wda" => Some(
+            "WebDriverAgent failed to start — inspect ~/.iphone-use/wda-agent.log and run setup-wda.sh doctor before retrying",
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn parse_setup_blocked_on(txt: &str, now: u64) -> String {
+    parse_setup_status(txt, now)
+        .map(|status| status.blocked_on)
+        .unwrap_or_default()
+}
+
+fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
+    let mut status: WdaSetupStatus = serde_json::from_str(txt).ok()?;
+    if now.saturating_sub(status.ts) > 300 {
+        return None;
+    }
+    if !matches!(
+        status.blocked_on.as_str(),
+        "" | "warp" | "proxy" | "usb" | "trust" | "ddi" | "wda"
+    ) {
+        return None;
+    }
+    // Old helpers emitted only {blocked_on, ts}. Keep their actionable
+    // blocker compatible, while rejecting a payload that has neither progress
+    // nor a blocker and therefore communicates no state at all.
+    if status.phase.is_empty() && status.blocked_on.is_empty() {
+        return None;
+    }
+    // Keep the wire response bounded even if a locally modified helper writes
+    // an unexpectedly large progress string. serde_json handles escaping.
+    status.phase = status.phase.chars().take(64).collect();
+    status.message = status.message.chars().take(512).collect();
+    Some(status)
 }
 
 /// launchd label for the dedicated, self-healing WDA job.
@@ -795,51 +1591,324 @@ fn gui_domain() -> String {
     format!("gui/{uid}")
 }
 
-/// Write the WDA LaunchAgent plist and (re)bootstrap it. Running WDA as its OWN
-/// launchd job — `KeepAlive=true`, in the user's GUI domain, NOT this daemon's
-/// cgroup — makes it (a) survive daemon restarts and (b) auto-restart when the
-/// runner dies (WARP reconnect / sleep / USB hiccup). `ThrottleInterval` caps
-/// the rebuild rate so a persistent killer thrashes harmlessly. Returns whether
-/// the bootstrap succeeded.
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn launchd_job_loaded(domain: &str, label: &str) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("{domain}/{label}")])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn wait_launchd_job_gone(domain: &str, label: &str) -> bool {
+    for _ in 0..20 {
+        if !launchd_job_loaded(domain, label) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    !launchd_job_loaded(domain, label)
+}
+
+fn valid_wda_udid(udid: &str) -> bool {
+    !udid.is_empty()
+        && udid.len() <= 128
+        && udid
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+}
+
+/// Write a same-directory, mode-0600 staging file without touching the live
+/// destination. The caller validates and atomically renames it into place.
+fn stage_file(
+    destination: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("staged file has no parent"))?;
+    for _ in 0..32 {
+        let suffix = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("wda-agent"),
+            std::process::id(),
+            suffix
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(mut file) => {
+                let written = file.write_all(contents).and_then(|()| file.sync_all());
+                drop(file);
+                match written {
+                    Ok(()) => return Ok(candidate),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique staging file",
+    ))
+}
+
+fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
+    match original {
+        Some(contents) => {
+            if let Ok(staged) = stage_file(plist_path, contents) {
+                let _ = std::fs::rename(staged, plist_path);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(plist_path);
+        }
+    }
+    if let Some(parent) = plist_path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+}
+
+/// Start or restart the dedicated WDA supervisor without destroying its
+/// persisted signing/path/port policy.
+///
+/// `setup-wda.sh` owns the complete plist contract. Reconnect edits only a
+/// mode-0600 staging copy, validates it, and atomically installs it so a crash
+/// cannot truncate the live policy. A changed target is fully unloaded and
+/// bootstrapped because launchd caches environment variables; an unchanged
+/// policy may be kickstarted. A minimal plist is created only when no
+/// setup-generated file exists yet.
 fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &str) -> bool {
-    let plist_path = format!("{home}/Library/LaunchAgents/{WDA_AGENT_LABEL}.plist");
-    let udid_kv = if udid.is_empty() {
-        String::new()
-    } else {
-        format!("        <key>WDA_UDID</key><string>{udid}</string>\n")
+    if !std::path::Path::new(setup_sh).is_file() || !valid_wda_udid(udid) {
+        return false;
+    }
+    let plist_path = std::path::PathBuf::from(format!(
+        "{home}/Library/LaunchAgents/{WDA_AGENT_LABEL}.plist"
+    ));
+    let Some(parent) = plist_path.parent() else {
+        return false;
     };
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let original = match std::fs::read(&plist_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return false,
+    };
+
+    let candidate = if let Some(contents) = &original {
+        contents.clone()
+    } else {
+        let mut environment = vec![
+            ("WDA_KEEPALIVE", "1".to_string()),
+            ("WDA_UDID", udid.to_string()),
+            (
+                "PATH",
+                "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin".to_string(),
+            ),
+        ];
+        for key in [
+            "WDA_TEAM_ID",
+            "WDA_BUNDLE_ID",
+            "WDA_DIR",
+            "WDA_REF",
+            "WDA_PORT",
+            "MJPEG_PORT",
+            "WDA_ALLOW_LAN",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() {
+                    environment.push((key, value));
+                }
+            }
+        }
+        let env_xml = environment
+            .into_iter()
+            .map(|(key, value)| {
+                format!(
+                    "        <key>{key}</key><string>{}</string>\n",
+                    xml_escape(&value)
+                )
+            })
+            .collect::<String>();
+        let setup_sh_xml = xml_escape(setup_sh);
+        let log_xml = xml_escape(log);
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>Label</key><string>{WDA_AGENT_LABEL}</string>
     <key>ProgramArguments</key>
-    <array><string>/bin/bash</string><string>{setup_sh}</string></array>
+    <array><string>/bin/bash</string><string>{setup_sh_xml}</string></array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>WDA_KEEPALIVE</key><string>1</string>
-        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-{udid_kv}    </dict>
+{env_xml}    </dict>
     <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>30</integer>
     <key>RunAtLoad</key><true/>
-    <key>StandardOutPath</key><string>{log}</string>
-    <key>StandardErrorPath</key><string>{log}</string>
+    <key>StandardOutPath</key><string>{log_xml}</string>
+    <key>StandardErrorPath</key><string>{log_xml}</string>
 </dict></plist>
 "#
-    );
-    if std::fs::write(&plist_path, plist).is_err() {
+        )
+        .into_bytes()
+    };
+
+    let staged = match stage_file(&plist_path, &candidate) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if original.is_some() {
+        // Edit only the staging copy. A crash or PlistBuddy failure cannot
+        // truncate or partially rewrite the live launchd configuration.
+        let set_command = format!("Set :EnvironmentVariables:WDA_UDID {udid}");
+        let set = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", &set_command])
+            .arg(&staged)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !set {
+            let add_command = format!("Add :EnvironmentVariables:WDA_UDID string {udid}");
+            let added = std::process::Command::new("/usr/libexec/PlistBuddy")
+                .args(["-c", &add_command])
+                .arg(&staged)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !added {
+                let _ = std::fs::remove_file(&staged);
+                return false;
+            }
+        }
+    }
+    if !std::process::Command::new("plutil")
+        .args(["-lint"])
+        .arg(&staged)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&staged);
         return false;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            return false;
+        }
+    }
+    let staged_contents = match std::fs::read(&staged) {
+        Ok(contents) => contents,
+        Err(_) => {
+            let _ = std::fs::remove_file(&staged);
+            return false;
+        }
+    };
+    let plist_changed = original.as_deref() != Some(staged_contents.as_slice());
+    if plist_changed {
+        if std::fs::rename(&staged, &plist_path).is_err()
+            || std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .is_err()
+        {
+            let _ = std::fs::remove_file(&staged);
+            restore_plist(&plist_path, original.as_deref());
+            return false;
+        }
+    } else {
+        let _ = std::fs::remove_file(&staged);
+    }
+
     let domain = gui_domain();
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{WDA_AGENT_LABEL}")])
-        .status();
-    std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist_path])
+    let service = format!("{domain}/{WDA_AGENT_LABEL}");
+    let was_loaded = launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    // A persistently disabled service rejects bootstrap. Enable first and treat
+    // failure as authoritative instead of continuing into a misleading start.
+    if !std::process::Command::new("launchctl")
+        .args(["enable", &service])
         .status()
-        .map(|s| s.success())
+        .map(|status| status.success())
         .unwrap_or(false)
+    {
+        if plist_changed {
+            if was_loaded {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["bootout", &service])
+                    .status();
+                let _ = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+            }
+            restore_plist(&plist_path, original.as_deref());
+        }
+        return false;
+    }
+    let activated = if was_loaded && !plist_changed {
+        // The cached launchd configuration is identical, so kickstart is safe.
+        std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &service])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    } else {
+        // Any plist change (especially WDA_UDID) requires a full unload/reload;
+        // kickstart alone would reuse launchd's cached old environment.
+        if was_loaded {
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &service])
+                .status();
+        }
+        wait_launchd_job_gone(&domain, WDA_AGENT_LABEL)
+            && std::process::Command::new("launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&plist_path)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+    };
+    let verified = activated && launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    if !verified && plist_changed {
+        // Preserve the last known-good on-disk policy while leaving the
+        // mismatched service down; never restart a cached old target.
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &service])
+            .status();
+        let _ = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+        restore_plist(&plist_path, original.as_deref());
+    }
+    verified
 }
 
 /// Boot out the WDA LaunchAgent (so its KeepAlive stops rebuilding the runner).
@@ -852,24 +1921,50 @@ fn bootout_wda_agent() {
 
 /// Stop the on-phone WDA runner + relay and boot out its KeepAlive LaunchAgent
 /// (FIRST — else KeepAlive would just rebuild the runner we're about to kill).
-/// Shared by `mode=mirror` and the idle-release watchdog. Returns whether the
-/// `setup-wda.sh stop` path ran (vs. the pkill fallback). Blocking — call under
-/// `spawn_blocking`.
+/// Used by the idle-release watchdog. Only the dedicated launchd job and setup
+/// script are in scope: global process-name matching can kill an unrelated
+/// developer's xcodebuild/iproxy process (or a different phone). If the script
+/// is unavailable, orphan ownership cannot be proven and the stop deliberately
+/// fails closed. Blocking — call under `spawn_blocking`.
 fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
     bootout_wda_agent();
-    let via_script = std::path::Path::new(setup_sh).exists()
+    let stopped_by_owner = std::path::Path::new(setup_sh).is_file()
         && std::process::Command::new("bash")
             .arg(setup_sh)
             .arg("stop")
             .status()
-            .map(|s| s.success())
+            .map(|status| status.success())
             .unwrap_or(false);
-    if !via_script {
-        for pat in ["xcodebuild.*WebDriverAgentRunner", "socat.*8100", "iproxy 8100"] {
-            let _ = std::process::Command::new("pkill").args(["-f", pat]).status();
-        }
+    let domain = gui_domain();
+    let supervisor_gone = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+    supervisor_gone && stopped_by_owner
+}
+
+/// Give idle-release observation priority over a background status probe while
+/// preserving foreground control priority. The second pending check while
+/// holding the probe slot closes the race with [`AppState::begin_wda_control`],
+/// which increments the counter before taking the same slot.
+fn abort_health_probe_for_idle(
+    control_pending: &std::sync::atomic::AtomicUsize,
+    probe_slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if control_pending.load(Ordering::Acquire) != 0 {
+        return false;
     }
-    via_script
+    let mut probe = recover(probe_slot.lock());
+    if control_pending.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    if let Some(probe) = probe.take() {
+        probe.abort();
+    }
+    true
+}
+
+fn prepare_idle_wda_probe(state: &AppState) -> bool {
+    abort_health_probe_for_idle(&state.wda_control_pending, &state.wda_health_probe)
 }
 
 /// Idle auto-release — the phone belongs to its owner first. When WDA is
@@ -878,14 +1973,18 @@ fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
 /// WDA runner and boot out its KeepAlive LaunchAgent so the device is free for
 /// hands-on use. The next `/agent/input` re-bootstraps WDA (see [`agent_input`]).
 ///
-/// Unlike `mode=mirror`, this does NOT bring iPhone Mirroring frontmost — the
-/// goal is to LET GO of the phone, not grab it back for screen viewing.
+/// This transition only lets go of the configured Direct target; it never
+/// opens, focuses, or otherwise touches the separate Mirror compatibility
+/// backend.
 ///
 /// No-op (and silent) when WDA isn't configured: a pure L3/mirror deployment has
 /// no persistent on-device session to release.
 pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
-    if state.wda.is_none() {
-        return; // nothing persistent to release without WDA
+    if state.backend != crate::config::DeviceBackend::Direct
+        || !state.managed_wda
+        || state.wda.is_none()
+    {
+        return; // external/remote WDA and mirror mode are never lifecycle-managed here
     }
     let idle_secs = std::env::var("PHONE_REMOTE_IDLE_RELEASE_SECS")
         .ok()
@@ -902,25 +2001,77 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
         const POLL: std::time::Duration = std::time::Duration::from_secs(20);
         let home = std::env::var("HOME").unwrap_or_default();
         let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+        let mut was_up = false;
         loop {
             tokio::time::sleep(POLL).await;
             if state.released.load(Ordering::Relaxed) {
                 continue; // already let go — reconnect is on-demand (agent_input)
             }
+            if state.wda_lifecycle.is_transitioning() {
+                continue;
+            }
+            // Status polling must not starve lifecycle work forever. Cancel its
+            // bounded health probe only when no real control is pending; control
+            // always wins this arbitration.
+            if !prepare_idle_wda_probe(&state) {
+                continue;
+            }
+            // Observe the service transition before consulting the idle clock.
+            // The daemon may have spent hours online while WDA was down; when a
+            // human starts WDA later, that first up edge begins a fresh full
+            // activity window instead of immediately releasing the new runner.
+            let up = match &state.wda {
+                Some(wda) => match wda.try_lock() {
+                    Ok(client) => {
+                        if state.wda_control_pending.load(Ordering::Acquire) != 0 {
+                            drop(client);
+                            continue;
+                        }
+                        tokio::time::timeout(std::time::Duration::from_millis(1500), client.is_up())
+                            .await
+                            .unwrap_or(false)
+                    }
+                    Err(_) => continue,
+                },
+                None => false,
+            };
+            if !up {
+                was_up = false;
+                continue;
+            }
+            if !was_up {
+                was_up = true;
+                state.touch_activity();
+                continue;
+            }
             if state.viewer_busy() {
                 continue; // someone is watching the live feed
+            }
+            if state.wda_control_pending.load(Ordering::Acquire) != 0 {
+                continue; // a real control request outranks idle release
             }
             if state.idle_for() < window {
                 continue; // driven recently
             }
-            // Only release a runner that's actually up — don't fight a bring-up
-            // already in progress, and don't churn launchctl when WDA is down
-            // for some other reason.
-            let up = match &state.wda {
-                Some(w) => w.lock().await.is_up().await,
-                None => false,
-            };
-            if !up {
+            // The WDA probe waits behind the shared client lock. Activity may
+            // have resumed while we were awaiting it, so re-check before owning
+            // the release transition.
+            if state.viewer_busy()
+                || state.idle_for() < window
+                || state.wda_control_pending.load(Ordering::Acquire) != 0
+            {
+                continue;
+            }
+            if !state.wda_lifecycle.try_begin_releasing() {
+                continue;
+            }
+            // Close the check→CAS race. Once `releasing=true`, request handlers
+            // fail fast and cannot start a new device action.
+            if state.viewer_busy()
+                || state.idle_for() < window
+                || state.wda_control_pending.load(Ordering::Acquire) != 0
+            {
+                state.wda_lifecycle.finish_releasing();
                 continue;
             }
             tracing::info!(
@@ -928,97 +2079,163 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 state.idle_for().as_secs()
             );
             let script = setup_sh.clone();
-            tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
                 .await
-                .ok();
-            if let Some(wda) = &state.wda {
-                wda.lock().await.invalidate_session();
+                .unwrap_or(false);
+            let endpoint_down = match &state.wda {
+                Some(wda) => {
+                    let mut wda = wda.lock().await;
+                    wda.invalidate_session();
+                    !wda.is_up().await
+                }
+                None => true,
+            };
+            if stopped && endpoint_down {
+                state.wda_actionable.store(false, Ordering::Relaxed);
+                *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                state.released.store(true, Ordering::Release);
+                was_up = false;
+                tracing::info!("idle release confirmed: supervisor/runner stopped and WDA is down");
+            } else {
+                tracing::warn!(
+                    "idle release was not confirmed (processes_stopped={stopped}, endpoint_down={endpoint_down}); keeping device state active"
+                );
             }
-            state.wda_actionable.store(false, Ordering::Relaxed);
-            state.released.store(true, Ordering::Relaxed);
+            state.wda_lifecycle.finish_releasing();
         }
     });
 }
 
-/// `POST /agent/mode` — switch between the two (mutually exclusive) control
-/// modes. Body: `{"mode":"mirror"}` or `{"mode":"agent"}`.
+/// `POST /agent/mode` — recover the currently configured backend.
+/// Body: `{"mode":"mirror"}` for Mirror or `{"mode":"agent"}` for Direct.
 ///
 /// The on-phone XCUITest runner (WDA, the L2 layer) monopolizes the device's
 /// remote session: while it runs, iPhone Mirroring shows "Connection
 /// Interrupted" and can never reconnect — even with the phone locked
-/// (hardware A/B-verified, see docs/wda-setup.html pitfall ⑨). So L2 and
-/// L3-video are switch MODES, not stacked layers, and this endpoint
-/// orchestrates the switch:
+/// (hardware A/B-verified, see docs/wda-setup.html pitfall ⑨). The configured
+/// backend is therefore persistent and never changes here:
 ///
-/// * `mirror` — stop the WDA runner + relay (via `~/.iphone-use/setup-wda.sh
-///   stop`, falling back to pkill), bring Mirroring frontmost, and tap its
-///   "Try Again" button through the L3 injector. Returns once dispatched;
+/// * Mirror + `mirror` — bring Mirroring frontmost and tap its "Try Again"
+///   button through the L3 injector. Returns once dispatched;
 ///   callers poll `/agent/status` for `"mode":"mirror"` and verify pixels.
-/// * `agent` — spawn `~/.iphone-use/setup-wda.sh` detached (the script
-///   self-installs there). WDA takes ~30-90s; poll `/agent/status` for
-///   `"wda":true`. Mirroring will drop — expected.
+/// * Direct + `agent` — recover daemon-managed WDA using its persisted
+///   canonical target. Poll until `reconnecting:false` and `drivable:true`.
+///
+/// A cross-backend value returns 409 and instructs the operator to persist
+/// `PHONE_REMOTE_BACKEND` and restart.
 async fn agent_mode(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     // Cookie OR bearer (same gate as screenshot/status) so the web client's
-    // "Reconnect" button can drive the mode switch without the agent token.
-    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
-    if !cookie_ok {
-        match agent_auth(&state, &headers) {
-            AgentAuth::Locked => return with_security_headers(
+    // "Reconnect" button can recover its current backend without an agent token.
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
                 (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            ),
-            AgentAuth::Denied => return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            ),
-            AgentAuth::Ok => {}
+            )
         }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
     let mode = parsed
         .as_ref()
         .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
         .unwrap_or_default();
-    // Optional target UDID — drive a SPECIFIC paired phone (not just the
-    // Mirroring one). Passed to setup-wda.sh as WDA_UDID. Sanitized to the
-    // hex/dash charset so it can't inject into the spawned shell command.
-    let udid = parsed
+    if state.backend == crate::config::DeviceBackend::Direct && mode == "mirror" {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"backend_is_direct","hint":"set PHONE_REMOTE_BACKEND=mirror and restart the daemon to use the legacy compatibility backend"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    if state.backend == crate::config::DeviceBackend::Mirror && mode == "agent" {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"backend_is_mirror","hint":"set PHONE_REMOTE_BACKEND=direct and restart the daemon to use device-side WDA control"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    if mode == "agent" && state.wda_lifecycle.is_releasing() {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"device_release_in_progress"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    // Optional target UDID. Invalid values are rejected rather than silently
+    // falling back to another phone. Once Direct has a persisted target, a
+    // transient request may not switch it behind status/idle recovery's back;
+    // change PHONE_REMOTE_UDID and restart to make a target change atomic.
+    let requested_udid = parsed
         .as_ref()
         .and_then(|v| v.get("udid").and_then(|u| u.as_str()))
-        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-        .map(String::from);
+        .filter(|u| !u.is_empty());
+    if requested_udid.is_some_and(|u| !u.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
+        return with_security_headers(
+            (StatusCode::BAD_REQUEST, "invalid target UDID").into_response(),
+        );
+    }
+    if state.backend == crate::config::DeviceBackend::Direct {
+        if mode == "agent" && state.managed_wda_pending {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh so PHONE_REMOTE_UDID is persisted before starting managed WDA"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        }
+        if let (Some(configured), Some(requested)) = (state.device_udid.as_deref(), requested_udid)
+        {
+            if configured != requested {
+                return with_security_headers(
+                    Response::builder()
+                        .status(StatusCode::CONFLICT)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"ok":false,"error":"target_change_requires_restart"}"#,
+                        ))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                );
+            }
+        }
+    }
+    let udid = state
+        .device_udid
+        .clone()
+        .or_else(|| requested_udid.map(String::from));
     let home = std::env::var("HOME").unwrap_or_default();
     let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
     match mode.as_str() {
         "mirror" => {
-            // 0) Lock the phone via WDA while it's still alive — Mirroring
-            //    can only connect to a LOCKED phone, so this makes the
-            //    reconnect deterministic instead of depending on whatever
-            //    state the agent left the phone in. Best-effort.
-            if let Some(wda) = &state.wda {
-                if let Err(e) = wda.lock().await.lock().await {
-                    tracing::warn!("wda lock before mirror switch failed (continuing): {e:#}");
-                }
-            }
-            // 1) Stop the WDA LaunchAgent FIRST (else its KeepAlive would just
-            //    rebuild the runner we're about to kill), then the runner +
-            //    relay via the script (single source of truth for pidfiles),
-            //    falling back to pkill.
-            let script = setup_sh.clone();
-            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
-                .await
-                .unwrap_or(false);
-            // 2) Drop any cached WDA session — it's dead now.
-            if let Some(wda) = &state.wda {
-                wda.lock().await.invalidate_session();
-            }
-            // 3) Give the phone a moment to release the session, then bring
-            //    Mirroring frontmost and tap "Try Again" (the button sits at
-            //    ~(0.5, 0.65) of the Interrupted screen — hardware-verified;
-            //    a stray tap there is harmless if already connected).
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            // Mirror recovery never starts, stops, or reuses WDA. Installation
+            // owns the explicit backend transition; runtime recovery only
+            // reopens the selected compatibility backend.
             #[cfg(target_os = "macos")]
             {
                 let _ = std::process::Command::new("open")
@@ -1033,17 +2250,15 @@ async fn agent_mode(
             if let Some(ev) =
                 crate::input_bridge::decode_control(r#"{"type":"tap","x":0.5,"y":0.65}"#)
             {
-                {
-                    let mut control = recover(state.control.lock());
-                    let lease = control
-                        .acquire(core::control::Holder::Agent("mode-switch".into()), now_secs());
-                    *recover(state.current_lease.lock()) = Some(lease);
-                }
+                recover(state.lease_state.lock()).acquire(
+                    core::control::Holder::Agent("mirror-recovery".into()),
+                    now_secs(),
+                );
                 state.injector.send(ev);
             }
-            let body = format!(
-                r#"{{"ok":true,"mode":"mirror","switching":true,"stopped_via_script":{stopped}}}"#
-            );
+            // Keep `switching` temporarily for older clients, while
+            // `recovering` names the actual current-backend operation.
+            let body = r#"{"ok":true,"mode":"mirror","recovering":true,"switching":true,"stopped_via_script":false}"#;
             with_security_headers(
                 Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
@@ -1052,6 +2267,19 @@ async fn agent_mode(
             )
         }
         "agent" => {
+            if !state.managed_wda {
+                return with_security_headers(
+                    Response::builder()
+                        .status(StatusCode::CONFLICT)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"ok":false,"error":"wda_is_externally_managed","recovery_owner":"external","hint":"restart the configured WDA endpoint on its owning host; this daemon will not run local setup or launchctl commands"}"#,
+                        ))
+                        .unwrap_or_else(|_| {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }),
+                );
+            }
             if !std::path::Path::new(&setup_sh).exists() {
                 return with_security_headers(
                     (
@@ -1074,19 +2302,55 @@ async fn agent_mode(
             //      the runner dies so launchd sees the exit and rebuilds.
             // ThrottleInterval caps the rebuild rate so a persistent killer
             // (WARP Always-On) thrashes harmlessly instead of hot-looping.
+            if !state.wda_lifecycle.try_begin_reconnecting() {
+                return with_security_headers(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::RETRY_AFTER, "5")
+                        .body(Body::from(
+                            r#"{"ok":false,"reconnecting":true,"error":"reconnect_in_progress"}"#,
+                        ))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                );
+            }
             let log = format!("{home}/.iphone-use/wda-agent.log");
-            let udid_env = udid.as_deref().unwrap_or("");
-            let spawned = write_and_bootstrap_wda_agent(&home, &setup_sh, &log, udid_env);
-            // Explicit bring-up clears any idle-release flag and resets the idle
-            // clock, so the watchdog doesn't immediately tear down the runner we
-            // just asked for.
-            state.released.store(false, std::sync::atomic::Ordering::Relaxed);
-            state.touch_activity();
+            let udid_env = udid.unwrap_or_default();
+            let home_for_bootstrap = home.clone();
+            let setup_for_bootstrap = setup_sh.clone();
+            let log_for_bootstrap = log.clone();
+            let spawned = tokio::task::spawn_blocking(move || {
+                write_and_bootstrap_wda_agent(
+                    &home_for_bootstrap,
+                    &setup_for_bootstrap,
+                    &log_for_bootstrap,
+                    &udid_env,
+                )
+            })
+            .await
+            .unwrap_or(false);
+            if spawned {
+                // launchd acceptance is not device readiness. Keep the
+                // transition visible and suppress duplicate reconnects until a
+                // real action-level probe succeeds (or the 120s budget ends).
+                *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                state
+                    .wda_actionable
+                    .store(false, std::sync::atomic::Ordering::Release);
+                spawn_wda_readiness_wait(state.clone());
+            } else {
+                state.wda_lifecycle.finish_reconnecting();
+            }
             let body = format!(
-                r#"{{"ok":{spawned},"mode":"agent","starting":true,"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — the launcher waits for it; WDA now auto-restarts if it drops"}}"#
+                r#"{{"ok":{spawned},"mode":"agent","starting":{spawned},"reconnecting":{spawned},"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — startup remains reconnecting until WDA can perform actions"}}"#
             );
             with_security_headers(
                 Response::builder()
+                    .status(if spawned {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    })
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
@@ -1108,6 +2372,16 @@ async fn agent_mode(
 /// `dx` reveals content to the right). The delta is scaled into a finger travel
 /// that is always a visible swipe (≥15% of the axis) yet stays on-screen (≤75%);
 /// the finger moves opposite to the content reveal.
+fn normalized_wda_axis(value: f64, size: f64) -> anyhow::Result<f64> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("normalized WDA coordinate must be within 0..=1");
+    }
+    if !size.is_finite() || size <= 2.0 {
+        anyhow::bail!("WDA screen axis must be larger than two points");
+    }
+    Ok((value * size).clamp(1.0, size - 1.0))
+}
+
 pub(crate) async fn wda_swipe(
     w: &mut crate::wda::WdaClient,
     nx: f64,
@@ -1123,8 +2397,8 @@ pub(crate) async fn wda_swipe(
         }
     };
     let (sw, sh) = w.window_size().await?;
-    let cx = (nx * sw).clamp(1.0, sw - 1.0);
-    let cy = (ny * sh).clamp(1.0, sh - 1.0);
+    let cx = normalized_wda_axis(nx, sw)?;
+    let cy = normalized_wda_axis(ny, sh)?;
     let tx = travel(dx, sw);
     let ty = travel(dy, sh);
     let x1 = (cx + tx / 2.0).clamp(1.0, sw - 1.0);
@@ -1141,25 +2415,124 @@ pub(crate) async fn wda_swipe(
 /// `devicectl` requires an explicit `--device` and the daemon doesn't otherwise
 /// track the UDID.
 #[cfg(target_os = "macos")]
-fn detect_connected_device() -> Option<String> {
-    let out = std::process::Command::new("xcrun")
-        .args(["devicectl", "list", "devices"])
-        .output()
-        .ok()?;
+#[derive(Debug, PartialEq, Eq)]
+enum DevicectlError {
+    Timeout,
+    TargetRequired(usize),
+    Failed(String),
+}
+
+/// Run a CoreDevice child with a server-owned deadline in addition to
+/// devicectl's own `--timeout`. The outer kill is essential: Command::output
+/// otherwise waits forever if CoreDevice wedges, and an HTTP timeout would only
+/// detach a child that could uninstall the app much later.
+#[cfg(target_os = "macos")]
+fn run_child_with_deadline(
+    command: &mut std::process::Command,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, DevicectlError> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| DevicectlError::Failed(format!("spawn devicectl: {e}")))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(DevicectlError::Timeout);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(DevicectlError::Failed(format!("wait for devicectl: {e}")));
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn detect_connected_device() -> Result<String, DevicectlError> {
+    let out = run_child_with_deadline(
+        std::process::Command::new("xcrun").args([
+            "devicectl",
+            "--quiet",
+            "--timeout",
+            "8",
+            "list",
+            "devices",
+        ]),
+        std::time::Duration::from_secs(12),
+    )?;
+    if !out.status.success() {
+        return Err(DevicectlError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut connected = Vec::new();
     for line in text.lines() {
         // States seen: "connected", "available (paired)", "unavailable".
-        // Only the live one contains the bare word "connected".
-        if line.contains("connected") {
+        // Match the state as a token; substring matching would misclassify a
+        // future "disconnected" state as usable.
+        let is_connected = line.split_whitespace().any(|field| {
+            field
+                .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                .eq_ignore_ascii_case("connected")
+        });
+        if is_connected {
             for tok in line.split_whitespace() {
                 // CoreDevice identifier is a 36-char UUID (8-4-4-4-12).
                 if tok.len() == 36 && tok.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-                    return Some(tok.to_string());
+                    let candidate = tok.to_string();
+                    if !connected.contains(&candidate) {
+                        connected.push(candidate);
+                    }
                 }
             }
         }
     }
-    None
+    match connected.len() {
+        1 => Ok(connected.remove(0)),
+        count => Err(DevicectlError::TargetRequired(count)),
+    }
 }
 
 /// Uninstall an app (and its data container) from a paired device via
@@ -1167,131 +2540,1851 @@ fn detect_connected_device() -> Option<String> {
 /// apps, and UI-driven deletion (Settings → Storage, or a home-screen
 /// long-press) is flaky to automate. `udid` defaults to the connected device.
 #[cfg(target_os = "macos")]
-fn devicectl_uninstall(udid: Option<&str>, bundle: &str) -> Result<(), String> {
+fn devicectl_uninstall(udid: Option<&str>, bundle: &str) -> Result<(), DevicectlError> {
     let device = match udid {
         Some(u) => u.to_string(),
-        None => detect_connected_device().ok_or_else(|| "no connected device".to_string())?,
+        None => detect_connected_device()?,
     };
-    let out = std::process::Command::new("xcrun")
-        .args(["devicectl", "device", "uninstall", "app", "--device", &device, bundle])
-        .output()
-        .map_err(|e| format!("spawn devicectl: {e}"))?;
+    let out = run_child_with_deadline(
+        std::process::Command::new("xcrun").args([
+            "devicectl",
+            "--quiet",
+            "--timeout",
+            "15",
+            "device",
+            "uninstall",
+            "app",
+            "--device",
+            &device,
+            bundle,
+        ]),
+        std::time::Duration::from_secs(20),
+    )?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Err(DevicectlError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
     }
 }
 
-/// Route a web-client control message (the WebRTC `control` data-channel JSON)
-/// to WDA when it's up, so the BROWSER drives the phone on-device in agent mode
-/// — like `/agent/input`, but for the live data channel. Returns true if WDA
-/// handled it; false → the caller falls back to the L3 (mirror) injector, which
-/// drives whatever the Mac mirrors and steals Mac focus. Covers the common
-/// interactions (tap/scroll/text/home); rarer events (drag down/up,
-/// spotlight/switcher, key) fall through to L3.
-pub(crate) async fn wda_control_from_json(
-    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WdaControlOutcome {
+    Applied,
+    NotSent,
+    Unsupported,
+    InvalidElementSnapshot,
+    StaleElementSnapshot,
+    ElementNotFound,
+    AmbiguousElement,
+    InvalidElementTarget,
+    Failed,
+}
+
+fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let encoded = serde_json::to_vec(rows)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
+}
+
+#[derive(Debug)]
+enum SnapshotElementTapError {
+    Invalid,
+    Stale,
+    NotFound,
+    Ambiguous,
+    BeforeDispatch(anyhow::Error),
+    AfterDispatch(anyhow::Error),
+}
+
+fn element_center(row: &crate::wda::ElementRow) -> Option<(f64, f64)> {
+    let [x, y, width, height] = row.rect;
+    if ![x, y, width, height].into_iter().all(f64::is_finite) || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some((x + width / 2.0, y + height / 2.0))
+}
+
+fn snapshot_row_locator(row: &crate::wda::ElementRow) -> Option<AgentElementLocator> {
+    let label = (!row.label.is_empty()).then(|| row.label.clone());
+    let kind = (!row.kind.is_empty()).then(|| row.kind.clone());
+    let identifier = row.identifier.clone().filter(|value| !value.is_empty());
+
+    // A label needs a type to avoid widening a snapshot-bound action into a
+    // different control with the same visible text. An accessibility
+    // identifier is independently usable through WDA's native lookup.
+    if identifier.is_none() && (label.is_none() || kind.is_none()) {
+        return None;
+    }
+
+    Some(AgentElementLocator {
+        label,
+        identifier,
+        kind,
+        value: row.value.clone(),
+        focused: row.focused,
+        enabled: row.enabled,
+        visible: row.visible,
+    })
+}
+
+async fn tap_snapshot_element(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+) -> Result<(), SnapshotElementTapError> {
+    let index = value
+        .get("element")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or(SnapshotElementTapError::Invalid)?;
+    let expected_snapshot = value
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .filter(|snapshot| !snapshot.is_empty())
+        .ok_or(SnapshotElementTapError::Invalid)?;
+
+    let rows = w
+        .elements()
+        .await
+        .map_err(SnapshotElementTapError::BeforeDispatch)?;
+    let current_snapshot =
+        element_snapshot_id(&rows).map_err(SnapshotElementTapError::BeforeDispatch)?;
+    if current_snapshot != expected_snapshot {
+        return Err(SnapshotElementTapError::Stale);
+    }
+
+    let row = rows.get(index).ok_or(SnapshotElementTapError::Invalid)?;
+    if let Some(locator) = snapshot_row_locator(row) {
+        // System-owned sheets and document pickers can publish stale or offset
+        // rectangles while their native XCUIElement remains clickable. The
+        // snapshot proves which semantic row the caller selected; re-resolve
+        // that row and require exactly one native element before dispatching.
+        // Never fall back to the suspect rectangle when semantic lookup fails.
+        let (using, value) = locator_wda_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
+        let element_ids = w
+            .find_elements(using, &value)
+            .await
+            .map_err(SnapshotElementTapError::BeforeDispatch)?;
+        let element_id = match element_ids.as_slice() {
+            [] => return Err(SnapshotElementTapError::NotFound),
+            [element_id] => element_id,
+            _ => return Err(SnapshotElementTapError::Ambiguous),
+        };
+        return w
+            .click_element(element_id)
+            .await
+            .map_err(SnapshotElementTapError::AfterDispatch);
+    }
+
+    let (x, y) = element_center(row).ok_or(SnapshotElementTapError::Invalid)?;
+    w.tap_point(x, y)
+        .await
+        .map_err(SnapshotElementTapError::AfterDispatch)
+}
+
+#[derive(Debug)]
+enum UniqueLabelTapError {
+    NotFound,
+    Ambiguous,
+    InvalidTarget,
+    BeforeDispatch(anyhow::Error),
+    AfterDispatch(anyhow::Error),
+}
+
+async fn tap_unique_label(
+    w: &mut crate::wda::WdaClient,
+    label: &str,
+) -> Result<(), UniqueLabelTapError> {
+    let rows = w
+        .elements()
+        .await
+        .map_err(UniqueLabelTapError::BeforeDispatch)?;
+    let mut matches = rows.iter().filter(|row| row.label == label);
+    let row = matches.next().ok_or(UniqueLabelTapError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(UniqueLabelTapError::Ambiguous);
+    }
+    let (x, y) = element_center(row).ok_or(UniqueLabelTapError::InvalidTarget)?;
+    w.tap_point(x, y)
+        .await
+        .map_err(UniqueLabelTapError::AfterDispatch)
+}
+
+async fn tap_unique_locator(
+    w: &mut crate::wda::WdaClient,
+    locator: &AgentElementLocator,
+) -> Result<(), UniqueLabelTapError> {
+    let rows = w
+        .elements()
+        .await
+        .map_err(UniqueLabelTapError::BeforeDispatch)?;
+    let mut matches = rows
+        .iter()
+        .filter(|row| agent_locator_matches(row, locator));
+    let row = matches.next().ok_or(UniqueLabelTapError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(UniqueLabelTapError::Ambiguous);
+    }
+    let _ = row;
+
+    // `/source?format=json` can report stale/wrong rectangles for elements in
+    // system-owned sheets (hardware-reproduced with the iOS share sheet's
+    // "Save to Files" cell). A coordinate tap at that rectangle returns a WDA
+    // success envelope while landing elsewhere. Re-resolve the already-proven
+    // unique locator through WDA's live element query and invoke XCUIElement's
+    // click action instead. Requiring exactly one returned element preserves
+    // the fail-closed uniqueness contract across the second lookup.
+    let (using, value) = locator_wda_query(locator).ok_or(UniqueLabelTapError::InvalidTarget)?;
+    let element_ids = w
+        .find_elements(using, &value)
+        .await
+        .map_err(UniqueLabelTapError::BeforeDispatch)?;
+    let element_id = match element_ids.as_slice() {
+        [] => return Err(UniqueLabelTapError::NotFound),
+        [element_id] => element_id,
+        _ => return Err(UniqueLabelTapError::Ambiguous),
+    };
+    w.click_element(element_id)
+        .await
+        .map_err(UniqueLabelTapError::AfterDispatch)
+}
+
+fn wda_predicate_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Build a fresh WDA element lookup for a strict agent locator.
+///
+/// WDA's predicate attributes do not expose the source tree's
+/// `rawIdentifier`. When an identifier is the only condition, accessibility-id
+/// is the closest native lookup and the caller still requires exactly one
+/// result. When other fields exist, the source-tree precheck above enforces the
+/// identifier while the predicate re-resolves every WDA-queryable condition.
+fn locator_wda_query(locator: &AgentElementLocator) -> Option<(&'static str, String)> {
+    let mut clauses = Vec::new();
+    if let Some(kind) = &locator.kind {
+        clauses.push(format!(
+            "type == {}",
+            wda_predicate_literal(&format!("XCUIElementType{kind}"))
+        ));
+    }
+    if let Some(label) = &locator.label {
+        let label = wda_predicate_literal(label);
+        clauses.push(format!("(label == {label} OR name == {label})"));
+    }
+    if let Some(value) = &locator.value {
+        clauses.push(format!("value == {}", wda_predicate_literal(value)));
+    }
+    if let Some(focused) = locator.focused {
+        clauses.push(format!("focused == {}", u8::from(focused)));
+    }
+    if let Some(enabled) = locator.enabled {
+        clauses.push(format!("enabled == {}", u8::from(enabled)));
+    }
+    if let Some(visible) = locator.visible {
+        clauses.push(format!("visible == {}", u8::from(visible)));
+    }
+    if clauses.is_empty() {
+        locator
+            .identifier
+            .as_ref()
+            .map(|identifier| ("accessibility id", identifier.clone()))
+    } else {
+        Some(("predicate string", clauses.join(" AND ")))
+    }
+}
+
+async fn wda_control_with_client(
+    w: &mut crate::wda::WdaClient,
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
-) -> bool {
+) -> WdaControlOutcome {
     use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let mut w = wda.lock().await;
     let r: anyhow::Result<()> = match typ {
-        "tap" | "longpress" => {
+        "tap" if v.get("label").is_some() => {
+            let Some(label) = v
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .filter(|label| !label.is_empty())
+            else {
+                return WdaControlOutcome::Unsupported;
+            };
+            match tap_unique_label(w, label).await {
+                Ok(()) => Ok(()),
+                Err(UniqueLabelTapError::NotFound) => {
+                    return WdaControlOutcome::ElementNotFound;
+                }
+                Err(UniqueLabelTapError::Ambiguous) => {
+                    return WdaControlOutcome::AmbiguousElement;
+                }
+                Err(UniqueLabelTapError::InvalidTarget) => {
+                    return WdaControlOutcome::InvalidElementTarget;
+                }
+                Err(UniqueLabelTapError::BeforeDispatch(error)) => {
+                    w.invalidate_session();
+                    tracing::warn!("wda control ({typ}) failed before dispatch: {error:#}");
+                    return WdaControlOutcome::NotSent;
+                }
+                Err(UniqueLabelTapError::AfterDispatch(error)) => Err(error),
+            }
+        }
+        "tap" if v.get("element").is_some() => match tap_snapshot_element(w, v).await {
+            Ok(()) => Ok(()),
+            Err(SnapshotElementTapError::Invalid) => {
+                return WdaControlOutcome::InvalidElementSnapshot;
+            }
+            Err(SnapshotElementTapError::Stale) => {
+                return WdaControlOutcome::StaleElementSnapshot;
+            }
+            Err(SnapshotElementTapError::NotFound) => {
+                return WdaControlOutcome::ElementNotFound;
+            }
+            Err(SnapshotElementTapError::Ambiguous) => {
+                return WdaControlOutcome::AmbiguousElement;
+            }
+            Err(SnapshotElementTapError::BeforeDispatch(error)) => {
+                w.invalidate_session();
+                tracing::warn!(
+                    "wda control snapshot tap failed before dispatch: {error:#}"
+                );
+                return WdaControlOutcome::NotSent;
+            }
+            Err(SnapshotElementTapError::AfterDispatch(error)) => Err(error),
+        },
+        "tap" => {
             match (
                 v.get("x").and_then(|x| x.as_f64()),
                 v.get("y").and_then(|y| y.as_f64()),
             ) {
-                (Some(x), Some(y)) => {
+                (Some(x), Some(y)) if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => {
                     async {
                         let (sw, sh) = w.window_size().await?;
-                        w.tap_point(x * sw, y * sh).await
+                        w.tap_point(normalized_wda_axis(x, sw)?, normalized_wda_axis(y, sh)?)
+                            .await
                     }
                     .await
                 }
-                _ => return false,
+                _ => return WdaControlOutcome::Unsupported,
             }
         }
+        "longpress" => match (
+            v.get("x").and_then(|x| x.as_f64()),
+            v.get("y").and_then(|y| y.as_f64()),
+        ) {
+            (Some(x), Some(y)) if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => {
+                async {
+                    let (sw, sh) = w.window_size().await?;
+                    let duration = v.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(600);
+                    w.longpress_point(
+                        normalized_wda_axis(x, sw)?,
+                        normalized_wda_axis(y, sh)?,
+                        duration,
+                    )
+                    .await
+                }
+                .await
+            }
+            _ => return WdaControlOutcome::Unsupported,
+        },
         "scroll" => {
             let nx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
             let ny = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
             let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
             let dy = v.get("dy").and_then(|y| y.as_f64()).unwrap_or(0.0);
-            if dx == 0.0 && dy == 0.0 {
-                return false;
+            if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) || (dx == 0.0 && dy == 0.0)
+            {
+                return WdaControlOutcome::Unsupported;
             }
-            wda_swipe(&mut w, nx, ny, dx, dy).await
+            wda_swipe(w, nx, ny, dx, dy).await
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
             Some(t) => w.keys(t).await,
-            None => return false,
+            None => return WdaControlOutcome::Unsupported,
         },
+        "key" => match v.get("name").and_then(|n| n.as_str()) {
+            Some("dismiss" | "hide") => w.dismiss_keyboard().await,
+            Some(name) => w.named_key(name).await,
+            None => return WdaControlOutcome::Unsupported,
+        },
+        "keyboard" => w.dismiss_keyboard().await,
+        "home" => w.press_home().await,
+        "back" => w.back().await,
         "shortcut" => match v.get("name").and_then(|n| n.as_str()) {
             Some("home") => w.press_home().await,
-            // Spotlight: the pull-down is a SpringBoard system gesture that WDA's
-            // synthetic touches can't trigger. Instead go Home and TAP the Search
-            // pill above the dock — a normal touch that opens Spotlight reliably.
-            // (Hardware-verified at y≈0.82 on a 956pt-tall device.)
-            Some("spotlight") => {
-                async {
-                    let (sw, sh) = w.window_size().await?;
-                    w.press_home().await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-                    w.tap_point(sw * 0.5, sh * 0.82).await
-                }
-                .await
-            }
+            // Spotlight's Search pill acknowledges coordinate taps without
+            // always opening. Resolve and click its accessibility element, then
+            // verify the search field before reporting success.
+            Some("spotlight") => w.open_spotlight().await,
             // App switcher: the swipe-up-from-the-home-indicator is a system
             // gesture WDA can't synthesize (hardware-verified: from Home it goes
             // Home, from an app the swipe is absorbed — the switcher never opens).
             // There is no WDA element to tap either, so it's unreachable in agent
             // mode. Report unhandled; the web client shows a hint instead of
             // sending a no-op. (Works in mirror mode via the L3 path.)
-            Some("switcher") => return false,
-            _ => return false,
+            Some("switcher") => return WdaControlOutcome::Unsupported,
+            _ => return WdaControlOutcome::Unsupported,
         },
         // A whole swipe gesture as ONE on-device drag (start→end). The web client
         // sends this on pointer-up in agent mode instead of streaming per-move
         // scroll deltas (WDA has no scroll-wheel; a delta stream turned into a
         // storm of discrete swipes that kept scrolling after release — issue: the
         // screen "kept moving" after the finger stopped).
-        "swipe" => {
+        "swipe" | "drag" => {
             let g = |k: &str| v.get(k).and_then(|x| x.as_f64());
             match (g("x1"), g("y1"), g("x2"), g("y2")) {
-                (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                (Some(x1), Some(y1), Some(x2), Some(y2))
+                    if [x1, y1, x2, y2]
+                        .into_iter()
+                        .all(|n| (0.0..=1.0).contains(&n)) =>
+                {
                     async {
                         let (sw, sh) = w.window_size().await?;
-                        let (ax, ay, bx, by) = (x1 * sw, y1 * sh, x2 * sw, y2 * sh);
+                        let (ax, ay, bx, by) = (
+                            normalized_wda_axis(x1, sw)?,
+                            normalized_wda_axis(y1, sh)?,
+                            normalized_wda_axis(x2, sw)?,
+                            normalized_wda_axis(y2, sh)?,
+                        );
                         let dist = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-                        let dur = (dist * 0.9).clamp(120.0, 500.0) as u64;
-                        w.swipe(ax, ay, bx, by, dur).await
+                        let duration = v
+                            .get("duration_ms")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or_else(|| (dist * 0.9).clamp(120.0, 500.0) as u64);
+                        if typ == "drag" {
+                            let hold = v.get("hold_ms").and_then(|x| x.as_u64()).unwrap_or(500);
+                            w.drag(ax, ay, bx, by, hold, duration).await
+                        } else {
+                            w.swipe(ax, ay, bx, by, duration).await
+                        }
                     }
                     .await
                 }
-                _ => return false,
+                _ => return WdaControlOutcome::Unsupported,
             }
         }
-        // Not a WDA-routable type (down/up/key). Leave the actionable flag as-is
-        // and let the caller decide based on it.
-        _ => return false,
+        // Streaming down/up/move is a Mirroring-era protocol. Direct gestures
+        // arrive atomically as tap/longpress/swipe/drag.
+        _ => return WdaControlOutcome::Unsupported,
     };
     match r {
         Ok(()) => {
             actionable.store(true, Ordering::Relaxed);
-            true
+            WdaControlOutcome::Applied
         }
         Err(e) => {
-            // A WDA call that should have worked failed → WDA is down (mirror
-            // mode / locked / wedged). Mark it so the move channel falls back to
-            // L3 instead of silently dropping.
+            // A WDA call that should have worked failed. Direct callers fail
+            // closed; the explicit mirror backend may choose its compatibility
+            // path.
             actionable.store(false, Ordering::Relaxed);
             w.invalidate_session();
-            tracing::warn!("wda data-channel control ({typ}): {e:#}");
-            false
+            tracing::warn!("wda control ({typ}): {e:#}");
+            WdaControlOutcome::Failed
         }
     }
+}
+
+/// `POST /control` — cookie-authenticated browser control for the direct backend.
+///
+/// The custom request header makes cross-origin form CSRF impossible in open
+/// mode (a browser must preflight it, and this server exposes no CORS policy).
+/// Unlike the old data channel this endpoint acknowledges every command; the
+/// client must not show success unless it receives `{"ok":true}`.
+const DIRECT_CONTROL_MAX_TTL_MS: u64 = 2500;
+const AGENT_INPUT_WDA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const AGENT_ACTIONS_MAX_BODY_BYTES: usize = 64 * 1024;
+const AGENT_ACTIONS_MAX_STEPS: usize = 24;
+const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 10_000;
+const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
+const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
+const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
+
+fn wda_deadline_response(dispatched: bool) -> Response {
+    let (status, body) = if dispatched {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            r#"{"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false}"#,
+        )
+    } else {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            r#"{"ok":false,"error":"not_sent","outcome":"not_sent","retry_safe":true}"#,
+        )
+    };
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn wda_failed_after_dispatch_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn wda_failed_before_dispatch_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"wda_pre_dispatch_failed","outcome":"not_sent","retry_safe":true}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn invalid_element_snapshot_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"invalid_element_snapshot","outcome":"not_sent","retry_safe":true}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn stale_element_snapshot_response() -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"stale_element_snapshot","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements and choose the element again"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn element_not_found_response() -> Response {
+    element_resolution_response(
+        r#"{"ok":false,"error":"element_not_found","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements and use an exact current label or snapshot-bound element index"}"#,
+    )
+}
+
+fn ambiguous_element_response() -> Response {
+    element_resolution_response(
+        r#"{"ok":false,"error":"ambiguous_element_label","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements, disambiguate by identifier/kind/state, then send element plus snapshot"}"#,
+    )
+}
+
+fn invalid_element_target_response() -> Response {
+    element_resolution_response(
+        r#"{"ok":false,"error":"invalid_element_target","outcome":"not_sent","retry_safe":true,"hint":"the matched element has no finite positive-size hit target; refresh /agent/elements and choose another locator"}"#,
+    )
+}
+
+fn element_resolution_response(body: &'static str) -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// Execute one Direct agent action exactly once.
+///
+/// Locator and geometry reads may precede the mutation, but once a mutating WDA
+/// request has been sent this function never rebuilds the session and replays
+/// it. A lost response is therefore surfaced as an uncertain outcome rather
+/// than turning a tap, swipe, Home press, or text insertion into two actions.
+async fn direct_agent_action(
+    w: &mut crate::wda::WdaClient,
+    actionable: &std::sync::atomic::AtomicBool,
+    value: &serde_json::Value,
+) -> WdaControlOutcome {
+    use std::sync::atomic::Ordering;
+
+    let typ = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let custom_result: Option<anyhow::Result<()>> = match typ {
+        "launch_app" => {
+            let bundle = value
+                .get("bundle")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(system_app_bundle)
+                        .map(str::to_string)
+                });
+            let Some(bundle) = bundle else {
+                return WdaControlOutcome::Unsupported;
+            };
+            Some(w.launch_app(&bundle).await)
+        }
+        "tap" if value.get("label").is_some() => {
+            let Some(label) = value
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .filter(|label| !label.is_empty())
+            else {
+                return WdaControlOutcome::Unsupported;
+            };
+            match tap_unique_label(w, label).await {
+                Ok(()) => Some(Ok(())),
+                Err(UniqueLabelTapError::NotFound) => {
+                    return WdaControlOutcome::ElementNotFound;
+                }
+                Err(UniqueLabelTapError::Ambiguous) => {
+                    return WdaControlOutcome::AmbiguousElement;
+                }
+                Err(UniqueLabelTapError::InvalidTarget) => {
+                    return WdaControlOutcome::InvalidElementTarget;
+                }
+                Err(UniqueLabelTapError::BeforeDispatch(error)) => {
+                    w.invalidate_session();
+                    tracing::warn!("wda agent action ({typ}) failed before dispatch: {error:#}");
+                    return WdaControlOutcome::NotSent;
+                }
+                Err(UniqueLabelTapError::AfterDispatch(error)) => Some(Err(error)),
+            }
+        }
+        "tap" if value.get("element").is_some() => match tap_snapshot_element(w, value).await {
+            Ok(()) => Some(Ok(())),
+            Err(SnapshotElementTapError::Invalid) => {
+                return WdaControlOutcome::InvalidElementSnapshot;
+            }
+            Err(SnapshotElementTapError::Stale) => {
+                return WdaControlOutcome::StaleElementSnapshot;
+            }
+            Err(SnapshotElementTapError::NotFound) => {
+                return WdaControlOutcome::ElementNotFound;
+            }
+            Err(SnapshotElementTapError::Ambiguous) => {
+                return WdaControlOutcome::AmbiguousElement;
+            }
+            Err(SnapshotElementTapError::BeforeDispatch(error)) => {
+                w.invalidate_session();
+                tracing::warn!(
+                    "wda agent snapshot tap failed before dispatch: {error:#}"
+                );
+                return WdaControlOutcome::NotSent;
+            }
+            Err(SnapshotElementTapError::AfterDispatch(error)) => Some(Err(error)),
+        },
+        "tap_locator" => {
+            let Some(locator) = value
+                .get("locator")
+                .cloned()
+                .and_then(|locator| serde_json::from_value::<AgentElementLocator>(locator).ok())
+                .filter(locator_has_condition)
+            else {
+                return WdaControlOutcome::Unsupported;
+            };
+            match tap_unique_locator(w, &locator).await {
+                Ok(()) => Some(Ok(())),
+                Err(UniqueLabelTapError::NotFound) => {
+                    return WdaControlOutcome::ElementNotFound;
+                }
+                Err(UniqueLabelTapError::Ambiguous) => {
+                    return WdaControlOutcome::AmbiguousElement;
+                }
+                Err(UniqueLabelTapError::InvalidTarget) => {
+                    return WdaControlOutcome::InvalidElementTarget;
+                }
+                Err(UniqueLabelTapError::BeforeDispatch(error)) => {
+                    w.invalidate_session();
+                    tracing::warn!("wda agent action ({typ}) failed before dispatch: {error:#}");
+                    return WdaControlOutcome::NotSent;
+                }
+                Err(UniqueLabelTapError::AfterDispatch(error)) => Some(Err(error)),
+            }
+        }
+        "picker" => {
+            let Some(target) = value.get("value").and_then(serde_json::Value::as_str) else {
+                return WdaControlOutcome::Unsupported;
+            };
+            let column = value
+                .get("column")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|column| usize::try_from(column).ok())
+                .unwrap_or(0);
+            Some(w.set_picker(column, target).await)
+        }
+        "text"
+            if value
+                .get("clear")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            let Some(text) = value.get("text").and_then(serde_json::Value::as_str) else {
+                return WdaControlOutcome::Unsupported;
+            };
+            Some(
+                async {
+                    // Clearing and typing are one intentional compound action.
+                    // A clear error is best-effort, but the text insertion is
+                    // still dispatched at most once.
+                    if let Err(error) = w.clear_active().await {
+                        tracing::warn!("wda clear_active before text: {error:#}");
+                    }
+                    w.keys(text).await
+                }
+                .await,
+            )
+        }
+        _ => None,
+    };
+
+    let Some(result) = custom_result else {
+        return wda_control_with_client(w, actionable, value).await;
+    };
+    match result {
+        Ok(()) => {
+            actionable.store(true, Ordering::Release);
+            WdaControlOutcome::Applied
+        }
+        Err(error) => {
+            actionable.store(false, Ordering::Release);
+            w.invalidate_session();
+            tracing::warn!("wda agent action ({typ}): {error:#}");
+            WdaControlOutcome::Failed
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlFreshnessError {
+    Missing,
+    Invalid,
+}
+
+fn direct_control_deadline(
+    value: &serde_json::Value,
+    monotonic_now: tokio::time::Instant,
+) -> Result<tokio::time::Instant, ControlFreshnessError> {
+    let ttl_ms = value
+        .get("ttl_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(ControlFreshnessError::Missing)?;
+    // `issued_at_ms` is optional audit metadata only. The browser can be on a
+    // different phone/computer whose wall clock legitimately differs from the
+    // Mac, so freshness is based exclusively on a server-side monotonic receipt
+    // deadline.
+    if value
+        .get("issued_at_ms")
+        .is_some_and(|issued| !issued.is_u64())
+        || ttl_ms == 0
+        || ttl_ms > DIRECT_CONTROL_MAX_TTL_MS
+    {
+        return Err(ControlFreshnessError::Invalid);
+    }
+    Ok(monotonic_now + std::time::Duration::from_millis(ttl_ms))
+}
+
+async fn direct_control(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !is_authed(&state, &headers) {
+        return with_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"ok":false,"error":"unauthorized"}"#,
+            )
+                .into_response(),
+        );
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    if state.backend != crate::config::DeviceBackend::Direct {
+        return with_security_headers(
+            (
+                StatusCode::CONFLICT,
+                r#"{"ok":false,"error":"legacy_mirror_uses_webrtc"}"#,
+            )
+                .into_response(),
+        );
+    }
+    if state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return with_security_headers(
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"ok":false,"error":"invalid_control_message"}"#,
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let deadline = match direct_control_deadline(&value, tokio::time::Instant::now()) {
+        Ok(deadline) => deadline,
+        Err(ControlFreshnessError::Missing | ControlFreshnessError::Invalid) => {
+            return with_security_headers(
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"ok":false,"error":"invalid_control_deadline"}"#,
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let lifecycle = state.wda_lifecycle.current();
+    let releasing = lifecycle == WdaLifecycleTransition::Releasing;
+    let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
+    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    if releasing || reconnecting || released {
+        let error = if releasing {
+            "releasing"
+        } else if reconnecting {
+            "reconnecting"
+        } else {
+            "released"
+        };
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(format!(
+                    r#"{{"ok":false,"error":"{error}","reconnecting":{reconnecting}}}"#
+                )))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    let Some(wda) = &state.wda else {
+        return with_security_headers(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"ok":false,"error":"wda_not_configured"}"#,
+            )
+                .into_response(),
+        );
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return wda_deadline_response(false);
+    }
+    let _priority = state.begin_wda_control();
+    let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dispatch_marker = dispatched.clone();
+    // One deadline covers BOTH mutex acquisition and the WDA action. Re-check
+    // lifecycle after acquiring the mutex: a request that sat behind a status
+    // probe or previous gesture must never execute after its browser was already
+    // told it timed out or after release began.
+    let outcome = tokio::time::timeout_at(deadline, async {
+        let mut client = wda.lock().await;
+        if tokio::time::Instant::now() >= deadline
+            || state.wda_lifecycle.is_transitioning()
+            || state.released.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
+        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value).await)
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return wda_deadline_response(false),
+        Err(_) => {
+            return wda_deadline_response(dispatched.load(std::sync::atomic::Ordering::Acquire));
+        }
+    };
+    if outcome == WdaControlOutcome::Applied {
+        state.touch_activity();
+        let locked = recover(state.wda_health.lock()).locked;
+        *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+            up: true,
+            actionable: true,
+            locked,
+        };
+        return with_security_headers(
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"ok":true}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+
+    if outcome == WdaControlOutcome::Failed {
+        let locked = recover(state.wda_health.lock()).locked;
+        *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+            up: true,
+            actionable: false,
+            locked,
+        };
+        return wda_failed_after_dispatch_response();
+    }
+    if outcome == WdaControlOutcome::NotSent {
+        mark_wda_read_path_unactionable(&state);
+        return wda_failed_before_dispatch_response();
+    }
+    if outcome == WdaControlOutcome::InvalidElementSnapshot {
+        return invalid_element_snapshot_response();
+    }
+    if outcome == WdaControlOutcome::StaleElementSnapshot {
+        return stale_element_snapshot_response();
+    }
+    if outcome == WdaControlOutcome::ElementNotFound {
+        return element_not_found_response();
+    }
+    if outcome == WdaControlOutcome::AmbiguousElement {
+        return ambiguous_element_response();
+    }
+    if outcome == WdaControlOutcome::InvalidElementTarget {
+        return invalid_element_target_response();
+    }
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"unsupported_control","outcome":"not_sent","retry_safe":false}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentActionsRequest {
+    steps: Vec<AgentActionStep>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentActionStep {
+    /// Execute one existing `/agent/input` action. `after_ms` is only a short
+    /// animation settle; use a following `wait_for` step for correctness.
+    Action {
+        action: serde_json::Value,
+        #[serde(default)]
+        after_ms: u64,
+    },
+    /// Poll the WDA element tree until every positive locator and the optional
+    /// application match, while every negative locator remains absent.
+    WaitFor {
+        expect: AgentUiExpectation,
+        #[serde(default = "default_agent_actions_wait_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_agent_actions_poll_ms")]
+        poll_ms: u64,
+    },
+    /// A bounded animation pause. This is deliberately small and should not be
+    /// used instead of a semantic `wait_for` gate.
+    Pause { ms: u64 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentUiExpectation {
+    #[serde(default)]
+    application: Option<String>,
+    #[serde(default)]
+    present: Vec<AgentElementLocator>,
+    #[serde(default)]
+    absent: Vec<AgentElementLocator>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentElementLocator {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    focused: Option<bool>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    visible: Option<bool>,
+}
+
+fn default_agent_actions_wait_ms() -> u64 {
+    5_000
+}
+
+fn default_agent_actions_poll_ms() -> u64 {
+    250
+}
+
+fn agent_actions_json(status: StatusCode, value: serde_json::Value) -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn agent_actions_invalid(detail: impl Into<String>) -> Response {
+    agent_actions_json(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({
+            "ok": false,
+            "error": "invalid_actions_request",
+            "detail": detail.into(),
+            "outcome": "not_sent",
+            "retry_safe": true
+        }),
+    )
+}
+
+fn locator_has_condition(locator: &AgentElementLocator) -> bool {
+    locator.label.is_some()
+        || locator.identifier.is_some()
+        || locator.kind.is_some()
+        || locator.value.is_some()
+        || locator.focused.is_some()
+        || locator.enabled.is_some()
+        || locator.visible.is_some()
+}
+
+fn finite_unit(value: Option<f64>) -> bool {
+    value.is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+}
+
+fn validate_agent_action_value(
+    action: &serde_json::Map<String, serde_json::Value>,
+    index: usize,
+) -> Result<(), String> {
+    let Some(typ) = action
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|typ| !typ.is_empty())
+    else {
+        return Err(format!(
+            "steps[{index}].action.type must be a non-empty string"
+        ));
+    };
+    if typ == "uninstall" {
+        return Err(format!(
+            "steps[{index}] cannot batch destructive uninstall actions"
+        ));
+    }
+
+    let invalid = |detail: &str| Err(format!("steps[{index}].action {detail}"));
+    match typ {
+        "tap" => {
+            let modes = usize::from(action.contains_key("label"))
+                + usize::from(action.contains_key("element"))
+                + usize::from(action.contains_key("x") || action.contains_key("y"));
+            if modes != 1 {
+                return invalid(
+                    "tap must use exactly one target mode: label, element+snapshot, or x+y",
+                );
+            }
+            if action.contains_key("label") {
+                if !action
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|label| !label.is_empty() && label.chars().count() <= 500)
+                {
+                    return invalid("tap label must contain 1 to 500 characters");
+                }
+            } else if action.contains_key("element") {
+                if action
+                    .get("element")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                    || !action
+                        .get("snapshot")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|snapshot| {
+                            !snapshot.is_empty() && snapshot.chars().count() <= 200
+                        })
+                {
+                    return invalid("indexed tap needs a non-negative element and snapshot");
+                }
+            } else if !finite_unit(action.get("x").and_then(serde_json::Value::as_f64))
+                || !finite_unit(action.get("y").and_then(serde_json::Value::as_f64))
+            {
+                return invalid("tap coordinates must be finite values from 0 to 1");
+            }
+        }
+        "tap_locator" => {
+            let locator = action
+                .get("locator")
+                .cloned()
+                .and_then(|locator| serde_json::from_value::<AgentElementLocator>(locator).ok());
+            if !locator.as_ref().is_some_and(locator_has_condition) {
+                return invalid(
+                    "tap_locator needs one non-empty strict locator with supported fields",
+                );
+            }
+        }
+        "longpress" => {
+            if !finite_unit(action.get("x").and_then(serde_json::Value::as_f64))
+                || !finite_unit(action.get("y").and_then(serde_json::Value::as_f64))
+                || action
+                    .get("duration_ms")
+                    .is_some_and(|duration| duration.as_u64().is_none_or(|value| value > 10_000))
+            {
+                return invalid("longpress needs x/y from 0 to 1 and duration_ms at most 10000");
+            }
+        }
+        "scroll" => {
+            let x = action.get("x").map_or(Some(0.5), serde_json::Value::as_f64);
+            let y = action.get("y").map_or(Some(0.5), serde_json::Value::as_f64);
+            let dx = action
+                .get("dx")
+                .map_or(Some(0.0), serde_json::Value::as_f64);
+            let dy = action
+                .get("dy")
+                .map_or(Some(0.0), serde_json::Value::as_f64);
+            if !finite_unit(x)
+                || !finite_unit(y)
+                || !dx.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
+                || !dy.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
+                || (dx == Some(0.0) && dy == Some(0.0))
+            {
+                return invalid("scroll geometry is invalid");
+            }
+        }
+        "text" => {
+            if action
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|text| text.chars().count() > 1_000)
+                || action
+                    .get("clear")
+                    .is_some_and(|clear| clear.as_bool().is_none())
+            {
+                return invalid(
+                    "text needs a string up to 1000 characters and optional bool clear",
+                );
+            }
+        }
+        "key" => {
+            if !action
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "return"
+                            | "enter"
+                            | "escape"
+                            | "space"
+                            | "tab"
+                            | "delete"
+                            | "backspace"
+                            | "up"
+                            | "down"
+                            | "left"
+                            | "right"
+                            | "dismiss"
+                            | "hide"
+                    )
+                })
+            {
+                return invalid("key name is unsupported");
+            }
+        }
+        "keyboard" | "home" | "back" => {}
+        "shortcut" => {
+            if !action
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| matches!(name, "home" | "spotlight"))
+            {
+                return invalid("shortcut must be home or spotlight");
+            }
+        }
+        "swipe" | "drag" => {
+            if !["x1", "y1", "x2", "y2"]
+                .into_iter()
+                .all(|key| finite_unit(action.get(key).and_then(serde_json::Value::as_f64)))
+                || action
+                    .get("duration_ms")
+                    .is_some_and(|value| value.as_u64().is_none_or(|value| value > 10_000))
+                || action
+                    .get("hold_ms")
+                    .is_some_and(|value| value.as_u64().is_none_or(|value| value > 10_000))
+            {
+                return invalid("swipe/drag geometry or timing is invalid");
+            }
+        }
+        "launch_app" => {
+            let has_bundle = action.contains_key("bundle");
+            let has_name = action.contains_key("name");
+            let valid_bundle = action
+                .get("bundle")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|bundle| {
+                    !bundle.is_empty()
+                        && bundle.len() <= 200
+                        && bundle
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                });
+            let valid_name = action
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| system_app_bundle(name).is_some());
+            if has_bundle == has_name || (has_bundle && !valid_bundle) || (has_name && !valid_name)
+            {
+                return invalid(
+                    "launch_app needs exactly one valid bundle or supported system-app name",
+                );
+            }
+        }
+        "picker" => {
+            if !action
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.chars().count() <= 500)
+                || action
+                    .get("column")
+                    .is_some_and(|column| column.as_u64().is_none_or(|value| value > 20))
+            {
+                return invalid("picker needs a value up to 500 characters and column 0 to 20");
+            }
+        }
+        _ => return invalid(&format!("has unsupported type {typ:?}")),
+    }
+    Ok(())
+}
+
+fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
+    if request.steps.is_empty() {
+        return Err("steps must contain at least one step".to_string());
+    }
+    if request.steps.len() > AGENT_ACTIONS_MAX_STEPS {
+        return Err(format!(
+            "steps exceeds the maximum of {AGENT_ACTIONS_MAX_STEPS}"
+        ));
+    }
+
+    let mut declared_wait_ms = 0_u64;
+    for (index, step) in request.steps.iter().enumerate() {
+        match step {
+            AgentActionStep::Action { action, after_ms } => {
+                let Some(action) = action.as_object() else {
+                    return Err(format!("steps[{index}].action must be an object"));
+                };
+                validate_agent_action_value(action, index)?;
+                if *after_ms > AGENT_ACTIONS_MAX_PAUSE_MS {
+                    return Err(format!(
+                        "steps[{index}].after_ms exceeds {AGENT_ACTIONS_MAX_PAUSE_MS}"
+                    ));
+                }
+                declared_wait_ms = declared_wait_ms.saturating_add(*after_ms);
+            }
+            AgentActionStep::WaitFor {
+                expect,
+                timeout_ms,
+                poll_ms,
+            } => {
+                if expect.application.is_none()
+                    && expect.present.is_empty()
+                    && expect.absent.is_empty()
+                {
+                    return Err(format!(
+                        "steps[{index}].expect must include application, present, or absent"
+                    ));
+                }
+                if expect
+                    .application
+                    .as_ref()
+                    .is_some_and(|application| application.is_empty())
+                {
+                    return Err(format!(
+                        "steps[{index}].expect.application must not be empty"
+                    ));
+                }
+                if expect
+                    .present
+                    .iter()
+                    .chain(expect.absent.iter())
+                    .any(|locator| !locator_has_condition(locator))
+                {
+                    return Err(format!("steps[{index}] contains an empty element locator"));
+                }
+                if *timeout_ms == 0 || *timeout_ms > AGENT_ACTIONS_MAX_WAIT_MS {
+                    return Err(format!(
+                        "steps[{index}].timeout_ms must be between 1 and {AGENT_ACTIONS_MAX_WAIT_MS}"
+                    ));
+                }
+                if !(50..=1_000).contains(poll_ms) {
+                    return Err(format!(
+                        "steps[{index}].poll_ms must be between 50 and 1000"
+                    ));
+                }
+                declared_wait_ms = declared_wait_ms.saturating_add(*timeout_ms);
+            }
+            AgentActionStep::Pause { ms } => {
+                if *ms == 0 || *ms > AGENT_ACTIONS_MAX_PAUSE_MS {
+                    return Err(format!(
+                        "steps[{index}].ms must be between 1 and {AGENT_ACTIONS_MAX_PAUSE_MS}"
+                    ));
+                }
+                declared_wait_ms = declared_wait_ms.saturating_add(*ms);
+            }
+        }
+    }
+    if declared_wait_ms > AGENT_ACTIONS_MAX_DECLARED_WAIT_MS {
+        return Err(format!(
+            "declared waits exceed the batch maximum of {AGENT_ACTIONS_MAX_DECLARED_WAIT_MS}ms"
+        ));
+    }
+    Ok(())
+}
+
+fn agent_locator_matches(row: &crate::wda::ElementRow, locator: &AgentElementLocator) -> bool {
+    locator
+        .label
+        .as_ref()
+        .is_none_or(|value| &row.label == value)
+        && locator
+            .identifier
+            .as_ref()
+            .is_none_or(|value| row.identifier.as_ref() == Some(value))
+        && locator.kind.as_ref().is_none_or(|value| &row.kind == value)
+        && locator
+            .value
+            .as_ref()
+            .is_none_or(|value| row.value.as_ref() == Some(value))
+        && locator
+            .focused
+            .is_none_or(|value| row.focused.unwrap_or(false) == value)
+        && locator
+            .enabled
+            .is_none_or(|value| row.enabled.unwrap_or(true) == value)
+        && locator
+            .visible
+            .is_none_or(|value| row.visible.unwrap_or(true) == value)
+}
+
+fn agent_expectation_observation(
+    rows: &[crate::wda::ElementRow],
+    expect: &AgentUiExpectation,
+) -> (bool, serde_json::Value) {
+    let application = rows
+        .iter()
+        .find(|row| row.kind == "Application")
+        .map(|row| row.label.clone());
+    let application_matches = expect
+        .application
+        .as_ref()
+        .is_none_or(|expected| application.as_ref() == Some(expected));
+    let missing_present: Vec<usize> = expect
+        .present
+        .iter()
+        .enumerate()
+        .filter_map(|(index, locator)| {
+            (!rows.iter().any(|row| agent_locator_matches(row, locator))).then_some(index)
+        })
+        .collect();
+    let violated_absent: Vec<usize> = expect
+        .absent
+        .iter()
+        .enumerate()
+        .filter_map(|(index, locator)| {
+            rows.iter()
+                .any(|row| agent_locator_matches(row, locator))
+                .then_some(index)
+        })
+        .collect();
+    let matches = application_matches && missing_present.is_empty() && violated_absent.is_empty();
+    (
+        matches,
+        serde_json::json!({
+            "application": application,
+            "application_matches": application_matches,
+            "missing_present": missing_present,
+            "violated_absent": violated_absent
+        }),
+    )
+}
+
+#[derive(Debug)]
+enum AgentWaitReadError {
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+async fn agent_wait_elements(
+    w: &mut crate::wda::WdaClient,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<crate::wda::ElementRow>, AgentWaitReadError> {
+    match tokio::time::timeout_at(deadline, w.elements()).await {
+        Ok(Ok(rows)) => Ok(rows),
+        Ok(Err(first_error)) => {
+            // Source reads are idempotent. A WebView transition can invalidate
+            // one WDA session, so rebuild once within the same wait deadline.
+            w.invalidate_session();
+            match tokio::time::timeout_at(deadline, w.elements()).await {
+                Ok(Ok(rows)) => Ok(rows),
+                Ok(Err(second_error)) => Err(AgentWaitReadError::Failed(anyhow::anyhow!(
+                    "source retry failed: {second_error:#}; first attempt: {first_error:#}"
+                ))),
+                Err(_) => Err(AgentWaitReadError::TimedOut),
+            }
+        }
+        Err(_) => Err(AgentWaitReadError::TimedOut),
+    }
+}
+
+// Keeping all failure evidence in one builder prevents individual early-return
+// branches from silently omitting the at-most-once fields callers rely on.
+#[allow(clippy::too_many_arguments)]
+fn agent_actions_failure(
+    status: StatusCode,
+    failed_step: usize,
+    completed: usize,
+    applied_actions: usize,
+    error: &str,
+    outcome: &str,
+    retry_safe: bool,
+    steps: &[serde_json::Value],
+    observation: Option<serde_json::Value>,
+) -> Response {
+    let mut body = serde_json::json!({
+        "ok": false,
+        "error": error,
+        "failed_step": failed_step,
+        "completed": completed,
+        "applied_actions": applied_actions,
+        "outcome": outcome,
+        "retry_safe": retry_safe,
+        "steps": steps
+    });
+    if let (Some(object), Some(observation)) = (body.as_object_mut(), observation) {
+        object.insert("observation".to_string(), observation);
+    }
+    agent_actions_json(status, body)
+}
+
+/// `POST /agent/actions` — execute a bounded, fail-closed Direct/WDA sequence.
+///
+/// The whole request is validated before any action is sent. It supports three
+/// step kinds: one existing input `action`, a short `pause`, and a semantic
+/// `wait_for` over the current application and element locators. The WDA lock is
+/// held for the sequence so another daemon client cannot interleave gestures.
+/// Any failed action, expectation, read, lifecycle transition, or deadline stops
+/// the sequence immediately; later actions are never attempted.
+async fn agent_actions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
+        return agent_actions_invalid(format!(
+            "request body exceeds {AGENT_ACTIONS_MAX_BODY_BYTES} bytes"
+        ));
+    }
+    let request: AgentActionsRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => return agent_actions_invalid(format!("invalid JSON shape: {error}")),
+    };
+    if let Err(error) = validate_agent_actions(&request) {
+        return agent_actions_invalid(error);
+    }
+    if state.backend != crate::config::DeviceBackend::Direct {
+        return agent_actions_json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "ok": false,
+                "error": "batch_requires_direct_wda",
+                "outcome": "not_sent",
+                "retry_safe": true
+            }),
+        );
+    }
+    if state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    if state.wda_lifecycle.is_transitioning()
+        || state.released.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return agent_actions_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false,
+                "error": "device_not_drivable",
+                "outcome": "not_sent",
+                "retry_safe": true,
+                "hint": "check /agent/status, reconnect the canonical Direct target if instructed, then retry only after drivable=true"
+            }),
+        );
+    }
+    let Some(wda) = &state.wda else {
+        return agent_actions_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false,
+                "error": "wda_not_configured",
+                "outcome": "not_sent",
+                "retry_safe": true
+            }),
+        );
+    };
+
+    state.touch_activity();
+    let _priority = state.begin_wda_control();
+    let batch_deadline = tokio::time::Instant::now() + AGENT_ACTIONS_DEADLINE;
+    let mut w = match tokio::time::timeout_at(batch_deadline, wda.lock()).await {
+        Ok(client) => client,
+        Err(_) => {
+            return agent_actions_failure(
+                StatusCode::REQUEST_TIMEOUT,
+                0,
+                0,
+                0,
+                "batch_deadline",
+                "not_sent",
+                true,
+                &[],
+                None,
+            )
+        }
+    };
+
+    let mut completed = 0_usize;
+    let mut applied_actions = 0_usize;
+    let mut step_results = Vec::with_capacity(request.steps.len());
+    for (index, step) in request.steps.iter().enumerate() {
+        if state.wda_lifecycle.is_transitioning()
+            || state.released.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return agent_actions_failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                index,
+                completed,
+                applied_actions,
+                "device_transition_in_progress",
+                "not_sent",
+                applied_actions == 0,
+                &step_results,
+                None,
+            );
+        }
+        if tokio::time::Instant::now() >= batch_deadline {
+            return agent_actions_failure(
+                StatusCode::GATEWAY_TIMEOUT,
+                index,
+                completed,
+                applied_actions,
+                "batch_deadline",
+                "not_sent",
+                applied_actions == 0,
+                &step_results,
+                None,
+            );
+        }
+
+        match step {
+            AgentActionStep::Action { action, after_ms } => {
+                // Dispatch exactly once. If the batch deadline wins after this
+                // point, the action outcome is unknown and the whole batch must
+                // not be replayed automatically.
+                let outcome = match tokio::time::timeout_at(
+                    batch_deadline,
+                    direct_agent_action(&mut w, &state.wda_actionable, action),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        mark_wda_read_path_unactionable(&state);
+                        return agent_actions_failure(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            index,
+                            completed,
+                            applied_actions,
+                            "outcome_unknown",
+                            "unknown",
+                            false,
+                            &step_results,
+                            None,
+                        );
+                    }
+                };
+                if outcome != WdaControlOutcome::Applied {
+                    let (status, error, outcome_name, current_retry_safe) = match outcome {
+                        WdaControlOutcome::NotSent => (
+                            StatusCode::BAD_GATEWAY,
+                            "wda_pre_dispatch_failed",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::Unsupported => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "unsupported_control",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::InvalidElementSnapshot => (
+                            StatusCode::BAD_REQUEST,
+                            "invalid_element_snapshot",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::StaleElementSnapshot => (
+                            StatusCode::CONFLICT,
+                            "stale_element_snapshot",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::ElementNotFound => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "element_not_found",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::AmbiguousElement => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "ambiguous_element_label",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::InvalidElementTarget => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "invalid_element_target",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::Failed => {
+                            (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
+                        }
+                        WdaControlOutcome::Applied => unreachable!(),
+                    };
+                    if matches!(
+                        outcome,
+                        WdaControlOutcome::Failed | WdaControlOutcome::NotSent
+                    ) {
+                        mark_wda_read_path_unactionable(&state);
+                    }
+                    return agent_actions_failure(
+                        status,
+                        index,
+                        completed,
+                        applied_actions,
+                        error,
+                        outcome_name,
+                        current_retry_safe && applied_actions == 0,
+                        &step_results,
+                        None,
+                    );
+                }
+                applied_actions += 1;
+                if *after_ms > 0
+                    && tokio::time::timeout_at(
+                        batch_deadline,
+                        tokio::time::sleep(std::time::Duration::from_millis(*after_ms)),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return agent_actions_failure(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        index,
+                        completed,
+                        applied_actions,
+                        "batch_deadline_after_action",
+                        "applied",
+                        false,
+                        &step_results,
+                        None,
+                    );
+                }
+                step_results.push(serde_json::json!({
+                    "index": index,
+                    "kind": "action",
+                    "ok": true
+                }));
+            }
+            AgentActionStep::Pause { ms } => {
+                if tokio::time::timeout_at(
+                    batch_deadline,
+                    tokio::time::sleep(std::time::Duration::from_millis(*ms)),
+                )
+                .await
+                .is_err()
+                {
+                    return agent_actions_failure(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        index,
+                        completed,
+                        applied_actions,
+                        "batch_deadline",
+                        "not_sent",
+                        applied_actions == 0,
+                        &step_results,
+                        None,
+                    );
+                }
+                step_results.push(serde_json::json!({
+                    "index": index,
+                    "kind": "pause",
+                    "ok": true
+                }));
+            }
+            AgentActionStep::WaitFor {
+                expect,
+                timeout_ms,
+                poll_ms,
+            } => {
+                let wait_deadline = std::cmp::min(
+                    batch_deadline,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(*timeout_ms),
+                );
+                let mut attempts = 0_u64;
+                let mut last_observation = serde_json::Value::Null;
+                let mut last_read_error = None;
+                loop {
+                    attempts += 1;
+                    let rows = match agent_wait_elements(&mut w, wait_deadline).await {
+                        Ok(rows) => rows,
+                        Err(AgentWaitReadError::Failed(error)) => {
+                            last_read_error = Some(format!("{error:#}"));
+                            // System sheets can briefly restart the WDA relay or
+                            // invalidate the app-scoped session after an applied
+                            // action. A `wait_for` owns a bounded polling window,
+                            // so keep rebuilding the read-only session inside that
+                            // window instead of failing on the first two quick
+                            // connection refusals. No mutation is replayed.
+                            if tokio::time::Instant::now() >= wait_deadline {
+                                tracing::warn!(
+                                    "wda batch wait_for source never recovered: {error:#}"
+                                );
+                                mark_wda_read_path_unactionable(&state);
+                                return agent_actions_failure(
+                                    StatusCode::BAD_GATEWAY,
+                                    index,
+                                    completed,
+                                    applied_actions,
+                                    "wda_source_failed",
+                                    "not_sent",
+                                    applied_actions == 0,
+                                    &step_results,
+                                    None,
+                                );
+                            }
+                            let remaining = wait_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(std::cmp::min(
+                                std::time::Duration::from_millis(*poll_ms),
+                                remaining,
+                            ))
+                            .await;
+                            continue;
+                        }
+                        Err(AgentWaitReadError::TimedOut) => {
+                            if let Some(error) = last_read_error {
+                                tracing::warn!(
+                                    "wda batch wait_for source timed out after retries: {error}"
+                                );
+                            }
+                            w.invalidate_session();
+                            return agent_actions_failure(
+                                StatusCode::CONFLICT,
+                                index,
+                                completed,
+                                applied_actions,
+                                "expectation_timeout",
+                                "not_sent",
+                                applied_actions == 0,
+                                &step_results,
+                                Some(last_observation),
+                            );
+                        }
+                    };
+                    let (matches, observation) = agent_expectation_observation(&rows, expect);
+                    last_observation = observation;
+                    if matches {
+                        step_results.push(serde_json::json!({
+                            "index": index,
+                            "kind": "wait_for",
+                            "ok": true,
+                            "attempts": attempts,
+                            "observation": last_observation
+                        }));
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= wait_deadline {
+                        return agent_actions_failure(
+                            StatusCode::CONFLICT,
+                            index,
+                            completed,
+                            applied_actions,
+                            "expectation_timeout",
+                            "not_sent",
+                            applied_actions == 0,
+                            &step_results,
+                            Some(last_observation),
+                        );
+                    }
+                    let remaining =
+                        wait_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::sleep(std::cmp::min(
+                        std::time::Duration::from_millis(*poll_ms),
+                        remaining,
+                    ))
+                    .await;
+                }
+            }
+        }
+        completed += 1;
+    }
+
+    state.touch_activity();
+    let locked = recover(state.wda_health.lock()).locked;
+    *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+        up: true,
+        actionable: true,
+        locked,
+    };
+    agent_actions_json(
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "completed": completed,
+            "applied_actions": applied_actions,
+            "steps": step_results
+        }),
+    )
 }
 
 /// `POST /agent/input` — inject one control message (same JSON shape as the
@@ -1310,19 +4403,31 @@ async fn agent_input(
     body: String,
 ) -> Response {
     match agent_auth(&state, &headers) {
-        AgentAuth::Locked => return with_security_headers(
-            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-        ),
-        AgentAuth::Denied => return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        ),
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
         AgentAuth::Ok => {}
     }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    // The MCP client waits 30 seconds. Keep the daemon's complete Direct WDA
+    // budget comfortably below that so the authoritative HTTP outcome arrives
+    // before the client can abandon a still-running action.
+    let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
     // App uninstall via CoreDevice (`devicectl`) — WDA can't remove apps and
     // UI-driven deletion is unreliable to automate, so this is the dependable
     // "Delete App (with data)" primitive (e.g. resetting a wedged app to its
     // login state). `{"type":"uninstall","bundle":"com.example.app"}`; optional
-    // `"udid"` targets a specific paired phone, else the connected one is used.
+    // `"udid"` targets a specific paired phone; otherwise reuse the daemon's
+    // persisted target before falling back to CoreDevice auto-detection.
     // Destructive — gated behind agent auth like every action here.
     #[cfg(target_os = "macos")]
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -1344,50 +4449,171 @@ async fn agent_input(
                         .into_response(),
                 );
             }
-            let udid = v
-                .get("udid")
-                .and_then(|u| u.as_str())
-                .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-                .map(String::from);
+            let udid = match v.get("udid") {
+                None => state.device_udid.clone(),
+                Some(serde_json::Value::String(udid))
+                    if !udid.is_empty()
+                        && udid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') =>
+                {
+                    if state
+                        .device_udid
+                        .as_deref()
+                        .is_some_and(|configured| configured != udid)
+                    {
+                        return with_security_headers(
+                            Response::builder()
+                                .status(StatusCode::CONFLICT)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    r#"{"ok":false,"error":"target_change_requires_restart"}"#,
+                                ))
+                                .unwrap_or_else(|_| {
+                                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                }),
+                        );
+                    }
+                    Some(udid.clone())
+                }
+                Some(_) => {
+                    return with_security_headers(
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "uninstall \"udid\" must be non-empty hex and dashes",
+                        )
+                            .into_response(),
+                    );
+                }
+            };
             let bundle = bundle.to_string();
-            let r = tokio::task::spawn_blocking(move || {
-                devicectl_uninstall(udid.as_deref(), &bundle)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("join error: {e}")));
+            let r =
+                tokio::task::spawn_blocking(move || devicectl_uninstall(udid.as_deref(), &bundle))
+                    .await
+                    .unwrap_or_else(|e| Err(DevicectlError::Failed(format!("join error: {e}"))));
             return match r {
                 Ok(()) => {
                     with_security_headers((StatusCode::OK, "ok (uninstalled)").into_response())
                 }
-                Err(e) => {
+                Err(DevicectlError::Timeout) => {
+                    tracing::warn!("devicectl uninstall exceeded server deadline and was killed");
+                    with_security_headers(
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "uninstall timed out; devicectl was terminated",
+                        )
+                            .into_response(),
+                    )
+                }
+                Err(DevicectlError::TargetRequired(count)) => {
+                    tracing::warn!(
+                        "devicectl uninstall requires an explicit target ({count} connected candidates)"
+                    );
+                    with_security_headers(
+                        Response::builder()
+                            .status(StatusCode::CONFLICT)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(format!(
+                                r#"{{"ok":false,"error":"target_required","connected_candidates":{count},"hint":"configure PHONE_REMOTE_UDID or pass an explicit matching udid"}}"#
+                            )))
+                            .unwrap_or_else(|_| {
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            }),
+                    )
+                }
+                Err(DevicectlError::Failed(e)) => {
                     tracing::warn!("devicectl uninstall failed: {e}");
                     with_security_headers(
-                        (StatusCode::BAD_GATEWAY, format!("uninstall failed: {e}"))
-                            .into_response(),
+                        (StatusCode::BAD_GATEWAY, format!("uninstall failed: {e}")).into_response(),
                     )
                 }
             };
         }
     }
-    // If the idle watchdog released the phone (WDA stopped so the owner could
-    // use it), a fresh driving request means "I want it back" — re-bootstrap WDA
-    // and tell the caller to retry once it's up (~30-90s). One caller wins the
-    // swap and kicks the bring-up; the rest get the same retry signal.
-    if state.released.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        state.touch_activity();
-        let home = std::env::var("HOME").unwrap_or_default();
-        let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
-        let log = format!("{home}/.iphone-use/wda-agent.log");
-        tokio::task::spawn_blocking(move || {
-            write_and_bootstrap_wda_agent(&home, &setup_sh, &log, "");
-        });
+    if state.wda_lifecycle.is_releasing() {
         return with_security_headers(
             Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::RETRY_AFTER, "5")
                 .body(Body::from(
-                    r#"{"ok":false,"reconnecting":true,"hint":"phone was idle-released to free it for hands-on use; WDA is restarting (~30-90s) — retry. If the phone is locked, unlock it once."}"#,
+                    r#"{"ok":false,"error":"device_release_in_progress"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    // If the idle watchdog released the phone, one caller starts recovery while
+    // `released` remains true. Only a successful supervisor bootstrap clears it;
+    // failed recovery therefore remains honest and retryable instead of briefly
+    // reporting an active device that never restarted.
+    if state.released.load(std::sync::atomic::Ordering::Acquire) {
+        if !state.managed_wda {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"wda_is_externally_managed","recovery_owner":"external","reconnecting":false,"hint":"restart WDA on the configured endpoint's owning host"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        }
+        let won = state.wda_lifecycle.try_begin_reconnecting();
+        if won {
+            let recovery_state = state.clone();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+            let log = format!("{home}/.iphone-use/wda-agent.log");
+            let udid = state.device_udid.clone().unwrap_or_default();
+            tokio::spawn(async move {
+                let bootstrapped = tokio::task::spawn_blocking(move || {
+                    write_and_bootstrap_wda_agent(&home, &setup_sh, &log, &udid)
+                })
+                .await
+                .unwrap_or(false);
+                if bootstrapped {
+                    *recover(recovery_state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                    recovery_state
+                        .wda_actionable
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    spawn_wda_readiness_wait(recovery_state);
+                } else {
+                    recovery_state.wda_lifecycle.finish_reconnecting();
+                }
+            });
+        }
+        if state.wda_lifecycle.is_releasing() {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::RETRY_AFTER, "5")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"device_release_in_progress","reconnecting":false}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        }
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(
+                    r#"{"ok":false,"reconnecting":true,"hint":"phone was idle-released to free it for hands-on use; managed WDA is restarting (~30-90s) — retry. If the phone is locked, unlock it once."}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    if state.backend == crate::config::DeviceBackend::Direct && state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    if state.wda_lifecycle.is_reconnecting() {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"reconnect_in_progress","reconnecting":true}"#,
                 ))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
@@ -1395,291 +4621,95 @@ async fn agent_input(
     // Every real driving request resets the idle clock so the watchdog only
     // fires during genuine inactivity.
     state.touch_activity();
-    // ── L2 auto-routing (WebDriverAgent) ──────────────────────────────────
-    // When WDA is configured, prefer it for the actions where it is strictly
-    // better: text goes in as Unicode (CJK lands cleanly instead of being
-    // eaten by the on-phone IME), label-taps address elements directly, and
-    // coordinate taps are synthesized on-device (no host-cursor contention,
-    // no frontmost requirement). Any WDA failure falls back to the L3 pixel
-    // path below — except label-taps, which L3 cannot express.
-    if let Some(wda) = &state.wda {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let label = v.get("label").and_then(|l| l.as_str());
-            match (typ, label) {
-                // Dismiss the on-screen keyboard so it stops covering a page's
-                // own submit/next buttons. `{"type":"keyboard"}` or
-                // `{"type":"key","name":"dismiss"|"hide"}`. WDA-only — there is
-                // no L3 equivalent, and a missing keyboard is a no-op, so this
-                // always reports ok.
-                ("keyboard", _) | ("key", _)
-                    if typ == "keyboard"
-                        || v.get("name")
-                            .and_then(|n| n.as_str())
-                            .is_some_and(|n| matches!(n, "dismiss" | "hide")) =>
-                {
-                    let _ = wda.lock().await.dismiss_keyboard().await;
-                    return with_security_headers(
-                        (StatusCode::OK, "ok (wda keyboard dismiss)").into_response(),
-                    );
-                }
-                // Open an app by bundle id (issue #18-A): Home-Screen icons report
-                // rect [0,0,0,0] and don't navigate on tap, so launching by bundle
-                // is the only reliable way to open a system app. Accepts an
-                // explicit `{"bundle":"com.apple.Preferences"}` or a `{"name":"设置"}`
-                // mapped from the common-app table below.
-                ("launch_app", _) => {
-                    let bundle = v
-                        .get("bundle")
-                        .and_then(|b| b.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            v.get("name")
-                                .and_then(|n| n.as_str())
-                                .and_then(system_app_bundle)
-                                .map(str::to_string)
-                        });
-                    return match bundle {
-                        Some(b) => match wda.lock().await.launch_app(&b).await {
-                            Ok(()) => with_security_headers(
-                                (StatusCode::OK, "ok (wda launch)").into_response(),
-                            ),
-                            Err(e) => {
-                                tracing::warn!("wda launch_app '{b}' failed: {e:#}");
-                                with_security_headers(
-                                    (StatusCode::BAD_GATEWAY, "wda: launch failed")
-                                        .into_response(),
-                                )
-                            }
-                        },
-                        None => with_security_headers(
-                            (
-                                StatusCode::BAD_REQUEST,
-                                "launch_app needs \"bundle\":\"<id>\" (or a known \"name\")",
-                            )
-                                .into_response(),
-                        ),
-                    };
-                }
-                // Tap the Nth element from /agent/elements by its rect center
-                // (#24.1) — for when labels are non-unique/opaque. WDA-only,
-                // on-device. `{"type":"tap","element":N}`.
-                ("tap", None) if v.get("element").and_then(|e| e.as_u64()).is_some() => {
-                    let idx = v.get("element").and_then(|e| e.as_u64()).unwrap() as usize;
-                    let mut w = wda.lock().await;
-                    let r = async {
-                        let rows = w.elements().await?;
-                        let row = rows.get(idx).ok_or_else(|| {
-                            anyhow::anyhow!("element {idx} out of range ({} on screen)", rows.len())
-                        })?;
-                        let (cx, cy) = (row.rect[0] + row.rect[2] / 2.0, row.rect[1] + row.rect[3] / 2.0);
-                        w.tap_point(cx, cy).await
-                    }
-                    .await;
-                    return match r {
-                        Ok(()) => with_security_headers(
-                            (StatusCode::OK, "ok (wda element tap)").into_response(),
-                        ),
-                        Err(e) => {
-                            w.invalidate_session();
-                            tracing::warn!("wda element tap [{idx}] failed: {e:#}");
-                            with_security_headers(
-                                (StatusCode::BAD_GATEWAY, format!("wda element tap: {e}"))
-                                    .into_response(),
-                            )
-                        }
-                    };
-                }
-                ("tap", Some(label)) => {
-                    let r = wda.lock().await.click_label(label).await;
-                    return match r {
-                        Ok(()) => with_security_headers(
-                            (StatusCode::OK, "ok (wda element)").into_response(),
-                        ),
-                        Err(e) => {
-                            tracing::warn!("wda label tap '{label}' failed: {e:#}");
-                            with_security_headers(
-                                (StatusCode::BAD_GATEWAY, "wda: element not found")
-                                    .into_response(),
-                            )
-                        }
-                    };
-                }
-                // Go to the Home screen on-device (`{"type":"home"}`). WDA-only
-                // so it works in agent mode; the L3 `shortcut` path needs the
-                // mirror frontmost.
-                ("home", _) => {
-                    let mut w = wda.lock().await;
-                    if w.press_home().await.is_ok() {
-                        return with_security_headers(
-                            (StatusCode::OK, "ok (wda home)").into_response(),
-                        );
-                    }
-                    // One stale-session retry (the session can expire / be
-                    // reclaimed between calls).
-                    w.invalidate_session();
-                    return match w.press_home().await {
-                        Ok(()) => with_security_headers(
-                            (StatusCode::OK, "ok (wda home)").into_response(),
-                        ),
-                        Err(e) => {
-                            w.invalidate_session();
-                            tracing::warn!("wda home failed: {e:#}");
-                            with_security_headers(
-                                (StatusCode::BAD_GATEWAY, format!("wda home: {e}")).into_response(),
-                            )
-                        }
-                    };
-                }
-                // Navigate back via the universal iOS left-edge swipe
-                // (`{"type":"back"}`). Reliable across apps, unlike a nav-bar
-                // button whose label/position varies.
-                ("back", _) => {
-                    let mut w = wda.lock().await;
-                    if w.back().await.is_ok() {
-                        return with_security_headers(
-                            (StatusCode::OK, "ok (wda back)").into_response(),
-                        );
-                    }
-                    w.invalidate_session();
-                    return match w.back().await {
-                        Ok(()) => with_security_headers(
-                            (StatusCode::OK, "ok (wda back)").into_response(),
-                        ),
-                        Err(e) => {
-                            w.invalidate_session();
-                            tracing::warn!("wda back failed: {e:#}");
-                            with_security_headers(
-                                (StatusCode::BAD_GATEWAY, format!("wda back: {e}")).into_response(),
-                            )
-                        }
-                    };
-                }
-                ("text", None) => {
-                    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                        let mut w = wda.lock().await;
-                        // `{"type":"text","clear":true}` empties the focused
-                        // field first so the text REPLACES rather than appends
-                        // (the "ClaudeClaude" search-box bug). Best-effort — a
-                        // failed clear still lets the type proceed.
-                        if v.get("clear").and_then(|c| c.as_bool()).unwrap_or(false) {
-                            if let Err(e) = w.clear_active().await {
-                                tracing::warn!("wda clear_active before text: {e:#}");
-                            }
-                        }
-                        match w.keys(text).await {
-                            Ok(()) => {
-                                return with_security_headers(
-                                    (StatusCode::OK, "ok (wda keys)").into_response(),
-                                );
-                            }
-                            Err(e) => {
-                                // One stale-session retry, then fall through to L3.
-                                w.invalidate_session();
-                                if w.keys(text).await.is_ok() {
-                                    return with_security_headers(
-                                        (StatusCode::OK, "ok (wda keys)").into_response(),
-                                    );
-                                }
-                                tracing::warn!("wda keys failed, falling back to L3: {e:#}");
-                            }
-                        }
-                    }
-                }
-                ("tap", None) => {
-                    let (x, y) = (
-                        v.get("x").and_then(|x| x.as_f64()),
-                        v.get("y").and_then(|y| y.as_f64()),
-                    );
-                    if let (Some(x), Some(y)) = (x, y) {
-                        let mut w = wda.lock().await;
-                        let r = async {
-                            let (sw, sh) = w.window_size().await?;
-                            w.tap_point(x * sw, y * sh).await
-                        }
-                        .await;
-                        match r {
-                            Ok(()) => {
-                                return with_security_headers(
-                                    (StatusCode::OK, "ok (wda tap)").into_response(),
-                                );
-                            }
-                            Err(e) => {
-                                w.invalidate_session();
-                                tracing::warn!("wda tap failed, falling back to L3: {e:#}");
-                            }
-                        }
-                    }
-                }
-                // Set a date/option PickerWheel — WDA-only (a scroll gesture
-                // can't move it; issue #23). `{"type":"picker","column":N,
-                // "value":"March"}`. No L3 fallback (the mirror can't express
-                // adjustToPickerWheelValue).
-                ("picker", _) => {
-                    let column = v.get("column").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
-                    let value = v.get("value").and_then(|x| x.as_str());
-                    return match value {
-                        Some(value) => {
-                            let mut w = wda.lock().await;
-                            match w.set_picker(column, value).await {
-                                Ok(()) => with_security_headers(
-                                    (StatusCode::OK, "ok (wda picker)").into_response(),
-                                ),
-                                Err(e) => {
-                                    w.invalidate_session();
-                                    tracing::warn!("wda set_picker col={column} '{value}': {e:#}");
-                                    with_security_headers(
-                                        (StatusCode::BAD_GATEWAY, format!("wda picker: {e}"))
-                                            .into_response(),
-                                    )
-                                }
-                            }
-                        }
-                        None => with_security_headers(
-                            (
-                                StatusCode::BAD_REQUEST,
-                                "picker needs \"value\":\"<target>\" (and optional \"column\":N, 0-based)",
-                            )
-                                .into_response(),
-                        ),
-                    };
-                }
-                // Scroll/swipe on-device via WDA (issue #27) — like tap/text,
-                // independent of whether the Mirroring window is frontmost.
-                // `{"type":"scroll","x":0.5,"y":0.5,"dy":300}` (x/y optional,
-                // default screen center). Sign matches the L3 convention:
-                // positive `dy` reveals content further down (finger swipes up),
-                // positive `dx` reveals content to the right. On WDA error we
-                // reset the session, retry once, then fall through to L3.
-                ("scroll", _) | ("swipe", _) => {
-                    let nx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
-                    let ny = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
-                    let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let dy = v.get("dy").and_then(|y| y.as_f64()).unwrap_or(0.0);
-                    if dx != 0.0 || dy != 0.0 {
-                        let mut w = wda.lock().await;
-                        match wda_swipe(&mut w, nx, ny, dx, dy).await {
-                            Ok(()) => {
-                                return with_security_headers(
-                                    (StatusCode::OK, "ok (wda swipe)").into_response(),
-                                );
-                            }
-                            Err(e) => {
-                                // One stale-session retry, then fall through to L3.
-                                w.invalidate_session();
-                                if wda_swipe(&mut w, nx, ny, dx, dy).await.is_ok() {
-                                    return with_security_headers(
-                                        (StatusCode::OK, "ok (wda swipe)").into_response(),
-                                    );
-                                }
-                                tracing::warn!("wda swipe failed, falling back to L3: {e:#}");
-                            }
-                        }
-                    }
-                }
-                _ => {} // key/shortcut/down/up → L3 (mirroring) below
+    if state.wda_lifecycle.is_releasing() {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from("device release in progress"))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    // Direct is a single at-most-once WDA path. One server deadline covers lock
+    // acquisition plus the whole compound action, and no failure is replayed.
+    if state.backend == crate::config::DeviceBackend::Direct {
+        let value = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                return with_security_headers(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"ok":false,"error":"invalid_control_message"}"#,
+                    )
+                        .into_response(),
+                );
             }
+        };
+        let Some(wda) = &state.wda else {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"wda_not_configured","fallback":"disabled"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        };
+        if tokio::time::Instant::now() >= agent_wda_deadline {
+            return wda_deadline_response(false);
         }
+        let _priority = state.begin_wda_control();
+        let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatch_marker = dispatched.clone();
+        let outcome = tokio::time::timeout_at(agent_wda_deadline, async {
+            let mut client = wda.lock().await;
+            if tokio::time::Instant::now() >= agent_wda_deadline
+                || state.wda_lifecycle.is_transitioning()
+                || state.released.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return None;
+            }
+            dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
+            Some(direct_agent_action(&mut client, &state.wda_actionable, &value).await)
+        })
+        .await;
+        let outcome = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return wda_deadline_response(false),
+            Err(_) => {
+                return wda_deadline_response(
+                    dispatched.load(std::sync::atomic::Ordering::Acquire),
+                );
+            }
+        };
+        return match outcome {
+            WdaControlOutcome::Applied => with_security_headers(
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ok":true,"transport":"wda"}"#))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            ),
+            WdaControlOutcome::NotSent => {
+                mark_wda_read_path_unactionable(&state);
+                wda_failed_before_dispatch_response()
+            }
+            WdaControlOutcome::Unsupported => with_security_headers(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"wda_unavailable_or_unsupported","fallback":"disabled"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            ),
+            WdaControlOutcome::InvalidElementSnapshot => invalid_element_snapshot_response(),
+            WdaControlOutcome::StaleElementSnapshot => stale_element_snapshot_response(),
+            WdaControlOutcome::ElementNotFound => element_not_found_response(),
+            WdaControlOutcome::AmbiguousElement => ambiguous_element_response(),
+            WdaControlOutcome::InvalidElementTarget => invalid_element_target_response(),
+            WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
+        };
     }
 
     let event = match crate::input_bridge::decode_control(&body) {
@@ -1711,7 +4741,7 @@ async fn agent_input(
         return with_security_headers(
             (
                 StatusCode::CONFLICT,
-                "yielded to human: iPhone Mirroring is not frontmost — retry when status human_active is false, or switch to agent mode",
+                "yielded to human: iPhone Mirroring is not frontmost — retry when status human_active is false; on-device control requires PHONE_REMOTE_BACKEND=direct plus a daemon restart",
             )
                 .into_response(),
         );
@@ -1723,11 +4753,7 @@ async fn agent_input(
         .filter(|s| !s.is_empty())
         .unwrap_or("agent")
         .to_string();
-    {
-        let mut control = recover(state.control.lock());
-        let lease = control.acquire(core::control::Holder::Agent(agent_id), now_secs());
-        *recover(state.current_lease.lock()) = Some(lease);
-    }
+    recover(state.lease_state.lock()).acquire(core::control::Holder::Agent(agent_id), now_secs());
     // Deliverability check (issue #25): an L3 event only lands if iPhone
     // Mirroring can be brought frontmost. When a human is on the Mac, macOS
     // refuses to let a background LaunchAgent steal focus, so the event is
@@ -1746,7 +4772,7 @@ async fn agent_input(
                     .status(StatusCode::CONFLICT)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"ok":false,"dropped":true,"reason":"iPhone Mirroring could not be brought frontmost (a human is using the Mac, or it is paused/in-use) — poll /agent/status until human_active is false and drivable is true, or switch to agent mode (POST /agent/mode mode=agent)"}"#,
+                        r#"{"ok":false,"dropped":true,"reason":"iPhone Mirroring could not be brought frontmost (a human is using the Mac, or it is paused/in-use) — poll /agent/status until human_active is false and drivable is true; on-device control requires PHONE_REMOTE_BACKEND=direct plus a daemon restart"}"#,
                     ))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             );
@@ -1760,73 +4786,171 @@ async fn agent_input(
 /// agent-friendly rows `{kind, label, rect:[x,y,w,h], depth}` (L2 / WDA).
 ///
 /// An agent reasons over this the way it reasons over a screenshot, but it's
-/// text — an order of magnitude cheaper — and the labels feed straight back
-/// into `POST /agent/input {"type":"tap","label":"…"}`. 503 when WDA is not
-/// configured; 502 when it's configured but unreachable.
+/// text — an order of magnitude cheaper. Prefer snapshot-bound element indexes;
+/// exact label taps are accepted only when one current row matches. 503 when
+/// WDA is not configured; 502 when it's configured but unreachable.
 async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => return with_security_headers(
-            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-        ),
-        AgentAuth::Denied => return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-        ),
+    // The browser's accessible-controls drawer reads the same on-device tree
+    // that agents use. It is read-only, so accept the authenticated browser
+    // session just like `/agent/status` and `/agent/screenshot`; machine callers
+    // continue to use the dedicated bearer token.
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
         AgentAuth::Ok => {}
     }
-    // Inspecting the element tree is part of driving — keep the phone held.
-    state.touch_activity();
-    // Always answer with parseable JSON so a client's `r.json()["elements"]`
-    // never throws — even when WDA is absent or mid-transition (issue #18-B:
-    // a non-JSON 502/503 body crashed agents' decoders, same class as #15-C).
-    let json_body = |body: String| {
+    // Always answer with parseable JSON, while preserving failure in the HTTP
+    // status. A 200 empty tree is indistinguishable from a genuinely empty
+    // screen and caused MCP clients to continue from false state.
+    let json_body = |status: StatusCode, body: String| {
         with_security_headers(
             Response::builder()
+                .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         )
     };
+    if state.backend != crate::config::DeviceBackend::Direct {
+        return json_body(
+            StatusCode::CONFLICT,
+            r#"{"elements":[],"error":"backend_is_mirror"}"#.to_string(),
+        );
+    }
+    if state.managed_wda_pending {
+        return json_body(
+            StatusCode::CONFLICT,
+            r#"{"elements":[],"error":"target_not_configured","hint":"run setup-wda.sh to select and persist the canonical iPhone before using Direct control"}"#.to_string(),
+        );
+    }
+    // Inspecting the element tree is part of driving — keep the phone held.
+    state.touch_activity();
+    if state.wda_lifecycle.is_transitioning()
+        || state.released.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return json_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"elements":[],"error":"device_transition_in_progress","transitioning":true}"#
+                .to_string(),
+        );
+    }
     let Some(wda) = &state.wda else {
         return json_body(
-            r#"{"elements":[],"error":"wda not configured (PHONE_REMOTE_WDA_URL)"}"#.to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"elements":[],"error":"wda_not_configured"}"#.to_string(),
         );
     };
-    let mut w = wda.lock().await;
-    let rows = match w.elements().await {
-        Ok(rows) => rows,
-        Err(_) => {
-            // One stale-session retry, then degrade gracefully: an empty set with
-            // `transitioning:true` (WDA is mid-screen-change or briefly down) lets
-            // the agent retry instead of crashing on an unparseable body.
-            w.invalidate_session();
+    let _priority = state.begin_wda_control();
+    // MCP waits 45 seconds for this endpoint. Bound mutex wait + optional
+    // read-only stale-session retry + screen-size lookup to 35 seconds so the
+    // daemon, not a disconnected client, owns the final outcome.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35);
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut w = wda.lock().await;
+        let mut first_source_error = None;
+        let rows = loop {
             match w.elements().await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!("wda elements failed: {e:#}");
-                    return json_body(r#"{"elements":[],"transitioning":true}"#.to_string());
+                Ok(rows) => break rows,
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    if first_source_error.is_none() {
+                        first_source_error = Some(error.clone());
+                    }
+                    // Source reads are idempotent. System document pickers can
+                    // briefly restart the WDA relay/session, so two immediate
+                    // attempts are not a meaningful recovery window. Keep
+                    // rebuilding with a bounded delay until the endpoint's
+                    // existing total deadline; no mutation is replayed.
+                    w.invalidate_session();
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        anyhow::bail!(
+                            "WDA source never recovered; last error: {error}; first error: {}",
+                            first_source_error.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    tokio::time::sleep(std::cmp::min(
+                        std::time::Duration::from_millis(250),
+                        remaining,
+                    ))
+                    .await;
                 }
             }
+        };
+        // Screen size lets callers normalize point-space rects. Failure is
+        // non-fatal; the element tree itself is still useful.
+        let screen = w.window_size().await.ok();
+        Ok::<_, anyhow::Error>((rows, screen))
+    })
+    .await;
+    let (rows, screen) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            tracing::warn!("wda elements failed: {error:#}");
+            mark_wda_read_path_unactionable(&state);
+            return json_body(
+                StatusCode::BAD_GATEWAY,
+                r#"{"elements":[],"error":"wda_source_failed","transitioning":true}"#.to_string(),
+            );
+        }
+        Err(_) => {
+            mark_wda_read_path_unactionable(&state);
+            return json_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                r#"{"elements":[],"error":"wda_source_timeout","transitioning":true}"#.to_string(),
+            );
         }
     };
-    // Screen size so the agent can normalize the point-space rects to [0,1]
-    // instead of guessing the device dimensions from the largest rect (#24.2).
-    // The array index of each row is its stable handle for `{"type":"tap",
-    // "element":<i>}` (#24.1) — useful when labels are non-unique/opaque.
-    let screen = w.window_size().await.ok();
-    json_body(
-        serde_json::to_string(&serde_json::json!({
-            "screen": screen.map(|(width, height)| serde_json::json!({"width": width, "height": height})),
-            "elements": rows,
-        }))
-        .unwrap_or_else(|_| r#"{"elements":[]}"#.to_string()),
-    )
+    match serde_json::to_string(&serde_json::json!({
+        "screen": screen.map(|(width, height)| serde_json::json!({"width": width, "height": height})),
+        "snapshot": match element_snapshot_id(&rows) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!("serialize WDA element snapshot: {error:#}");
+                return json_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
+                );
+            }
+        },
+        "elements": rows,
+    })) {
+        Ok(body) => json_body(StatusCode::OK, body),
+        Err(_) => json_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
+        ),
+    }
+}
+
+/// A read-path failure is enough to revoke `drivable`, even when the last
+/// background health probe still says the WDA runner was up.
+///
+/// Keep reachability and lock knowledge intact: a WebView transition can make
+/// `/source` fail while WDA itself remains reachable. The next bounded status
+/// probe decides whether the runner is down; until then, actions fail closed.
+fn mark_wda_read_path_unactionable(state: &AppState) {
+    state
+        .wda_actionable
+        .store(false, std::sync::atomic::Ordering::Release);
+    recover(state.wda_health.lock()).actionable = false;
 }
 
 /// `GET /agent/screenshot` — current phone screen as a PNG.
 ///
-/// Captures the Mirroring window via [`core::capture::screenshot_mirroring_png`]
-/// (uses `screencapture -l <window_id>` internally — no external cua-driver
-/// dependency).  503 if the Mirroring window is not currently found.
+/// Direct captures on-device through WDA and fails closed if WDA is unavailable.
+/// Mirror compatibility captures its configured Mirroring window through
+/// [`core::capture::screenshot_mirroring_png`]. The two paths never fall
+/// through to one another.
 ///
 /// Auth: agent bearer **or** a valid session cookie. The cookie path exists for
 /// the web client's stills-fallback (when Mirroring dies the page polls this
@@ -1834,89 +4958,126 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 /// privilege is identical. The cookie is checked FIRST so browser polling never
 /// touches the bearer auth-limiter (5 misses there lock the agent API for 30s).
 async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    // Cookie counts only when a password is actually configured — in a
-    // token-only deployment `is_authed` would otherwise wave everyone through
-    // (it treats password=None as open mode).
-    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
-    if !cookie_ok {
-        match agent_auth(&state, &headers) {
-            AgentAuth::Locked => return with_security_headers(
+    // Match `/phone`: password=None intentionally makes the browser UI open.
+    // A separate agent token still protects machine-only mutation endpoints.
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
                 (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            ),
-            AgentAuth::Denied => return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            ),
-            AgentAuth::Ok => {}
+            )
         }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if state.backend == crate::config::DeviceBackend::Direct && state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    if state.backend == crate::config::DeviceBackend::Direct
+        && (state.wda_lifecycle.is_transitioning()
+            || state.released.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return with_security_headers(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "direct device is released, releasing, or reconnecting",
+            )
+                .into_response(),
+        );
     }
     // A screenshot means someone is looking at the phone — keep it held.
     state.touch_activity();
-    // Prefer the WDA on-device capture whenever WDA is configured. In agent mode
-    // the Mirroring window only shows the "iPhone in Use" interstitial (WDA
-    // monopolizes the device), and when WDA targets a *second* phone the mirror
-    // is a different device entirely — so the L3 mirror bytes would be the WRONG
-    // screen. WDA bytes are always the actual target phone. Falls through to the
-    // L3 mirror capture when WDA is absent or its runner is down (the failed
-    // call doubles as the liveness check, so no extra /status round-trip).
-    if let Some(wda) = &state.wda {
-        if let Ok(bytes) = wda.lock().await.screenshot_png().await {
-            if is_valid_png(&bytes) {
-                let resp = Response::builder()
+    // The configured backend owns capture end-to-end. Direct uses WDA bytes
+    // from its canonical phone and returns an error when that path is down;
+    // Mirror alone reaches the legacy host-window capture below. This prevents
+    // a failed Direct request from silently returning pixels from another
+    // mirrored phone.
+    if state.backend == crate::config::DeviceBackend::Direct {
+        let _priority = state.wda.as_ref().map(|_| state.begin_wda_control());
+        let Some(wda) = &state.wda else {
+            return with_security_headers(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "direct device screenshot unavailable (WDA is not configured)",
+                )
+                    .into_response(),
+            );
+        };
+        return match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            wda.lock().await.screenshot_png().await
+        })
+        .await
+        {
+            Ok(Ok(bytes)) if is_valid_png(&bytes) => {
+                let response = Response::builder()
                     .header(header::CONTENT_TYPE, "image/png")
                     .body(Body::from(bytes))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-                return with_security_headers(resp);
+                with_security_headers(response)
             }
-        }
+            Ok(Ok(bytes)) => {
+                tracing::warn!(
+                    "agent screenshot: Direct WDA returned {} bytes, not a valid PNG",
+                    bytes.len()
+                );
+                mark_wda_read_path_unactionable(&state);
+                with_security_headers(
+                    (StatusCode::BAD_GATEWAY, "WDA returned an invalid PNG").into_response(),
+                )
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("agent screenshot: Direct WDA failed: {error:#}");
+                mark_wda_read_path_unactionable(&state);
+                with_security_headers(
+                    (StatusCode::BAD_GATEWAY, "WDA screenshot failed").into_response(),
+                )
+            }
+            Err(_) => {
+                mark_wda_read_path_unactionable(&state);
+                with_security_headers(
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "WDA screenshot exceeded the server deadline",
+                    )
+                        .into_response(),
+                )
+            }
+        };
     }
     let png = tokio::task::spawn_blocking(core::capture::screenshot_mirroring_png).await;
-    // A valid L3 capture short-circuits. Otherwise — capture error, empty, OR a
-    // runt/garbage frame (issue #14: ~26-byte non-PNG bodies came back during the
-    // post-Resume screen transition and crashed the agent's decoder) — fall
-    // through to the WDA on-device screenshot, then to a clear 503. Never hand
-    // the agent half a frame with an image/png content-type.
-    match &png {
-        Ok(Ok(bytes)) if is_valid_png(bytes) => {
+    // Mirror is an isolated compatibility backend: a failed/runt host-window
+    // capture returns 503 and never reaches WDA, even if an invalid AppState
+    // accidentally contains a WDA client.
+    match png {
+        Ok(Ok(bytes)) if is_valid_png(&bytes) => {
             let resp = Response::builder()
                 .header(header::CONTENT_TYPE, "image/png")
-                .body(Body::from(bytes.clone()))
+                .body(Body::from(bytes))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             return with_security_headers(resp);
         }
         Ok(Ok(bytes)) => {
-            // Non-empty but not a decodable PNG, or empty.
             tracing::warn!(
-                "agent screenshot: L3 capture returned {} bytes, not a valid PNG — trying WDA",
+                "agent screenshot: Mirror capture returned {} bytes, not a valid PNG",
                 bytes.len()
             );
         }
         Ok(Err(e)) => {
-            tracing::warn!("agent screenshot: no Mirroring window: {e:#} — trying WDA");
+            tracing::warn!("agent screenshot: no Mirroring window: {e:#}");
         }
         Err(e) => {
-            tracing::warn!("agent screenshot: capture task panicked: {e:?} — trying WDA");
-        }
-    }
-    // On-device fallback: works with no Mac-side window at all, and its bytes
-    // come straight from WDA so they're a complete frame.
-    if let Some(wda) = &state.wda {
-        match wda.lock().await.screenshot_png().await {
-            Ok(bytes) if is_valid_png(&bytes) => {
-                let resp = Response::builder()
-                    .header(header::CONTENT_TYPE, "image/png")
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-                return with_security_headers(resp);
-            }
-            Ok(bytes) => tracing::warn!(
-                "agent screenshot: WDA returned {} bytes, not a valid PNG",
-                bytes.len()
-            ),
-            Err(e) => tracing::warn!("agent screenshot: WDA screenshot failed: {e:#}"),
+            tracing::warn!("agent screenshot: Mirror capture task panicked: {e:?}");
         }
     }
     with_security_headers(
-        (StatusCode::SERVICE_UNAVAILABLE, "no valid screenshot frame available").into_response(),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no valid screenshot frame available",
+        )
+            .into_response(),
     )
 }
 
@@ -1927,63 +5088,201 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
 /// this directly in an `<img src="/agent/mjpeg">`. ~28 fps at the tuned
 /// settings applied here (framerate/scaling/quality), regardless of USB vs Wi-Fi
 /// (the cap is WDA's screenshot rate, not the transport).
-async fn agent_mjpeg(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+fn is_mjpeg_content_type(value: &str) -> bool {
+    value.split(';').next().is_some_and(|media_type| {
+        media_type
+            .trim()
+            .eq_ignore_ascii_case("multipart/x-mixed-replace")
+    })
+}
+
+async fn agent_mjpeg(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MjpegStreamQuery>,
+    headers: HeaderMap,
+) -> Response {
     // Same cookie-or-bearer rule as `agent_screenshot`.
-    let cookie_ok = state.password.is_some() && is_authed(&state, &headers);
-    if !cookie_ok {
-        match agent_auth(&state, &headers) {
-            AgentAuth::Locked => {
-                return with_security_headers(
-                    (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-                )
-            }
-            AgentAuth::Denied => {
-                return with_security_headers(
-                    (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-                )
-            }
-            AgentAuth::Ok => {}
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
         }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    let stream_id = match query.stream_id {
+        Some(stream_id) if valid_mjpeg_stream_id(&stream_id) => Some(stream_id),
+        Some(_) => {
+            return with_security_headers(
+                (StatusCode::BAD_REQUEST, "invalid MJPEG stream id").into_response(),
+            )
+        }
+        None => None,
+    };
+    if state.backend != crate::config::DeviceBackend::Direct {
+        return with_security_headers(
+            (
+                StatusCode::CONFLICT,
+                "WDA MJPEG is disabled for the Mirror backend",
+            )
+                .into_response(),
+        );
+    }
+    if state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    if state.wda_lifecycle.is_transitioning()
+        || state.released.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return with_security_headers(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "direct device is released, releasing, or reconnecting",
+            )
+                .into_response(),
+        );
     }
     // Opening the live feed counts as watching — stamp now, and hold a stream
     // guard (below) for the whole connection so the idle watchdog won't release
     // the phone while a viewer is on it.
     state.touch_activity();
+    if state.wda_lifecycle.is_transitioning()
+        || state.released.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return with_security_headers(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "device transition in progress",
+            )
+                .into_response(),
+        );
+    }
+    const MAX_MJPEG_VIEWERS: usize = 4;
+    let Some(stream_guard) =
+        StreamGuard::try_reserve(state.live_streams.clone(), MAX_MJPEG_VIEWERS)
+    else {
+        return with_security_headers(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many live viewers (maximum 4)",
+            )
+                .into_response(),
+        );
+    };
     let Some(url) = state.mjpeg_url.clone() else {
         return with_security_headers(
             (StatusCode::SERVICE_UNAVAILABLE, "no WDA MJPEG configured").into_response(),
         );
     };
     // Best-effort: tune the stream for a smooth feed (idempotent). A failure
-    // here just leaves WDA's defaults (~9 fps) — still usable.
+    // here just leaves WDA's defaults (~9 fps) — still usable. Never wait behind
+    // a control/status holder: opening video must not outlive the browser's own
+    // first-frame timeout merely to change optional settings.
     if let Some(wda) = &state.wda {
-        let _ = wda.lock().await.set_mjpeg_settings(30, 50, 60).await;
+        let _priority = state.begin_wda_control();
+        if let Ok(mut client) = wda.try_lock() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                client.set_mjpeg_settings(30, 50, 60),
+            )
+            .await;
+        }
     }
-    // Proxy the upstream MJPEG stream straight through. A fresh client with no
-    // timeout — the stream is intentionally long-lived (one frame after another
-    // forever), so a request timeout would cut it off.
-    let client = match reqwest::Client::builder().build() {
+    // Proxy the upstream MJPEG stream straight through. Keep the request itself
+    // unbounded because the body is intentionally long-lived, but cap the TCP
+    // connect phase so a dead relay cannot hang the handler indefinitely.
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match client.get(&url).send().await {
+    let upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.get(&url).send(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return with_security_headers(
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "WDA MJPEG did not return response headers before the deadline",
+                )
+                    .into_response(),
+            )
+        }
+    };
+    match upstream {
         Ok(up) if up.status().is_success() => {
             let content_type = up
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("multipart/x-mixed-replace; boundary=--BoundaryString")
-                .to_string();
+                .filter(|value| is_mjpeg_content_type(value));
+            let Some(content_type) = content_type else {
+                return with_security_headers(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "WDA MJPEG upstream returned a non-MJPEG content type",
+                    )
+                        .into_response(),
+                );
+            };
+            let content_type = content_type.to_string();
             // Carry a StreamGuard alongside the proxied stream: it increments
             // live_streams now and decrements when this stream is dropped (the
             // viewer disconnects), so an open feed keeps the phone from being
             // idle-released and the count falls cleanly when they leave.
             use futures_util::StreamExt;
-            let guard = StreamGuard::new(state.live_streams.clone());
-            let body = Body::from_stream(up.bytes_stream().map(move |item| {
-                let _keep = &guard; // hold the guard for the stream's lifetime
-                item
-            }));
+            let guard = stream_guard;
+            let upstream = Box::pin(up.bytes_stream());
+            // This is an inactivity timeout, not a total stream timeout. Every
+            // received chunk resets the 8-second window; if WDA silently stalls
+            // after its first frame, close the response so the browser's
+            // img.onerror/fallback logic can reconnect.
+            let activity_guard = stream_id.map(|stream_id| {
+                MjpegActivityGuard::register(state.mjpeg_stream_activity.clone(), stream_id)
+            });
+            let timed = futures_util::stream::unfold(
+                (upstream, guard, activity_guard, false),
+                |(mut upstream, guard, activity_guard, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    match tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, upstream.next()).await {
+                        Ok(Some(Ok(bytes))) => {
+                            if let Some(activity) = &activity_guard {
+                                activity.touch();
+                            }
+                            Some((
+                                Ok::<_, std::io::Error>(bytes),
+                                (upstream, guard, activity_guard, false),
+                            ))
+                        }
+                        Ok(Some(Err(error))) => Some((
+                            Err(std::io::Error::other(error)),
+                            (upstream, guard, activity_guard, true),
+                        )),
+                        Ok(None) => None,
+                        Err(_) => Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "WDA MJPEG stream was idle for 8 seconds",
+                            )),
+                            (upstream, guard, activity_guard, true),
+                        )),
+                    }
+                },
+            );
+            let body = Body::from_stream(timed);
             Response::builder()
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CACHE_CONTROL, "no-store")
@@ -2074,6 +5373,9 @@ async fn agent_inbox_post(
         }
         AgentAuth::Ok => {}
     }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
     // Accept any JSON; if the shortcut sent a bare string / non-JSON, wrap it.
     let value: serde_json::Value =
         serde_json::from_str(&body).unwrap_or_else(|_| serde_json::Value::String(body.clone()));
@@ -2090,15 +5392,20 @@ async fn agent_inbox_post(
     with_security_headers((StatusCode::OK, "accepted").into_response())
 }
 
-/// `GET /agent/inbox` — an agent retrieves and DRAINS pending phone results.
+fn inbox_items_response(items: Vec<InboxItem>) -> Response {
+    let json = serde_json::json!({ "items": items }).to_string();
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    with_security_headers(response)
+}
+
+/// `GET /agent/inbox` — safely peek at pending phone results without mutation.
 ///
-/// Returns `{"items":[{"received_at":..,"body":..}, ...]}` and empties the inbox
-/// (use `?peek=1` to read without draining). Bearer-auth'd.
-async fn agent_inbox_get(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> Response {
+/// `?peek=1` remains accepted for compatibility but is now equivalent to the
+/// default. Destructive consumption belongs to `POST /agent/inbox/drain`.
+async fn agent_inbox_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
             return with_security_headers(
@@ -2112,33 +5419,88 @@ async fn agent_inbox_get(
         }
         AgentAuth::Ok => {}
     }
-    let peek = query.as_deref().is_some_and(|q| q.contains("peek=1"));
-    let items: Vec<InboxItem> = {
-        let mut inbox = state.inbox.lock().unwrap_or_else(|e| e.into_inner());
-        if peek {
-            inbox.iter().cloned().collect()
-        } else {
-            inbox.drain(..).collect()
+    let items = state
+        .inbox
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    inbox_items_response(items)
+}
+
+/// `POST /agent/inbox/drain` — atomically consume all pending phone results.
+///
+/// This state-changing operation requires both bearer authentication (unless
+/// explicitly running open mode) and the custom CSRF header.
+async fn agent_inbox_drain(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
         }
-    };
-    let json = serde_json::json!({ "items": items }).to_string();
-    let resp = Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    with_security_headers(resp)
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let items = state
+        .inbox
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .drain(..)
+        .collect();
+    inbox_items_response(items)
 }
 
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    if !is_authed(&state, &headers) {
+    if state.backend != crate::config::DeviceBackend::Mirror {
         return with_security_headers(
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            (
+                StatusCode::CONFLICT,
+                "WebRTC signaling is disabled for the direct device backend",
+            )
+                .into_response(),
         );
     }
+    // Browser WebSockets are not protected by CORS preflight. In open mirror
+    // mode, reject a cross-site page before it can acquire a viewer lease or
+    // reach the legacy data-channel control path. Non-browser clients may omit
+    // Origin; when it is present, it must match this request's Host exactly.
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let same_origin = origin
+            .parse::<axum::http::Uri>()
+            .ok()
+            .and_then(|uri| {
+                let scheme_ok = matches!(uri.scheme_str(), Some("http") | Some("https"));
+                let authority = uri.authority()?.as_str();
+                let host = headers.get(header::HOST)?.to_str().ok()?;
+                Some(scheme_ok && authority.eq_ignore_ascii_case(host))
+            })
+            .unwrap_or(false);
+        if !same_origin {
+            return with_security_headers(
+                (StatusCode::FORBIDDEN, "cross-origin WebSocket denied").into_response(),
+            );
+        }
+    }
+    if !is_authed(&state, &headers) {
+        return with_security_headers((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return with_security_headers(rejection.into_response()),
+    };
     let session_id = new_session_id();
     let state = state.clone();
     ws.on_upgrade(move |socket| async move {
@@ -2231,6 +5593,273 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn element_snapshot_changes_with_the_actionable_tree() {
+        let first = vec![crate::wda::ElementRow {
+            kind: "Button".to_string(),
+            label: "继续".to_string(),
+            identifier: Some("continue-button".to_string()),
+            rect: [10.0, 20.0, 80.0, 44.0],
+            depth: 2,
+            value: None,
+            enabled: None,
+            visible: None,
+            accessible: Some(true),
+            focused: None,
+            placeholder: None,
+        }];
+        let mut changed = vec![crate::wda::ElementRow {
+            kind: "Button".to_string(),
+            label: "继续".to_string(),
+            identifier: Some("continue-button".to_string()),
+            rect: [10.0, 20.0, 80.0, 44.0],
+            depth: 2,
+            value: None,
+            enabled: None,
+            visible: None,
+            accessible: Some(true),
+            focused: None,
+            placeholder: None,
+        }];
+
+        let snapshot = element_snapshot_id(&first).unwrap();
+        assert_eq!(snapshot, element_snapshot_id(&first).unwrap());
+        assert!(!snapshot.is_empty());
+
+        changed[0].rect[1] = 120.0;
+        assert_ne!(snapshot, element_snapshot_id(&changed).unwrap());
+    }
+
+    #[test]
+    fn locator_wda_query_uses_element_clickable_predicate_fields() {
+        let locator = AgentElementLocator {
+            label: Some("保存到“文件”".to_string()),
+            identifier: Some("actionGroupCell".to_string()),
+            kind: Some("Cell".to_string()),
+            value: None,
+            focused: Some(false),
+            enabled: Some(true),
+            visible: Some(true),
+        };
+
+        let (using, value) = locator_wda_query(&locator).unwrap();
+        assert_eq!(using, "predicate string");
+        assert_eq!(
+            value,
+            "type == 'XCUIElementTypeCell' AND (label == '保存到“文件”' OR name == '保存到“文件”') AND focused == 0 AND enabled == 1 AND visible == 1"
+        );
+    }
+
+    #[test]
+    fn locator_wda_query_falls_back_to_identifier_and_escapes_predicates() {
+        let locator = AgentElementLocator {
+            label: None,
+            identifier: Some("unique-control".to_string()),
+            kind: None,
+            value: None,
+            focused: None,
+            enabled: None,
+            visible: None,
+        };
+        assert_eq!(
+            locator_wda_query(&locator),
+            Some(("accessibility id", "unique-control".to_string()))
+        );
+        assert_eq!(
+            wda_predicate_literal("O'Reilly\\Files"),
+            "'O\\'Reilly\\\\Files'"
+        );
+    }
+
+    #[test]
+    fn snapshot_row_locator_uses_semantics_instead_of_system_rectangle() {
+        let row = crate::wda::ElementRow {
+            kind: "Button".to_string(),
+            label: "保存".to_string(),
+            identifier: None,
+            rect: [358.0, 24.0, 58.0, 36.0],
+            depth: 3,
+            value: None,
+            enabled: Some(true),
+            visible: Some(true),
+            accessible: Some(true),
+            focused: Some(false),
+            placeholder: None,
+        };
+
+        let locator = snapshot_row_locator(&row).unwrap();
+        assert_eq!(locator.label.as_deref(), Some("保存"));
+        assert_eq!(locator.kind.as_deref(), Some("Button"));
+        assert_eq!(locator.enabled, Some(true));
+        assert_eq!(locator.visible, Some(true));
+    }
+
+    #[test]
+    fn snapshot_row_locator_allows_coordinate_only_without_semantics() {
+        let row = crate::wda::ElementRow {
+            kind: String::new(),
+            label: String::new(),
+            identifier: None,
+            rect: [10.0, 20.0, 80.0, 44.0],
+            depth: 1,
+            value: None,
+            enabled: None,
+            visible: None,
+            accessible: None,
+            focused: None,
+            placeholder: None,
+        };
+
+        assert!(snapshot_row_locator(&row).is_none());
+    }
+
+    #[test]
+    fn batch_expectations_match_application_and_strict_element_state() {
+        let rows = vec![
+            crate::wda::ElementRow {
+                kind: "Application".to_string(),
+                label: "招商银行".to_string(),
+                identifier: None,
+                rect: [0.0, 0.0, 440.0, 956.0],
+                depth: 0,
+                value: None,
+                enabled: None,
+                visible: None,
+                accessible: None,
+                focused: None,
+                placeholder: None,
+            },
+            crate::wda::ElementRow {
+                kind: "TextField".to_string(),
+                label: "搜索".to_string(),
+                identifier: Some("search-field".to_string()),
+                rect: [20.0, 80.0, 400.0, 44.0],
+                depth: 4,
+                value: Some("示例联系人".to_string()),
+                enabled: None,
+                visible: None,
+                accessible: Some(true),
+                focused: Some(true),
+                placeholder: Some("搜索交易".to_string()),
+            },
+        ];
+        let expect = AgentUiExpectation {
+            application: Some("招商银行".to_string()),
+            present: vec![AgentElementLocator {
+                label: Some("搜索".to_string()),
+                identifier: Some("search-field".to_string()),
+                kind: Some("TextField".to_string()),
+                value: Some("示例联系人".to_string()),
+                focused: Some(true),
+                enabled: Some(true),
+                visible: Some(true),
+            }],
+            absent: vec![AgentElementLocator {
+                label: Some("确认转账".to_string()),
+                identifier: None,
+                kind: None,
+                value: None,
+                focused: None,
+                enabled: None,
+                visible: None,
+            }],
+        };
+
+        let (matches, observation) = agent_expectation_observation(&rows, &expect);
+        assert!(matches);
+        assert_eq!(observation["application"], "招商银行");
+        assert_eq!(observation["missing_present"], serde_json::json!([]));
+        assert_eq!(observation["violated_absent"], serde_json::json!([]));
+
+        let wrong_app = AgentUiExpectation {
+            application: Some("聚焦".to_string()),
+            present: vec![],
+            absent: vec![],
+        };
+        assert!(!agent_expectation_observation(&rows, &wrong_app).0);
+    }
+
+    #[test]
+    fn setup_status_accepts_every_setup_script_blocker() {
+        for blocker in ["warp", "proxy", "usb", "trust", "ddi", "wda"] {
+            let payload = format!(r#"{{"blocked_on":"{blocker}","ts":1000}}"#);
+            assert_eq!(parse_setup_blocked_on(&payload, 1100), blocker);
+            assert!(
+                setup_blocker_hint(blocker).is_some(),
+                "{blocker} must have an actionable status hint"
+            );
+        }
+        assert!(setup_blocker_hint("").is_none());
+        assert!(setup_blocker_hint("surprise").is_none());
+        assert!(setup_blocker_hint("warp").unwrap().contains("fd00::/8"));
+        assert!(setup_blocker_hint("warp").unwrap().contains("Traffic only mode"));
+    }
+
+    #[test]
+    fn setup_status_rejects_stale_unknown_or_invalid_input() {
+        assert_eq!(
+            parse_setup_blocked_on(r#"{"blocked_on":"wda","ts":1000}"#, 1301),
+            ""
+        );
+        assert_eq!(
+            parse_setup_blocked_on(r#"{"blocked_on":"surprise","ts":1000}"#, 1000),
+            ""
+        );
+        assert_eq!(parse_setup_blocked_on("not-json", 1000), "");
+    }
+
+    #[test]
+    fn setup_status_preserves_fresh_progress_without_calling_it_a_blocker() {
+        let status = parse_setup_status(
+            r#"{"phase":"building","blocked_on":"","message":"building + launching WDA (90s elapsed)","ts":1000}"#,
+            1100,
+        )
+        .unwrap();
+        assert_eq!(status.phase, "building");
+        assert_eq!(status.blocked_on, "");
+        assert_eq!(
+            status.message,
+            "building + launching WDA (90s elapsed)"
+        );
+    }
+
+    #[test]
+    fn setup_log_fallback_recognizes_usb_failure_from_latest_attempt_only() {
+        let unplugged = "\u{1b}[1m== Checking prerequisites\u{1b}[0m\n\
+            == Resolving target device\n\
+            target 00008150-000A60EC1A02401C is not currently connected over USB.";
+        assert_eq!(parse_setup_log_blocked_on(unplugged), "usb");
+
+        let recovered = "== Checking prerequisites\n\
+            target 00008150-000A60EC1A02401C is not currently connected over USB.\n\
+            == Checking prerequisites\n\
+            iPhone on USB: 00008150-000A60EC1A02401C\n\
+            prerequisites passed";
+        assert_eq!(parse_setup_log_blocked_on(recovered), "");
+        assert_eq!(
+            parse_setup_log_blocked_on("USB relay diagnostics completed"),
+            ""
+        );
+    }
+
+    #[test]
+    fn setup_log_fallback_recognizes_warp_from_latest_attempt_only() {
+        let connected = "== Checking prerequisites\n\
+            WARP is ON and will block WDA (the CoreDevice tunnel dies).";
+        assert_eq!(parse_setup_log_blocked_on(connected), "warp");
+
+        let recovered = "== Checking prerequisites\n\
+            WARP is ON and will block WDA (the CoreDevice tunnel dies).\n\
+            == Checking prerequisites\n\
+            System proxies (HTTP/HTTPS/SOCKS): none enabled\n\
+            prerequisites passed";
+        assert_eq!(parse_setup_log_blocked_on(recovered), "");
+
+        let missing_bypass = "== Checking prerequisites\n\
+            WARP is connected, but its effective Split Tunnel exclusions do not cover the CoreDevice device tunnel.";
+        assert_eq!(parse_setup_log_blocked_on(missing_bypass), "warp");
+    }
+
     // ── AuthLimiter unit tests ────────────────────────────────────────────────
 
     #[test]
@@ -2256,7 +5885,10 @@ mod tests {
         for _ in 0..(AUTH_MAX_FAILURES - 1) {
             limiter.record_failure();
         }
-        assert!(!limiter.is_locked(), "4 failures should not trigger lockout (max=5)");
+        assert!(
+            !limiter.is_locked(),
+            "4 failures should not trigger lockout (max=5)"
+        );
     }
 
     #[test]
@@ -2277,7 +5909,10 @@ mod tests {
         // Manually set a lockout that already expired.
         limiter.failures = AUTH_MAX_FAILURES;
         limiter.locked_until = Some(Instant::now() - std::time::Duration::from_secs(1));
-        assert!(!limiter.is_locked(), "expired lockout should not block requests");
+        assert!(
+            !limiter.is_locked(),
+            "expired lockout should not block requests"
+        );
     }
 
     #[test]
@@ -2312,7 +5947,10 @@ mod tests {
         let json = ice_servers_json(&servers);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["iceServers"].is_array());
-        assert_eq!(v["iceServers"][0]["urls"][0], "stun:stun.l.google.com:19302");
+        assert_eq!(
+            v["iceServers"][0]["urls"][0],
+            "stun:stun.l.google.com:19302"
+        );
         // No username/credential on a bare STUN entry.
         assert!(v["iceServers"][0].get("username").is_none());
     }
@@ -2354,6 +5992,50 @@ mod tests {
         assert!(INDEX_HTML.contains("iphone-use"));
         assert!(INDEX_HTML.contains("/ws"));
         assert!(INDEX_HTML.contains("turn-creds"));
+        assert!(INDEX_HTML.contains("id=\"flowPanel\""));
+        assert!(INDEX_HTML.contains("aria-label=\"录制并运行自动化流程\""));
+        assert!(INDEX_HTML.contains("id=\"flowAvailability\""));
+        assert!(INDEX_HTML.contains("id=\"flowSafetyGate\""));
+        assert!(INDEX_HTML.contains("id=\"flowOpenFile\""));
+        assert!(INDEX_HTML.contains("validateImportedFlowDocument"));
+        assert!(INDEX_HTML.contains("正常重放不需要 AI 逐步操作"));
+        assert!(INDEX_HTML.contains("写死了文字；请改用 input 运行参数"));
+        assert!(INDEX_HTML.contains("文字只会变成运行参数"));
+        assert!(INDEX_HTML.contains("只用于本次执行，不写入 JSON"));
+        assert!(INDEX_HTML.contains("document.inputs = Object.fromEntries"));
+        assert!(INDEX_HTML.contains("kind: 'type'"));
+        assert!(INDEX_HTML.contains("input: key"));
+        assert!(INDEX_HTML.contains("界面检查点"));
+        assert!(INDEX_HTML.contains("chooseFlowCheckpoint"));
+        assert!(INDEX_HTML.contains("kind: 'wait_for'"));
+        assert!(INDEX_HTML.contains("fetch('/agent/actions'"));
+        assert!(INDEX_HTML.contains("X-Phone-Control"));
+        assert!(INDEX_HTML.contains("function managedSetupWillRetry"));
+        assert!(INDEX_HTML.contains("连接后会自动继续"));
+        assert!(INDEX_HTML.contains("fd00::/8"));
+        assert!(INDEX_HTML.contains("fe80::/10"));
+        assert!(INDEX_HTML.contains("Traffic only + Split Tunnels Include"));
+        assert!(!INDEX_HTML.contains("请手动断开 WARP"));
+        assert!(!INDEX_HTML.contains("请连接并解锁 iPhone，保持亮屏，然后在手机上点「信任」"));
+        assert!(INDEX_HTML
+            .contains("a, button, input, textarea, select, summary, [contenteditable=\"true\"]"));
+    }
+
+    #[test]
+    fn embedded_setup_html_is_the_connection_guide() {
+        assert!(SETUP_HTML.contains("连接真实 iPhone"));
+        assert!(SETUP_HTML.contains("fetch('/agent/status'"));
+        assert!(SETUP_HTML.contains("setup_blocked_on"));
+        assert!(SETUP_HTML.contains("recovery_owner"));
+        assert!(SETUP_HTML.contains("aria-disabled=\"true\""));
+        assert!(SETUP_HTML.contains("href=\"/phone\""));
+        assert!(SETUP_HTML.contains("fd00::/8"));
+        assert!(SETUP_HTML.contains("fe80::/10"));
+        assert!(SETUP_HTML.contains("Traffic only mode"));
+        assert!(!SETUP_HTML.contains("id=\"copyBlocker\""));
+        assert!(!SETUP_HTML.contains("是否断开 VPN 由你决定"));
+        assert!(!SETUP_HTML.contains("/agent/mode"));
+        assert!(!SETUP_HTML.contains("/agent/actions"));
     }
 
     #[test]
@@ -2370,5 +6052,247 @@ mod tests {
         let mut ok = sig.to_vec();
         ok.extend_from_slice(&[0u8; 25]); // pad past the 33-byte floor
         assert!(is_valid_png(&ok));
+    }
+
+    #[test]
+    fn launch_agent_values_are_xml_escaped() {
+        assert_eq!(
+            xml_escape(r#"/Users/A&B/<phone>"quoted".sh"#),
+            "/Users/A&amp;B/&lt;phone&gt;&quot;quoted&quot;.sh"
+        );
+    }
+
+    #[test]
+    fn plist_staging_preserves_live_file_until_atomic_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("agent.plist");
+        std::fs::write(&live, b"old").unwrap();
+
+        let staged = stage_file(&live, b"new").unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"old");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+
+        std::fs::rename(&staged, &live).unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"new");
+    }
+
+    #[test]
+    fn managed_wda_target_requires_a_canonical_udid() {
+        assert!(valid_wda_udid("00008110-001234567890001E"));
+        assert!(!valid_wda_udid(""));
+        assert!(!valid_wda_udid("phone one"));
+        assert!(!valid_wda_udid("../other-device"));
+    }
+
+    #[test]
+    fn normalized_wda_coordinates_stay_inside_touchable_bounds() {
+        assert_eq!(normalized_wda_axis(0.0, 390.0).unwrap(), 1.0);
+        assert_eq!(normalized_wda_axis(1.0, 390.0).unwrap(), 389.0);
+        assert_eq!(normalized_wda_axis(0.5, 390.0).unwrap(), 195.0);
+        assert!(normalized_wda_axis(0.5, 2.0).is_err());
+        assert!(normalized_wda_axis(f64::NAN, 390.0).is_err());
+    }
+
+    #[test]
+    fn idle_release_aborts_stuck_health_probe_but_never_pending_control() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let control_pending = std::sync::atomic::AtomicUsize::new(0);
+            let stuck = tokio::spawn(std::future::pending::<()>());
+            let stuck_abort = stuck.abort_handle();
+            let slot = Mutex::new(Some(stuck));
+
+            assert!(abort_health_probe_for_idle(&control_pending, &slot));
+            tokio::task::yield_now().await;
+            assert!(recover(slot.lock()).is_none());
+            assert!(stuck_abort.is_finished());
+
+            control_pending.store(1, std::sync::atomic::Ordering::Release);
+            let protected = tokio::spawn(std::future::pending::<()>());
+            let protected_abort = protected.abort_handle();
+            *recover(slot.lock()) = Some(protected);
+
+            assert!(!abort_health_probe_for_idle(&control_pending, &slot));
+            tokio::task::yield_now().await;
+            assert!(recover(slot.lock()).is_some());
+            assert!(!protected_abort.is_finished());
+            recover(slot.lock()).take().unwrap().abort();
+        });
+    }
+
+    #[test]
+    fn wda_lifecycle_serializes_release_and_reconnect_in_both_orders() {
+        let lifecycle = WdaLifecycle::new();
+
+        assert!(lifecycle.try_begin_reconnecting());
+        assert!(lifecycle.is_reconnecting());
+        assert!(!lifecycle.try_begin_releasing());
+        lifecycle.finish_reconnecting();
+
+        assert!(lifecycle.try_begin_releasing());
+        assert!(lifecycle.is_releasing());
+        assert!(!lifecycle.try_begin_reconnecting());
+        lifecycle.finish_releasing();
+
+        assert!(!lifecycle.is_transitioning());
+    }
+
+    #[test]
+    fn simultaneous_wda_lifecycle_starts_have_exactly_one_owner() {
+        let lifecycle = std::sync::Arc::new(WdaLifecycle::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let reconnect_lifecycle = lifecycle.clone();
+        let reconnect_barrier = barrier.clone();
+        let reconnect = std::thread::spawn(move || {
+            reconnect_barrier.wait();
+            reconnect_lifecycle.try_begin_reconnecting()
+        });
+        let release_lifecycle = lifecycle.clone();
+        let release_barrier = barrier.clone();
+        let release = std::thread::spawn(move || {
+            release_barrier.wait();
+            release_lifecycle.try_begin_releasing()
+        });
+
+        barrier.wait();
+        let reconnect_won = reconnect.join().unwrap();
+        let release_won = release.join().unwrap();
+        assert_ne!(reconnect_won, release_won);
+
+        if reconnect_won {
+            assert!(lifecycle.is_reconnecting());
+            lifecycle.finish_reconnecting();
+        } else {
+            assert!(lifecycle.is_releasing());
+            lifecycle.finish_releasing();
+        }
+        assert!(!lifecycle.is_transitioning());
+    }
+
+    #[test]
+    fn locked_but_up_reconnect_clears_released_before_timeout_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let health_slot = Mutex::new(crate::wda::WdaHealth::down());
+        let actionable = AtomicBool::new(false);
+        let released = AtomicBool::new(true);
+        let lifecycle = WdaLifecycle::new();
+        assert!(lifecycle.try_begin_reconnecting());
+        let locked = crate::wda::WdaHealth {
+            up: true,
+            actionable: false,
+            locked: Some(true),
+        };
+
+        assert!(!apply_wda_health_probe(
+            &health_slot,
+            &actionable,
+            &released,
+            locked,
+        ));
+        assert!(!released.load(Ordering::Acquire));
+        assert!(!actionable.load(Ordering::Acquire));
+        let cached = *recover(health_slot.lock());
+        assert!(cached.up);
+        assert!(!cached.actionable);
+        assert_eq!(cached.locked, Some(true));
+
+        // Model the readiness deadline expiring without actionability: the
+        // runner still owns the device, while reconnecting ends and status can
+        // honestly tell the user to unlock instead of reconnecting again.
+        finish_wda_readiness_wait(&lifecycle);
+        assert!(!lifecycle.is_reconnecting());
+        assert_eq!(recover(health_slot.lock()).locked, Some(true));
+    }
+
+    #[test]
+    fn direct_control_deadline_is_server_monotonic_and_bounded() {
+        let now = tokio::time::Instant::now();
+        let valid = serde_json::json!({
+            "type": "tap",
+            "ttl_ms": 2000,
+            // A remote browser's wall clock is audit-only and may differ.
+            "issued_at_ms": 1
+        });
+        let deadline = direct_control_deadline(&valid, now).unwrap();
+        assert_eq!(
+            deadline.duration_since(now),
+            std::time::Duration::from_millis(2000)
+        );
+        assert_eq!(
+            direct_control_deadline(&serde_json::json!({"ttl_ms": 0}), now),
+            Err(ControlFreshnessError::Invalid)
+        );
+        assert_eq!(
+            direct_control_deadline(&serde_json::json!({"ttl_ms": 2501}), now),
+            Err(ControlFreshnessError::Invalid)
+        );
+        assert_eq!(
+            direct_control_deadline(&serde_json::json!({}), now),
+            Err(ControlFreshnessError::Missing)
+        );
+    }
+
+    #[test]
+    fn stream_guard_reserves_viewer_slot_atomically() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(3));
+        let fourth = StreamGuard::try_reserve(count.clone(), 4).expect("fourth slot");
+        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 4);
+        assert!(StreamGuard::try_reserve(count.clone(), 4).is_none());
+        drop(fourth);
+        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn mjpeg_stream_ids_are_bounded_and_url_safe() {
+        assert!(valid_mjpeg_stream_id("browser_01234567"));
+        assert!(valid_mjpeg_stream_id("ABC-def_123"));
+        assert!(!valid_mjpeg_stream_id("short"));
+        assert!(!valid_mjpeg_stream_id("contains/slash"));
+        assert!(!valid_mjpeg_stream_id("contains space"));
+        assert!(!valid_mjpeg_stream_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn stale_mjpeg_guard_cannot_remove_a_newer_stream_registration() {
+        let activity = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let older = MjpegActivityGuard::register(activity.clone(), "browser_01234567".into());
+        let newer = MjpegActivityGuard::register(activity.clone(), "browser_01234567".into());
+
+        drop(older);
+        assert!(
+            recover(activity.lock()).contains_key("browser_01234567"),
+            "dropping an old response must not erase the replacement stream heartbeat"
+        );
+
+        drop(newer);
+        assert!(recover(activity.lock()).is_empty());
+    }
+
+    #[test]
+    fn mjpeg_proxy_rejects_successful_html_responses() {
+        assert!(is_mjpeg_content_type(
+            "multipart/x-mixed-replace; boundary=--BoundaryString"
+        ));
+        assert!(is_mjpeg_content_type("Multipart/X-Mixed-Replace"));
+        assert!(!is_mjpeg_content_type("text/html; charset=utf-8"));
+        assert!(!is_mjpeg_content_type("image/jpeg"));
+        assert!(!is_mjpeg_content_type(""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_deadline_kills_a_wedged_process() {
+        let started = Instant::now();
+        let result = run_child_with_deadline(
+            std::process::Command::new("/bin/sleep").arg("2"),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(matches!(result, Err(DevicectlError::Timeout)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

@@ -3,7 +3,7 @@
 locale: en
 slug: iphone-use
 title: iphone-use — Computer-use, but for the iPhone
-summary: An open-source agent control layer for a real iPhone: live browser remote + a see/act HTTP API for AI agents. Three input layers (Shortcut verbs / element tree / pixel fallback), clean CJK input, hardware-validated.
+summary: Open-source Direct/WDA control for a real iPhone: live WDA MJPEG, acknowledged HTTP control, and an Agent API. Mirror/WebRTC is explicit legacy compatibility.
 renderMode: raw
 section: editorial
 tags: [iphone-use, agent, computer-use, ios, open-source]
@@ -18,11 +18,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iphone-use — Computer-use, but for the iPhone</title>
-<meta name="description" content="An open-source agent control layer for a real iPhone: live browser remote + a see/act HTTP API for AI agents. Three input layers, clean CJK input, hardware-validated.">
+<meta name="description" content="Open-source Direct/WDA control for a real iPhone: live WDA MJPEG, acknowledged HTTP control, and an Agent API. Mirror/WebRTC is explicit legacy compatibility.">
 <link rel="icon" href="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/icon-1024.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
     --ink: #1c1b33;
@@ -34,8 +31,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
     --border: rgba(79, 70, 229, 0.14);
     --good: #0f766e;
     --bad: #b91c1c;
-    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    --disp: "Unbounded", -apple-system, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --disp: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     --body: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -148,6 +145,11 @@ repoUrl: https://github.com/leeguooooo/iphone-use
   .cell h3 { font-size: 1rem; margin-bottom: .4rem; }
   .cell p { font-size: .9rem; color: var(--ink-soft); }
   .cell code { font-family: var(--mono); font-size: .82em; background: var(--accent-soft); padding: .1em .4em; border-radius: 5px; color: var(--accent); }
+  .notice {
+    background: #fffaf0; border: 1px solid #ead8ad; border-left: 4px solid #b7791f;
+    border-radius: 12px; padding: 1rem 1.2rem; color: #5f4a1e;
+  }
+  .notice code { font-family: var(--mono); font-size: .86em; }
 
   /* api sample */
   .api-two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; align-items: start; }
@@ -175,8 +177,8 @@ repoUrl: https://github.com/leeguooooo/iphone-use
       iphone-use
     </div>
     <nav class="top">
-      <a href="#install">Install</a>
-      <a href="#layers">Three layers</a>
+      <a href="#install">Setup</a>
+      <a href="#layers">Direct path</a>
       <a href="#api">Agent API</a>
       <a href="https://github.com/leeguooooo/iphone-use">GitHub</a>
     </nav>
@@ -184,20 +186,21 @@ repoUrl: https://github.com/leeguooooo/iphone-use
 
   <section class="hero">
     <div>
-      <div class="kicker">Open source · macOS + iPhone Mirroring · Rust</div>
+      <div class="kicker">Open source · Direct/WDA default · Rust</div>
       <h1>
-        Computer-use,<br>but for the iPhone
-        <span class="en">Let AI agents see and drive a real phone.</span>
+        Let agents drive<br>a real iPhone directly
+        <span class="en">Direct device control, with honest failure.</span>
       </h1>
       <p class="lede">
-        Give AI agents (and your browser) <strong>eyes and hands on a real iPhone</strong>.
-        Live WebRTC remote control in the browser; agents use one HTTP API to screenshot,
-        read the UI element tree, tap and type — <strong>CJK text lands in one shot</strong>.
-        Runs entirely on your own Mac, no third-party cloud.
+        The default backend runs <strong>WebDriverAgent</strong> on the phone. Browsers
+        watch its live MJPEG stream and control it through acknowledged HTTP requests;
+        agents use the same pinned device's element, screenshot, and input APIs. iPhone
+        Mirroring, WebRTC, TURN, and the Mac cursor belong only to the explicit
+        <code>PHONE_REMOTE_BACKEND=mirror</code> compatibility backend.
       </p>
       <div class="cta-row">
         <a class="btn primary" href="https://github.com/leeguooooo/iphone-use">GitHub ↗</a>
-        <a class="btn ghost" href="#install">Install in 60s</a>
+        <a class="btn ghost" href="#install">Read the setup steps</a>
       </div>
     </div>
     <div class="phone-stage">
@@ -205,93 +208,111 @@ repoUrl: https://github.com/leeguooooo/iphone-use
         <img src="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/assets/demo-l2-cjk.png"
              alt="Real-device demo: the agent types a whole CJK paragraph into Notes via the element layer">
       </div>
-      <div class="phone-note">Real device · agent typed<br><b>a full CJK paragraph, zero mojibake</b></div>
+      <div class="phone-note">Real-device component record<br><b>WDA Unicode, no Mac keycodes</b></div>
     </div>
   </section>
 
   <section id="install">
-    <h2>Install in 60 seconds</h2>
-    <p class="sec-lede">One command installs the daemon; one more teaches your agent to drive the phone.</p>
+    <h2>Two-stage setup; WDA is required</h2>
+    <p class="sec-lede">The installer stages the daemon and LaunchAgent. You must then build, sign, install, and relay WDA on the target phone. Timing depends on Xcode, signing, and device state; there is no fixed-minute promise.</p>
     <div class="term">
-<span class="c"># 1) Install the daemon on the Mac (auto-signed LaunchAgent; grant permissions once, keep them forever)</span>
+<span class="c"># 1) Install the verified Release app; pin its skill and WDA helper to the tag commit</span>
 <span class="p">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 
-<span class="c"># 2) Teach any skills-capable agent (Claude Code, etc.) to drive your phone</span>
-<span class="p">$</span> npx skills add leeguooooo/iphone-use
+<span class="c"># 2) Required: connect, trust, and unlock the iPhone, then complete WDA setup</span>
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh doctor
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh
+<span class="p">$</span> ~/.iphone-use/setup-wda.sh status
 
-<span class="c"># 3) (optional) Add the L2 element layer — element tree + tap-by-label + clean CJK</span>
-<span class="p">$</span> ./scripts/setup-wda.sh
+<span class="c"># The verified agent skill and Claude discovery link are already installed</span>
     </div>
+    <p class="sec-lede">You need full Xcode, an Apple development team, iPhone Developer Mode, pairing/trust, an unlocked and awake phone, and <code>iproxy</code>. The normal path requires USB and does not auto-switch to Wi-Fi or <code>socat</code>.</p>
+    <p class="sec-lede">The app is checked against the corresponding Release asset SHA-256; helpers and skill use the tag's exact commit. Skill fetch, validation, discovery-link, or installation failure aborts before daemon replacement; a later daemon failure restores the previous skill. Piping into <code>IPHONE_USE_SKIP_SKILL=1 sh</code> is an explicit degraded opt-out, and makes no daemon/skill compatibility claim.</p>
+    <p class="sec-lede">On upgrade, an older plist with no backend key but a valid loopback WDA URL migrates to Direct. Only a legacy install with no WDA configuration stays on Mirror; an explicit backend remains unchanged.</p>
   </section>
 
   <section id="layers">
-    <h2>Three input layers</h2>
+    <h2>The Direct path</h2>
     <p class="sec-lede">
-      One agent API; the daemon auto-routes to the best path — fast paths get faster, the fallback never goes away.
+      Video, control, and recovery stay attached to one persisted target. If WDA is unavailable, the request fails; the daemon does not silently switch to Mirroring or move the Mac cursor.
     </p>
     <div class="layers">
       <div class="layer">
-        <div class="tag">L1 · VERBS</div>
-        <h3>Shortcuts / App Intents</h3>
-        <p>One curated bridge shortcut reaches native iOS APIs — battery, Health, location… Structured JSON comes back: fastest, deterministic, no vision needed.</p>
+        <div class="tag">VIDEO · 9100</div>
+        <h3>Live WDA MJPEG</h3>
+        <p>The daemon proxies the phone's port 9100 stream at <code>/agent/mjpeg</code>. A broken stream reports failure or a visible degradation; it never switches to legacy WebRTC.</p>
       </div>
       <div class="layer hot">
-        <div class="tag">L2 · ELEMENTS</div>
-        <h3>Element tree (WebDriverAgent)</h3>
-        <p>Reads iOS's own accessibility tree: tap <b>by element label</b>, send Unicode straight into fields — no host-cursor contention, no coordinate drift, <b>CJK lands clean</b>. The agent keeps seeing and acting even while a human holds the phone.</p>
+        <div class="tag">CONTROL · 8100</div>
+        <h3>On-phone input with acknowledgements</h3>
+        <p>Browsers use <code>/control</code>; agents use <code>/agent/input</code>. WDA performs taps, gestures, and Unicode input on the phone. Only a successful HTTP response counts as completion.</p>
       </div>
       <div class="layer">
-        <div class="tag">L3 · PIXELS</div>
-        <h3>Mirroring + CGEvent</h3>
-        <p>Screen stream + system-level input over iPhone Mirroring — the universal fallback that can see and tap anything. Also the human's low-latency WebRTC remote desktop.</p>
+        <div class="tag">LIFECYCLE · UDID</div>
+        <h3>Pinned target, observable recovery</h3>
+        <p><code>PHONE_REMOTE_UDID</code> is the canonical target; one request cannot temporarily switch phones. Status distinguishes <code>releasing</code>, <code>released</code>, and <code>reconnecting</code>.</p>
       </div>
     </div>
   </section>
 
   <section>
     <h2>CJK input: clean vs mangled</h2>
-    <p class="sec-lede">Same phone, same Pinyin keyboard — the real recorded results of both paths:</p>
+    <p class="sec-lede">These are component-level records from the same phone. They prove WDA Unicode input works, not that the whole Direct browser path has passed acceptance.</p>
     <div class="versus">
       <div class="vs-card vs-bad">
-        <span class="lbl">❌ Traditional pixel path (keycodes eaten by the Pinyin IME)</span>
+        <span class="lbl">Legacy mirror keycodes: consumed by the Pinyin IME</span>
         我爱上 typed 不要按 AI阿根廷鸥鸟啊 real iPh…
       </div>
       <div class="vs-card vs-good">
-        <span class="lbl">✅ iphone-use L2 element layer (Unicode straight into the field)</span>
-        你好世界!This note was typed by the L2 layer — the whole CJK string landed in one shot.
+        <span class="lbl">Direct/WDA: Unicode sent to the field</span>
+        你好世界！This note was entered directly through WDA.
       </div>
     </div>
   </section>
 
   <section id="api">
     <h2>The agent API</h2>
-    <p class="sec-lede">Three moves: see (elements or screenshot) → act → verify. A ready-made <a href="https://github.com/leeguooooo/iphone-use/tree/main/crates/mcp">MCP server</a> (9 tools) plugs straight into Claude.</p>
+    <p class="sec-lede">Use a see → act → verify loop. Every state-changing POST requires <code>X-Phone-Control: 1</code> as a CSRF/intent guard in addition to authentication; GET does not. The current <a href="https://github.com/leeguooooo/iphone-use/tree/main/crates/mcp">MCP server</a> exposes twelve tools for status, screenshots/elements, snapshot-bound and strict-label taps, scroll, text, keys, shortcuts, fail-closed multi-step <code>phone_run_steps</code>, and <code>phone_reconnect</code>, which can only recover the canonical managed Direct target. Its client adds the mutation header automatically. The normal app install supplies the release-matched bridge at <code>~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp</code>; users do not have to assemble it from source. The same binary provides <code>flow validate/run</code> for offline validation and one-command replay of reviewed version-1 JSON; <code>--input key=value</code> injects text only for the current run, with no model on the happy path. The browser control bar also provides Flow recording: it keeps only acknowledged actions, prefers semantic labels, discards literal typed values into runtime placeholders, and saves or executes only after review and an explicit safety gate. A later session can open the saved script, restore its reviewed steps after strict validation, fill fresh parameters, and replay it without a model.</p>
     <div class="api-two">
       <div class="term">
-<span class="c"># See — the UI as text, an order of magnitude cheaper than vision</span>
-<span class="p">$</span> curl -H "$AUTH" $HOST/agent/elements
-{"elements":[{"kind":"Button",
-  "label":"新备忘录","rect":[369,885,38,38]}…]}
+<span class="c"># First require the pinned target to be actionable</span>
+<span class="p">$</span> curl -H "$AUTH" $HOST/agent/status
+{"backend":"direct","target_configured":true,
+ "managed_wda":true,"recovery_owner":"daemon",
+ "wda_actionable":true,"drivable":true}
       </div>
       <div class="term">
-<span class="c"># Act — tap by label / type Unicode directly</span>
-<span class="p">$</span> curl -X POST $HOST/agent/input \
+<span class="c"># Then act and inspect the HTTP status</span>
+<span class="p">$</span> MUTATION="X-Phone-Control: 1"
+<span class="p">$</span> curl -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" \
    -d '{"type":"tap","label":"新备忘录"}'
-<span class="p">$</span> curl -X POST $HOST/agent/input \
+<span class="p">$</span> curl -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" \
    -d '{"type":"text","text":"你好世界"}'
       </div>
     </div>
   </section>
 
   <section>
-    <h2>Why it isn't yet another screenshot poller</h2>
+    <h2>What it promises now</h2>
     <div class="grid">
-      <div class="cell"><h3>🔒 Fully self-hosted</h3><p>The daemon runs on your Mac; your screen never leaves home. Password + bearer auth, login rate-limiting.</p></div>
-      <div class="cell"><h3>⚡ Hardware-encoded WebRTC</h3><p>VideoToolbox H.264 over WebRTC — near-native latency in the browser; Cloudflare TURN for cross-network.</p></div>
-      <div class="cell"><h3>🤖 MCP + Skill</h3><p>One config line for Claude Desktop / Claude Code; <code>npx skills add</code> teaches agents the “vision once → script forever” method.</p></div>
-      <div class="cell"><h3>🧠 The UI as text</h3><p><code>/agent/elements</code> turns the screen into an element list — reasoning gets drastically cheaper, labels feed straight into taps.</p></div>
-      <div class="cell"><h3>🛠 Hardware-validated engineering</h3><p>Scroll must be a wheel event, Mirroring only takes keycodes, focus races, TCC signing… every pitfall is in <a href="https://github.com/leeguooooo/iphone-use/tree/main/docs">the docs</a>.</p></div>
-      <div class="cell"><h3>📦 Grant once, keep forever</h3><p>A stable local signing identity — upgrades and reinstalls never re-prompt Screen Recording / Accessibility.</p></div>
+      <div class="cell"><h3>WDA is a default dependency</h3><p>Direct requires complete WDA setup. A running daemon alone is not proof that video or control works.</p></div>
+      <div class="cell"><h3>Acknowledged HTTP control</h3><p><code>/control</code> and <code>/agent/input</code> do not confuse “accepted” with “executed.” On <code>504 outcome_unknown</code>, inspect the screen/status and never replay blindly.</p></div>
+      <div class="cell"><h3>Elements and Unicode</h3><p><code>/agent/elements</code> exposes the phone accessibility tree; WDA sends text without the Mac keycode path.</p></div>
+      <div class="cell"><h3>No Direct TCC identity</h3><p>The installer preserves a valid signature and applies ad-hoc signing only when needed. Stable TCC identity exists only for legacy mirror.</p></div>
+      <div class="cell"><h3>Mirror is compatibility</h3><p>Only explicit <code>PHONE_REMOTE_BACKEND=mirror</code> enables ScreenCaptureKit, WebRTC, TURN, CGEvent, and their TCC permissions.</p></div>
+      <div class="cell"><h3>Layered hardware evidence</h3><p>WDA components have records. Installer, MJPEG, browser gestures, recovery, and multi-device behavior still need the <a href="https://github.com/leeguooooo/iphone-use/tree/main/docs">full acceptance run</a>.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Phase 1 network boundary</h2>
+    <div class="notice">
+      The daemon password, cookie, and bearer protect port 44321 only. WDA's device-side
+      8100/9100 services have no authentication. USB <code>iproxy</code> pins the Mac
+      relay to a device but cannot stop another host on the routable LAN from reaching
+      WDA directly. Run this release only on a trusted, isolated network. A Phase 2
+      companion app or controlled tunnel must provide the real device-transport
+      authentication boundary.
     </div>
   </section>
 

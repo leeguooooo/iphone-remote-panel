@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "name": "Open Spotlight",
+  "description": "Safe navigation example: return home, open Spotlight, and require its text field.",
+  "steps": [
+    {
+      "kind": "shortcut",
+      "name": "home",
+      "after_ms": 300
+    },
+    {
+      "kind": "shortcut",
+      "name": "spotlight"
+    },
+    {
+      "kind": "wait_for",
+      "expect": {
+        "present": [
+          {
+            "kind": "TextField"
+          }
+        ]
+      },
+      "timeout_ms": 3000,
+      "poll_ms": 100
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/make-app.sh — wrap target/release/iphone-use into iPhoneUse.app
+# scripts/make-app.sh — wrap the daemon and MCP bridge into iPhoneUse.app
 #
 # Usage:
 #   ./scripts/make-app.sh [OUTPUT_DIR]
@@ -8,7 +8,7 @@
 #   <OUTPUT_DIR>/iPhoneUse.app
 #
 # Called by CI (release-binaries.yml) and local dev after:
-#   cargo build --release --bin iphone-use
+#   cargo build --release --bin iphone-use --bin iphone-use-mcp
 #
 set -eu
 
@@ -16,12 +16,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${1:-"$REPO_ROOT"}"
 APP="$OUTPUT_DIR/iPhoneUse.app"
 BINARY="$REPO_ROOT/target/release/iphone-use"
+MCP_BINARY="$REPO_ROOT/target/release/iphone-use-mcp"
 DEPLOY_DIR="$REPO_ROOT/deploy"
 
-# ── Verify the binary was built ───────────────────────────────────────────────
+# ── Verify both release-matched binaries were built ───────────────────────────
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: binary not found: $BINARY" >&2
-    echo "       Run: cargo build --release --bin iphone-use" >&2
+    echo "       Run: cargo build --release --bin iphone-use --bin iphone-use-mcp" >&2
+    exit 1
+fi
+if [ ! -f "$MCP_BINARY" ]; then
+    echo "ERROR: MCP binary not found: $MCP_BINARY" >&2
+    echo "       Run: cargo build --release --bin iphone-use --bin iphone-use-mcp" >&2
     exit 1
 fi
 
@@ -45,6 +51,8 @@ mkdir -p "$APP/Contents/Resources"
 # Copy the binary
 cp "$BINARY" "$APP/Contents/MacOS/iphone-use"
 chmod 755 "$APP/Contents/MacOS/iphone-use"
+cp "$MCP_BINARY" "$APP/Contents/MacOS/iphone-use-mcp"
+chmod 755 "$APP/Contents/MacOS/iphone-use-mcp"
 
 # Write Info.plist, substituting version placeholders from template.
 # Uses context-sensitive sed (n command: advance to next line after the key) so
@@ -66,6 +74,7 @@ fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "Created: $APP"
-echo "  Binary : $APP/Contents/MacOS/iphone-use"
+echo "  Daemon : $APP/Contents/MacOS/iphone-use"
+echo "  MCP    : $APP/Contents/MacOS/iphone-use-mcp"
 echo "  Plist  : $APP/Contents/Info.plist"
 [ -f "$ICNS" ] && echo "  Icon   : $APP/Contents/Resources/AppIcon.icns"

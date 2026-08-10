@@ -2,7 +2,7 @@
 //!
 //! Handshake (mirrors `web/index.html`):
 //!   1. On connect the daemon builds a [`RTCPeerConnection`]
-//!      ([`crate::webrtc::build_viewer_pc`]), `create_offer` +
+//!      ([`crate::webrtc::build_mirror_viewer_pc`]), `create_offer` +
 //!      `set_local_description`, and sends `{type:"offer", sdp}`.
 //!   2. The client replies `{type:"answer", sdp}` → `set_remote_description`.
 //!   3. Trickle ICE both ways via `{type:"ice", candidate}`.
@@ -42,9 +42,7 @@ pub enum SignalMsg {
     /// Client → daemon: the SDP answer.
     Answer { sdp: String },
     /// Either direction: a trickled ICE candidate (browser candidate JSON shape).
-    Ice {
-        candidate: serde_json::Value,
-    },
+    Ice { candidate: serde_json::Value },
     /// Client → daemon: request an ICE restart (re-offer).
     Restart,
     /// Daemon → client: whether the phone's Mirroring window is present.
@@ -157,7 +155,10 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
     if let JoinOutcome::Queued { ahead } = outcome {
         let _ = send_json(
             &mut socket,
-            &SignalMsg::SessionStatus { state: "queued".into(), ahead },
+            &SignalMsg::SessionStatus {
+                state: "queued".into(),
+                ahead,
+            },
         )
         .await;
         // Wait until promoted (active viewer left → our Notify fires) or the
@@ -170,7 +171,10 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
         // "session in use" overlay.
         let _ = send_json(
             &mut socket,
-            &SignalMsg::SessionStatus { state: "active".into(), ahead: 0 },
+            &SignalMsg::SessionStatus {
+                state: "active".into(),
+                ahead: 0,
+            },
         )
         .await;
     }
@@ -180,10 +184,8 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
     // only releases/clears the shared slot if WE still hold it (an agent's input
     // lease can supersede ours mid-session; a blind take() would rip theirs out).
     let my_lease = {
-        let mut control = recover(state.control.lock());
-        let lease = control.acquire(core::control::Holder::Human(session_id.clone()), now_secs());
-        *recover(state.current_lease.lock()) = Some(lease.clone());
-        lease
+        recover(state.lease_state.lock())
+            .acquire(core::control::Holder::Human(session_id.clone()), now_secs())
     };
 
     // Outbound queue: PC callbacks (ICE candidates) and the offer push here.
@@ -193,6 +195,8 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
         Ok(pc) => pc,
         Err(e) => {
             tracing::error!("failed to build peer connection: {e}");
+            recover(state.lease_state.lock()).release_if_current(&my_lease);
+            leave_and_promote(&state, &session_id);
             return;
         }
     };
@@ -200,13 +204,18 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
     // Send the initial offer.
     if let Err(e) = send_offer(&pc, &out_tx, false).await {
         tracing::error!("failed to create/send offer: {e}");
+        recover(state.lease_state.lock()).release_if_current(&my_lease);
+        let _ = pc.close().await;
+        leave_and_promote(&state, &session_id);
         return;
     }
 
     // Phone-presence push: tell the client the current window state up front,
     // then again on every transition (polled below). See SignalMsg::PhoneStatus.
     let mut phone_present = state.pipeline.phone_present();
-    let _ = out_tx.send(SignalMsg::PhoneStatus { present: phone_present });
+    let _ = out_tx.send(SignalMsg::PhoneStatus {
+        present: phone_present,
+    });
     let mut presence_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     presence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -253,13 +262,7 @@ pub async fn run_session(mut socket: WebSocket, state: Arc<AppState>, session_id
     // Tear down: release OUR lease only if we are still the current holder.
     // If an agent superseded us, the slot holds THEIR lease — taking/clearing it
     // would silently gate out their input.
-    {
-        let mut control = recover(state.control.lock());
-        if control.is_current(&my_lease) {
-            control.release(&my_lease);
-            *recover(state.current_lease.lock()) = None;
-        }
-    }
+    recover(state.lease_state.lock()).release_if_current(&my_lease);
     let _ = pc.close().await;
     // Hand the live slot to the next viewer in line (issue #8).
     leave_and_promote(&state, &session_id);
@@ -307,13 +310,15 @@ async fn build_pc(
     state: &Arc<AppState>,
     out_tx: &mpsc::UnboundedSender<SignalMsg>,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
+    anyhow::ensure!(
+        state.backend == crate::config::DeviceBackend::Mirror,
+        "WebRTC is available only for the legacy Mirror backend"
+    );
     let ice_servers = state.ice.load().servers.clone();
-    let pc = crate::webrtc::build_viewer_pc(
+    let pc = crate::webrtc::build_mirror_viewer_pc(
         ice_servers,
         state.pipeline.clone(),
         state.injector.clone(),
-        state.wda.clone(),
-        state.wda_actionable.clone(),
     )
     .await?;
 
@@ -405,7 +410,9 @@ async fn handle_inbound(
             }
             true
         }
-        SignalMsg::Offer { .. } | SignalMsg::PhoneStatus { .. } | SignalMsg::SessionStatus { .. } => {
+        SignalMsg::Offer { .. }
+        | SignalMsg::PhoneStatus { .. }
+        | SignalMsg::SessionStatus { .. } => {
             // Daemon-to-client-only messages; inbound copies are protocol errors.
             tracing::debug!("unexpected inbound daemon-only message; ignoring");
             false
@@ -447,8 +454,7 @@ mod tests {
 
     #[test]
     fn ice_parses_candidate_object() {
-        let json =
-            r#"{"type":"ice","candidate":{"candidate":"candidate:1 1 udp ...","sdpMid":"0","sdpMLineIndex":0}}"#;
+        let json = r#"{"type":"ice","candidate":{"candidate":"candidate:1 1 udp ...","sdpMid":"0","sdpMLineIndex":0}}"#;
         let msg: SignalMsg = serde_json::from_str(json).unwrap();
         match msg {
             SignalMsg::Ice { candidate } => {
@@ -477,7 +483,10 @@ mod tests {
             ahead: 2,
         })
         .unwrap();
-        assert_eq!(json, r#"{"type":"session_status","state":"queued","ahead":2}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"session_status","state":"queued","ahead":2}"#
+        );
     }
 
     fn notify() -> Arc<tokio::sync::Notify> {
@@ -488,8 +497,14 @@ mod tests {
     fn registry_first_viewer_is_active_rest_queue() {
         let mut reg = ViewerRegistry::default();
         assert_eq!(reg.join("a".into(), notify()), JoinOutcome::Active);
-        assert_eq!(reg.join("b".into(), notify()), JoinOutcome::Queued { ahead: 1 });
-        assert_eq!(reg.join("c".into(), notify()), JoinOutcome::Queued { ahead: 2 });
+        assert_eq!(
+            reg.join("b".into(), notify()),
+            JoinOutcome::Queued { ahead: 1 }
+        );
+        assert_eq!(
+            reg.join("c".into(), notify()),
+            JoinOutcome::Queued { ahead: 2 }
+        );
         assert_eq!(reg.count(), 3);
         assert_eq!(reg.ahead_of("b"), Some(1));
         assert_eq!(reg.ahead_of("c"), Some(2));
@@ -506,10 +521,10 @@ mod tests {
         assert!(reg.leave("a").is_some());
         assert_eq!(reg.count(), 2);
         assert_eq!(reg.ahead_of("c"), Some(1)); // 'c' moved up
-        // 'b' is now active; its departure promotes 'c'.
+                                                // 'b' is now active; its departure promotes 'c'.
         assert!(reg.leave("b").is_some());
         assert_eq!(reg.ahead_of("c"), None); // 'c' is active now
-        // Last viewer leaves → nobody to promote.
+                                             // Last viewer leaves → nobody to promote.
         assert!(reg.leave("c").is_none());
         assert_eq!(reg.count(), 0);
     }
@@ -524,7 +539,7 @@ mod tests {
         assert!(reg.leave("b").is_none());
         assert_eq!(reg.count(), 2);
         assert_eq!(reg.ahead_of("c"), Some(1)); // 'c' moved up from 2 to 1
-        // 'a' (still active) leaves → 'c' promoted.
+                                                // 'a' (still active) leaves → 'c' promoted.
         assert!(reg.leave("a").is_some());
         assert_eq!(reg.ahead_of("c"), None);
     }

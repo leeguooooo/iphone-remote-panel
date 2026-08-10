@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "name": "Search Spotlight",
+  "description": "Open Spotlight and type a query supplied only for the current run.",
+  "inputs": {
+    "query": {
+      "type": "string",
+      "description": "Spotlight search words for this run.",
+      "required": true
+    }
+  },
+  "steps": [
+    {
+      "kind": "shortcut",
+      "name": "spotlight"
+    },
+    {
+      "kind": "wait_for",
+      "expect": {
+        "present": [
+          {
+            "kind": "TextField"
+          }
+        ]
+      },
+      "timeout_ms": 3000,
+      "poll_ms": 100
+    },
+    {
+      "kind": "type",
+      "input": "query",
+      "clear": true,
+      "after_ms": 200
+    }
+  ]
+}

@@ -124,19 +124,24 @@ if [ ! -d "$APP" ]; then
     exit 1
 fi
 
-BINARY="$APP/Contents/MacOS/iphone-use"
-if [ ! -f "$BINARY" ]; then
-    echo "ERROR: binary missing inside bundle: $BINARY" >&2
-    exit 1
-fi
+DAEMON_BINARY="$APP/Contents/MacOS/iphone-use"
+MCP_BINARY="$APP/Contents/MacOS/iphone-use-mcp"
+for binary in "$DAEMON_BINARY" "$MCP_BINARY"; do
+    if [ ! -f "$binary" ]; then
+        echo "ERROR: binary missing inside bundle: $binary" >&2
+        exit 1
+    fi
+done
 
-# ── Sign nested binary first, then the outer bundle ──────────────────────────
-echo "Signing binary: $BINARY ..."
-codesign \
-    --force \
-    --sign "$IDENTITY" \
-    --timestamp=none \
-    "$BINARY"
+# ── Sign nested binaries first, then the outer bundle ─────────────────────────
+for binary in "$DAEMON_BINARY" "$MCP_BINARY"; do
+    echo "Signing binary: $binary ..."
+    codesign \
+        --force \
+        --sign "$IDENTITY" \
+        --timestamp=none \
+        "$binary"
+done
 
 echo "Signing bundle: $APP ..."
 codesign \

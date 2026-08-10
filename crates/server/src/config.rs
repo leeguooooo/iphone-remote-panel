@@ -14,6 +14,13 @@ use std::path::PathBuf;
 /// Resolved configuration for the phone-remote server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Device transport used by the daemon.
+    ///
+    /// `Direct` is the default: video and input come from services running on the
+    /// iPhone, so the daemon does not need iPhone Mirroring, Screen Recording, or
+    /// Accessibility access on the Mac. `Mirror` keeps the original
+    /// ScreenCaptureKit + CGEvent path as an explicit compatibility mode.
+    pub backend: DeviceBackend,
     /// IP address / hostname to listen on. Default: `127.0.0.1`.
     pub host: String,
     /// TCP port to listen on. Default: `44321`.
@@ -35,6 +42,39 @@ pub struct Config {
     /// When absent (the default), the existing behavior is preserved: the password
     /// is also accepted as a bearer, and open mode (no password) passes everything.
     pub agent_token: Option<String>,
+    /// Persistent target device identifier for WDA bring-up and recovery.
+    ///
+    /// Without this, an idle restart or browser reconnect re-ran auto-detection
+    /// and could silently select a different iPhone on a multi-device Mac.
+    pub device_udid: Option<String>,
+}
+
+/// How the daemon reaches the iPhone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceBackend {
+    /// WebDriverAgent input + on-device video. No iPhone Mirroring dependency.
+    Direct,
+    /// Legacy iPhone Mirroring capture + Mac-side CGEvent input.
+    Mirror,
+}
+
+impl DeviceBackend {
+    fn parse(value: Option<String>) -> Self {
+        match value.as_deref().map(str::trim) {
+            Some("mirror") | Some("legacy-mirror") => Self::Mirror,
+            // Direct is deliberately the safe default, including for unknown
+            // values: an upgrade must never silently regain Mac screen/cursor
+            // access because of a typo.
+            _ => Self::Direct,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Mirror => "mirror",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +101,7 @@ impl Config {
     /// `std::env::var`.  In tests, pass a closure over a `HashMap<&str,
     /// &str>` (or similar) to avoid side-effects on the real environment.
     pub fn from_map(get: impl Fn(&str) -> Option<String>) -> Config {
+        let backend = DeviceBackend::parse(get("PHONE_REMOTE_BACKEND"));
         let host = get("PHONE_REMOTE_HOST")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_HOST.to_owned());
@@ -81,8 +122,11 @@ impl Config {
             .map(PathBuf::from);
 
         let agent_token = get("PHONE_REMOTE_AGENT_TOKEN").filter(|s| !s.is_empty());
+        let device_udid = get("PHONE_REMOTE_UDID")
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
 
         Config {
+            backend,
             host,
             port,
             password,
@@ -90,6 +134,7 @@ impl Config {
             session_ttl_secs,
             state_dir,
             agent_token,
+            device_udid,
         }
     }
 }
@@ -113,6 +158,7 @@ mod tests {
     #[test]
     fn defaults_when_empty_env() {
         let cfg = map_cfg(&[]);
+        assert_eq!(cfg.backend, DeviceBackend::Direct);
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 44321);
         assert_eq!(cfg.password, None);
@@ -204,12 +250,49 @@ mod tests {
     fn agent_token_unset_gives_none() {
         let cfg = map_cfg(&[]);
         assert_eq!(cfg.agent_token, None);
+        assert_eq!(cfg.device_udid, None);
+    }
+
+    #[test]
+    fn backend_defaults_to_direct_and_mirror_is_explicit() {
+        assert_eq!(map_cfg(&[]).backend, DeviceBackend::Direct);
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_BACKEND", "direct")]).backend,
+            DeviceBackend::Direct
+        );
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_BACKEND", "mirror")]).backend,
+            DeviceBackend::Mirror
+        );
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_BACKEND", "legacy-mirror")]).backend,
+            DeviceBackend::Mirror
+        );
+    }
+
+    #[test]
+    fn unknown_backend_fails_closed_to_direct() {
+        let cfg = map_cfg(&[("PHONE_REMOTE_BACKEND", "miror")]);
+        assert_eq!(cfg.backend, DeviceBackend::Direct);
     }
 
     #[test]
     fn agent_token_empty_gives_none() {
         let cfg = map_cfg(&[("PHONE_REMOTE_AGENT_TOKEN", "")]);
         assert_eq!(cfg.agent_token, None);
+    }
+
+    #[test]
+    fn device_udid_is_preserved_and_empty_is_ignored() {
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_UDID", "00008110-001234567890001E")]).device_udid,
+            Some("00008110-001234567890001E".to_string())
+        );
+        assert_eq!(map_cfg(&[("PHONE_REMOTE_UDID", "   ")]).device_udid, None);
+        assert_eq!(
+            map_cfg(&[("PHONE_REMOTE_UDID", "device</string>")]).device_udid,
+            None
+        );
     }
 
     #[test]

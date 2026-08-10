@@ -4,261 +4,393 @@
 
 <h1 align="center">iphone-use</h1>
 
-<p align="center"><em>把 computer-use 搬到 iPhone 上 —— 让 AI 智能体（和你的浏览器）能「看见」并「操作」一台真实的手机。</em></p>
+<p align="center"><em>给真实 iPhone 用的 computer-use：让 AI agent 和浏览器看见并操作手机。</em></p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey" alt="Platform: macOS 15+">
-  <img src="https://img.shields.io/badge/built%20with-Rust-orange" alt="Built with Rust">
-  <img src="https://img.shields.io/badge/streaming-WebRTC%20%2F%20H.264-success" alt="Streaming: WebRTC / H.264">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="许可证：MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey" alt="平台：macOS 15+">
+  <img src="https://img.shields.io/badge/built%20with-Rust-orange" alt="使用 Rust 构建">
+  <img src="https://img.shields.io/badge/default-WDA%20direct-success" alt="默认后端：Direct WDA">
 </p>
 
 <p align="center">
-  <strong>简体中文</strong> ·
-  <a href="README.md">English</a>
+  <a href="README.md">English</a> ·
+  <strong>简体中文</strong>
 </p>
 
 <p align="center">
-  <img src="assets/hero.png" alt="在浏览器里操控 iPhone —— 实时画面加一排触控工具栏（主屏、聚焦搜索、App 切换、键盘）" width="320">
+  <img src="assets/hero.png" alt="在浏览器中查看并操作 iPhone" width="320">
 </p>
 
-**在任意浏览器里远程操控你的 iPhone** —— 基于 macOS 的 **iPhone 镜像（iPhone Mirroring）**，
-低延迟 WebRTC 画面 + 接近原生的触控体验。一个 Rust 守护进程用 **ScreenCaptureKit** 抓取镜像窗口，
-用 **VideoToolbox** 硬件编码成 **H.264**，再通过 **WebRTC** 推流到 iPhone Safari（或任意浏览器），
-同时把点按、滑动、滚动、文字作为连续的系统事件注入回去。AI 智能体、脚本、机器人也能通过一套简单的
-**HTTP API** 操作同一台手机。
+**在浏览器或 AI agent 里查看并操作真实 iPhone。** 默认的 `direct` 后端在手机上运行
+WebDriverAgent（WDA）：守护进程把 WDA 的 MJPEG 画面代理到 `/agent/mjpeg`，
+浏览器通过有确认响应的 `POST /control` 操作手机，agent 使用 `/agent/input`。
 
-可以把它理解成 **「给 iPhone 用的 Chrome 远程桌面」** —— 全程跑在你自己的 Mac 上，不经过任何第三方云。
+Direct 不依赖 macOS iPhone 镜像、屏幕录制、辅助功能权限、Mac 光标或前台窗口。
+旧的 ScreenCaptureKit + CGEvent 路径只在显式设置
+`PHONE_REMOTE_BACKEND=mirror` 时启用。
 
-## 功能特性
+## 功能
 
-- 📱 **在浏览器里操控 iPhone** —— 实时画面 + 点按 / 滑动 / 滚动 / 输入，iPhone Safari 或任意桌面浏览器都行。
-- ⚡ **低延迟** —— 硬件 H.264（VideoToolbox）走 WebRTC，而不是截图轮询。
-- 🤚 **接近原生的触控** —— 真实的滚轮滚动、keycode 文字输入、主屏 / 聚焦搜索 / App 切换快捷操作。
-- 🤖 **为智能体而生** —— 一套 HTTP API（`/agent/input`、`/agent/screenshot`）让 AI 智能体和脚本既能「看」也能「操作」手机。
-- 🌐 **局域网或远程** —— 同一 Wi-Fi 下走局域网，或通过 Cloudflare 隧道 + TURN 从任意网络接入。
-- 🔒 **自托管 + 鉴权** —— 密码登录；跑在你自己的机器上，画面永远不离开你的掌控。
+- 📱 **手机端实时画面**：浏览器显示 `/agent/mjpeg` 的 WDA MJPEG；直播失败时降级为 PNG 静帧。
+- 🤚 **手机端输入**：点按、拖动、长按、滚动和文字由 WDA 在 iPhone 上合成，不抢 Mac 光标。
+- ✅ **每次输入都有结果**：`/control` 明确返回成功或错误，不把断开的数据通道当成功。
+- 🤖 **Agent API**：`/agent/input`、`/agent/elements` 和 `/agent/screenshot` 支持脚本与 AI agent。
+- 🔒 **自托管**：浏览器登录和 agent bearer token 由本机守护进程校验。
 
-> v2 —— 在 v1（截图轮询服务）基础上彻底重写：WebRTC + 硬件编解码 + 连续输入。
-> 输入 + 视频这条主链路（视频、点按、滚动、文字、快捷操作、局域网 WebRTC）已在真机上验证通过。
+> 当前迁移状态：WDA 的元素树、文字、点按和截图组件已有真机记录。新的
+> Direct 浏览器整条链路仍须完成本文后面的真机验收矩阵。源码、单测或 daemon 在线都不能代替真机证据。
 
 ## 架构
 
-![架构图](assets/architecture.png)
+```text
+浏览器 <── GET /agent/mjpeg ── iphone-use daemon ── 127.0.0.1:9100 ──┐
+浏览器 ── POST /control ─────> iphone-use daemon ── 127.0.0.1:8100 ──┤ iPhone 上的 WDA
+Agent  ── /agent/* ──────────> iphone-use daemon ── 127.0.0.1:8100 ──┘
+```
 
-Rust 守护进程用 **ScreenCaptureKit** 抓取 macOS 的 iPhone 镜像窗口，用 **VideoToolbox** 硬件编码成
-**H.264**，再通过 **WebRTC** 推流（`webrtc-rs`，HTTP/WS 信令用 axum）。同一套「抓取 / 输入」内核同时服务两类前端：
-**人类客户端**（iPhone Safari —— 实时画面 + 连续触控）和 **智能体客户端**（一套 HTTP 控制 API，见 [智能体 API](#智能体-api)）。
-触控通过系统 HID 事件链路以连续的 `CGEvent` 注入回去。大部分 NAT 由 STUN 打通；剩下的由可选的 Cloudflare TURN 中继。
+完整的生命周期、失败状态、安全边界和真机验收设计见
+**[`docs/direct-device-architecture.html`](docs/direct-device-architecture.html)**。
 
-写进守护进程的几条关键输入经验（全部经过真机验证）：
+`scripts/setup-wda.sh` 编译并签名 WDA，启动 XCUITest runner，并通过 USB
+`iproxy` 建立控制端口 `8100` 和画面端口 `9100` 的 Mac loopback 中继。
+普通安装路径要求 USB，不会在 USB 不可用时自动切到 Wi-Fi 或 `socat`。
+`socat` 只适合操作者明确配置的手动/实验路径。
 
-- **滚动是滚轮事件。** iPhone 镜像会把鼠标拖拽当成长按 / 图标排序，永远不会滚动 ——
-  手指滑动必须映射成 `CGEvent` 滚轮事件。
-- **文字是 keycode，不是 Unicode。** 镜像转发的是虚拟 keycode（以及一个*真实*的 Shift 键），
-  而不是 `CGEvent` 的 Unicode 负载。**中文注意事项：** 输入走的是美式 keycode；如果手机键盘是中文（拼音）输入法，
-  数字会被当成候选词序号（`a1b2c3` → `啊不c3`）—— 输入纯英文/数字时先把手机切到英文 ABC 键盘。
-  真正的中文输入需要手机端的输入法，暂不在范围内。
-- **HID 点按要求镜像窗口在最前。** 只有当其它 App 抢走焦点时，守护进程才会重新把焦点夺回来。
+Direct 会 fail closed：WDA 不可用时，控制请求返回错误，不会改走 iPhone 镜像或移动 Mac 光标。
 
-### 部署 —— 一个跑在登录会话里的 LaunchAgent
+### Legacy mirror 兼容后端
 
-![部署图](assets/deployment.png)
+只有显式设置 `PHONE_REMOTE_BACKEND=mirror` 才启用旧链路。它用
+ScreenCaptureKit 抓取 iPhone 镜像窗口、VideoToolbox 编码 H.264、WebRTC 传输画面，
+并通过 CGEvent 注入输入。该后端需要：
 
-ScreenCaptureKit（屏幕录制）和输入注入（辅助功能）需要 TCC 授权，而授权绑定在**登录会话内**的已签名身份上 ——
-通过 SSH 启动的进程会被拒绝。所以守护进程以一个已签名的 **LaunchAgent** 运行在桌面会话里，只需授权一次；
-之后 SSH 终端、智能体、iPhone Safari 控制端都**连接到它**。
+- 已配置并连接 iPhone 镜像；
+- 给 iPhoneUse 授予屏幕录制和辅助功能权限；
+- 已登录 Aqua 会话，且镜像窗口可被置前。
 
-### 控制租约 —— 一个光标，一个控制者
+`assets/` 里的旧架构、部署和输入图描述的是这个兼容后端，不是 Direct 默认路径。
 
-![控制与输入](assets/control-input.png)
+## 前置条件
 
-HID 点按驱动的是宿主 Mac 上**唯一的真实光标**，且要求镜像窗口在最前。一个强制的**控制租约**在同一时刻只把这个光标授予一个控制者
-（人或智能体）；最近操作的一方持有控制权。没有租约的话，人和智能体会因为抢同一个光标而互相搞乱手势。
-纯观看者（只消费 WebRTC 画面、不发输入）不受影响：输入是「最后连接者获胜」，但所有观看者都保留各自的视频流。
+- macOS 15 或更高。
+- **完整 Xcode.app**，不能只有 Command Line Tools。在
+  Xcode → Settings → Accounts 登录 Apple ID 并选择开发团队。免费 Personal Team
+  可以用，但 WDA 签名通常需要定期续装。
+- iPhone 已开启**开发者模式**。
+- iPhone 已与 Mac 配对并点过**信任**。首次和普通运行路径都使用 USB。
+- 编译、启动和操作 WDA 时，保持 iPhone **解锁、亮屏、唤醒**。WDA 不能绕过 Face ID 或密码。
+- 安装 `iproxy`：`brew install libimobiledevice`。
+- 只有从源码构建 daemon 时才需要 Rust 工具链。
 
-## 环境要求
-
-- macOS 15 Sequoia 或更高（iPhone 镜像本身的要求），并且已设置好并登录 **iPhone 镜像**。
-  已在 macOS 15 Sequoia / 26 Tahoe 上验证；macOS 27 的支持见[路线图](#路线图)。
-- Rust 工具链（用于构建）—— `cargo`。
-- **零外部运行时依赖** —— 所有输入（点按、滚动、文字、按键、快捷操作）都通过原生 `CGEvent` 直接注入，
-  截图用系统自带的 `screencapture` 命令。运行时不需要任何第三方二进制（`cua-driver` 之类都不需要）。
-- *（可选）* 一个 Cloudflare TURN key，用于跨网络（蜂窝 / 远程）访问。
+Direct 不需要 iPhone 镜像、屏幕录制或辅助功能权限。
 
 ## 安装
 
-构建、打包成签名 `.app`、并注册 LaunchAgent：
+安装最新 GitHub Release，并注册当前用户的 LaunchAgent：
 
 ```bash
-cargo build --release --bin iphone-use
-./scripts/make-app.sh                 # → ./iPhoneUse.app
-./install.sh ./iPhoneUse.app          # 签名、安装、写入 LaunchAgent
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```
 
-`install.sh` 会绑定 `0.0.0.0`、生成一个密码（或使用 `$PHONE_REMOTE_PASSWORD`），
-打开「屏幕录制」+「辅助功能」面板让你授权一次，并打印出 iPhone 的连接地址。
-在 iPhone 上（同一 Wi-Fi）打开 **`http://<mac的局域网IP>:44321/phone`** 并输入密码即可。
-
-**预编译二进制**在每次打 version tag 时由 CI 发布 —— 见 [Releases 页面](../../releases)。
-`install.sh` 会用 `codesign -s -` 在本地做 ad-hoc 签名；除非做了公证，否则 Gatekeeper 会弹一次确认。
-
-> **从 v0.1.0 升级请注意：** v0.2.0 起 bundle id 从 `work.pwtk.iphone-remote` 改成了
-> `com.leeguoo.iphone-use`，app 也从 `iPhoneRemote.app` 改名成 `iPhoneUse.app`。
-> 因为 TCC 授权绑定 bundle id，**升级后必须重新授权「屏幕录制」和「辅助功能」**，旧授权不会自动继承。
-
-### 不安装直接跑（开发用）
+安装器默认写入 `PHONE_REMOTE_BACKEND=direct`、WDA/MJPEG loopback 地址，并把
+WDA 设置脚本放到 `~/.iphone-use/setup-wda.sh`。安装器完成不代表真机已经跑通。
+连接、信任并解锁手机后继续执行：
 
 ```bash
+~/.iphone-use/setup-wda.sh doctor
+~/.iphone-use/setup-wda.sh
+~/.iphone-use/setup-wda.sh status
+```
+
+然后在浏览器打开 **`http://<Mac局域网IP>:44321/setup`**。内置连接向导会把
+`/agent/status` 翻译成当前的 USB、信任、开发者服务、WDA 或外部主机阻塞项；
+它不会自动断开 VPN、修改代理或替你运行设置。设备真正可操作后再进入 **`/phone`**。
+出现登录页时输入安装器打印的密码。多台 iPhone 与同一台 Mac 配对时，要固定同一个
+classic UDID：
+
+```bash
+export PHONE_REMOTE_UDID=00008…
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+WDA_UDID="$PHONE_REMOTE_UDID" ~/.iphone-use/setup-wda.sh
+```
+
+从源码安装：
+
+```bash
+cargo build --release --bin iphone-use --bin iphone-use-mcp
+./scripts/make-app.sh
+./install.sh ./iPhoneUse.app
+```
+
+预编译产物见 [GitHub Releases](https://github.com/leeguooooo/iphone-use/releases)。
+安装后的 app 内含同版本 MCP bridge：
+`~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp`；Release 也会额外发布
+带 SHA-256 校验的 universal 独立压缩包。
+签名方式取决于后端：
+
+- **Direct**：保留已有且有效的 app 签名。只有 staged app 无签名或签名无效时，
+  才使用不改 keychain 的 ad-hoc 签名。Direct 不申请屏幕录制或辅助功能权限，
+  因此不需要稳定 TCC 身份。
+- **Mirror**：使用稳定的本地 `iPhoneUse Local Signing` 身份，让 mirror-only TCC
+  授权尽量跨升级保留。稳定 signer 不可用时，安装器会警告后再退回 ad-hoc 签名。
+
+升级仍使用同一条 `install.sh` 命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+```
+
+安装器先把 release tag 解析成一个确定的 commit，helper 和 skill 固定到该 commit；
+daemon app 来自对应的 Release asset，并校验其发布 SHA-256。在替换 daemon 之前，
+它会把 skill 安装到 `~/.agents/skills/iphone-use`，逐字节校验实际落盘内容和
+Claude Code 发现链接。skill 下载、校验或安装失败都会中止升级；后续 daemon 步骤
+失败时，会恢复旧 skill、发现目标和 skills lock。不需要另跑 skills CLI。
+
+如需明确保留现有 skill：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh \
+  | IPHONE_USE_SKIP_SKILL=1 sh
+```
+
+这是降级安装：安装器不会声称新 daemon 与现有 skill 兼容。
+
+升级迁移按已有配置判断：旧 plist 没有 backend 字段，但已有有效的 loopback
+`PHONE_REMOTE_WDA_URL` 时迁移到 Direct；只有完全没有 WDA 配置的旧安装才保留
+Mirror 兼容模式。显式配置的 backend 不会被改写。
+
+### 开发运行
+
+```bash
+PHONE_REMOTE_BACKEND=direct \
+PHONE_REMOTE_WDA_URL=http://127.0.0.1:8100 \
+PHONE_REMOTE_WDA_MJPEG_URL=http://127.0.0.1:9100 \
 PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
   ./target/release/iphone-use serve
 ```
 
-### 升级
+## 配置
 
-daemon 每天检查一次 GitHub Release,结果体现在 `GET /agent/status`
-(`version` / `latest` / `update_available`),落后时网页端会显示升级提示条。
-升级命令与安装相同(bundle id 不变,TCC 授权保留):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh   # daemon
-npx skills update -g                                                                      # agent skill
-```
-
-离线/隐私环境可用 `PHONE_REMOTE_NO_UPDATE_CHECK=1` 关闭检查。
-
-### 反馈 —— 欢迎人类,更欢迎 agent
-
-用着别扭?[提个 issue](https://github.com/leeguooooo/iphone-use/issues)。
-**明确鼓励 AI agent 来提**:自带的 skill 会指导 agent 在使用 API 受阻时
-(报错误导、能力缺失、文档与实际不符)征得用户同意后提交结构化 issue。
-最重度的用户的吐槽,才是产品进化的燃料。
-
-## 配置（环境变量）
-
-| 变量 | 默认值 | 用途 |
+| 环境变量 | 默认值 | 用途 |
 |---|---|---|
-| `PHONE_REMOTE_HOST` | `127.0.0.1` | 监听地址（局域网用 `0.0.0.0`）。 |
-| `PHONE_REMOTE_PORT` | `44321` | 监听端口。 |
-| `PHONE_REMOTE_PASSWORD` | *(无)* | 共享密码（cookie 登录 + 智能体 bearer 兜底）。 |
-| `PHONE_REMOTE_AGENT_TOKEN` | *(无)* | 专用的智能体 bearer token。设置后，智能体 API **只**接受这个 token（密码不再能当 bearer）；不设置时密码兼作 bearer（兼容旧行为）。 |
-| `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Cloudflare TURN key → 临时中继凭证，用于跨网络。 |
-| `PHONE_REMOTE_WDA_URL` | *(无)* | L2 元素树控制：指向可达的 WebDriverAgent（推荐 `http://127.0.0.1:8100`，由 `scripts/setup-wda.sh` 的中继提供）。设置后 agent 的文字/点按自动路由到手机端元素层 —— 中文直通、按标签点按无需坐标、完全不碰 Mac 光标；不设 = 纯像素路径。 |
-| `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 静态 TURN 服务器（Cloudflare 的替代方案）。 |
-| `PHONE_REMOTE_AUTO_RESUME` | *(关)* | `1` = 实验性：watchdog 自动点击 Mirroring 的 Resume/Connect 按钮恢复暂停屏。默认关 —— 手机使用中时 macOS 不允许后台 agent 把 Mirroring 置前，无法做到可靠，改用 `mirror_state`/`hint` 提示你何时手动点。 |
-| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | 空闲自动释放（仅 WDA 模式）：连续这么多秒没有任何 `/agent` 操作、也没有人在看实时画面时，守护进程会停掉手机上的 WDA runner 并 bootout 它的 KeepAlive LaunchAgent，把手机**交还给你正常使用** —— 没人远程控制时不再一直占着设备。下一次 `/agent/input`（或网页「重新连接」按钮）会自动重新拉起 WDA（约 30–90s；锁屏的话解锁一次）。空闲释放期间 `/agent/status` 返回 `"released":true`。设为 `0` 关闭（WDA 24/7 常驻，旧行为）。 |
+| `PHONE_REMOTE_BACKEND` | `direct` | `direct` = WDA 输入 + 手机端 MJPEG；`mirror` = 显式 legacy ScreenCaptureKit + CGEvent。 |
+| `PHONE_REMOTE_HOST` | `127.0.0.1` | 监听地址；局域网访问使用 `0.0.0.0`。 |
+| `PHONE_REMOTE_PORT` | `44321` | HTTP 端口。 |
+| `PHONE_REMOTE_PASSWORD` | *无* | 浏览器登录密码；未设置专用 agent token 时兼作 bearer。 |
+| `PHONE_REMOTE_AGENT_TOKEN` | *无* | 专用 agent bearer token。设置后，不再接受密码作为 bearer。 |
+| `PHONE_REMOTE_UDID` | 安装器识别并持久化；否则未设置 | managed WDA 和破坏性设备命令使用的 canonical classic UDID。目标一旦配置，单次请求不能临时换机；要换目标须修改部署配置并重启。setup 时传同值 `WDA_UDID`。 |
+| `PHONE_REMOTE_WDA_URL` | Direct 安装为 `http://127.0.0.1:8100` | WDA 控制 loopback。不可达时 Direct 输入失败，不回退到 Mac。 |
+| `PHONE_REMOTE_WDA_MJPEG_URL` | Direct 安装为 `http://127.0.0.1:9100` | WDA MJPEG loopback；daemon 从 `/agent/mjpeg` 代理给已认证客户端。 |
+| `PHONE_REMOTE_WDA_MANAGED` | Direct loopback 默认开启 | daemon 是否负责本地 WDA supervisor/relay 生命周期；远端 endpoint 必须由外部管理。 |
+| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | 空闲后释放 WDA。`0` 表示不释放。 |
+| `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | 仅 legacy mirror/WebRTC 使用。 |
+| `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 仅 legacy mirror/WebRTC 使用。 |
+| `PHONE_REMOTE_AUTO_RESUME` | *关* | 仅 legacy mirror 使用的 Resume/Connect 实验。 |
 
-## 智能体 API
+## Agent API
 
-智能体通过**连接到**运行中的守护进程来操作手机（绝不要自己起一个输入进程 —— macOS 会把子进程发出的事件视为不可信）。
-Bearer 鉴权：`Authorization: Bearer <token>`，其中 token 在设置了 `PHONE_REMOTE_AGENT_TOKEN` 时用它，
-否则回退到 `PHONE_REMOTE_PASSWORD`（兼容旧行为）。
+Bearer token 放在 `Authorization: Bearer <token>`。设置
+`PHONE_REMOTE_AGENT_TOKEN` 时使用它，否则兼容性回退到 `PHONE_REMOTE_PASSWORD`。
+
+所有会改变状态的 POST 还必须携带精确请求头 `X-Phone-Control: 1`。它是在 bearer
+或 session 鉴权之外增加的 CSRF/操作意图保护，不能代替鉴权。它适用于 `/control`、
+`/agent/input`、`/agent/mode`、`/agent/inbox` 和 `/agent/inbox/drain` 的 POST
+形式；GET 不需要。内置网页和 MCP client 会自动添加。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/agent/status` | 鉴权 / 健康探测 + 可操作性：`{ok, phone_target, wda, drivable, mirror_state, hint, mode, viewer_count, …}`。 |
-| `POST` | `/agent/input` | 一条控制消息：点按 / 滚动 / 文字 / 按键 / 快捷操作 / 收键盘（坐标归一化到 `[0,1]`）。 |
-| `GET` | `/agent/screenshot` | 当前手机画面，PNG 格式（校验帧；可回退到手机端截图）。 |
+| `GET` | `/agent/status` | 查看 backend、目标是否固定、`managed_wda`、`managed_wda_pending`、`recovery_owner`、WDA 状态、生命周期、viewer 计数和恢复提示。 |
+| `GET` | `/agent/mjpeg` | WDA 实时 MJPEG；支持 bearer 或浏览器 cookie。 |
+| `POST` | `/control` | 浏览器 Direct 输入；需要 cookie、mutation header 和有上限的 `ttl_ms`，成功体只有 `{"ok":true}`。 |
+| `POST` | `/agent/mode` | 需要 mutation header，只恢复当前 backend：Direct 接受 `{"mode":"agent"}`，Mirror 接受 `{"mode":"mirror"}`；不会切换 backend 或 canonical UDID。 |
+| `POST` | `/agent/input` | 需要 bearer 和 mutation header；支持点按、拖动、长按、滚动、文字、Home、Spotlight 和已有 named key。 |
+| `POST` | `/agent/actions` | 仅 Direct/WDA 的有界多步执行；先校验完整批次，`wait_for` 做语义检查，任一步失败后续动作都不会发送。 |
+| `GET` / `POST` | `/agent/inbox` | GET 只读查看 legacy Shortcuts 返回队列；POST 需要 bearer 和 mutation header，追加一条结果。 |
+| `POST` | `/agent/inbox/drain` | 需要 bearer 和 mutation header；原子返回并清空队列。 |
+| `GET` | `/agent/screenshot` | Direct 下只从 WDA 取当前目标手机 PNG。 |
+| `GET` | `/agent/elements` | WDA 元素树与屏幕尺寸。WDA 缺失/繁忙返回 `503`，source 重试失败返回 `502`，不会用 `200` 空数组伪装成功。 |
 
-判断能否操作要看 **`drivable`** 而非 `phone_target`：Mirroring 窗口可能在、但显示「Connection Paused」/「iPhone in Use」中间屏，此时点按打空。`mirror_state`（`active`/`paused`/`in_use`/`offline`）+ `hint` 告诉你怎么办（paused → 点 Resume；in_use → 锁屏；offline → 打开 Mirroring）。
+Direct 自动化必须同时检查 `backend:"direct"`、`wda_actionable:true` 和
+`drivable:true`。`device_state` 可能是 `ready`、`locked`、`blocked`、`offline`、
+`releasing`、`released` 或 `reconnecting`。`phone_target`、`mirror_state` 和
+`human_active` 是 legacy mirror 字段，不能证明 Direct 可控。managed loopback WDA 的
+`recovery_owner` 是 `daemon`；首次本地接入尚未持久化设备目标时是 `unconfigured`，
+远端或显式不托管的 endpoint 是 `external`。`viewer_count` 包含
+`/ws` 和 MJPEG viewer，`mjpeg_viewer_count` 只统计 MJPEG。
 
-完整参考：**[`docs/agent-api.html`](docs/agent-api.html)**。
+Direct 输入按 at-most-once 处理。`/control` 使用必填的 1–2500 ms `ttl_ms`；
+`/agent/input` 从服务端收到请求起使用固定 15 秒总 deadline。dispatch 前过期返回
+`408`、`error:"not_sent"`、`retry_safe:true`。动作已经开始，但结果无法确认时返回
+`error:"outcome_unknown"`、`retry_safe:false`：WDA/transport 明确报错但不能证明动作
+未落地时是 `502`，post-dispatch deadline 是 `504`。遇到 502/504，先读 status 和
+当前画面/元素；不要盲目重发文字、滚动、Back、点按或其他非幂等操作。
+`/agent/actions` 最多接受 24 个 `action`、`wait_for` 或短 `pause` step，整个批次
+持有一个 WDA 控制锁并在首个失败处停止。返回值包含 `completed`、
+`applied_actions`、`failed_step`、`outcome` 和 `retry_safe`；只要前面已有动作落地，
+就绝不会把“重放整个批次”标成安全。`tap_locator` 与 `wait_for` 使用相同的
+label/identifier/kind/value/focused/enabled/visible 精确条件，并要求当前页面唯一命中，
+让 durable locator 不只可检查，也能安全执行。
+
+完整接口见 [`docs/agent-api.html`](docs/agent-api.html)；脚本化与竞品调研见
+[`docs/scripted-flows-research.html`](docs/scripted-flows-research.html)。
 
 ```bash
-HOST=http://<mac的局域网IP>:44321; AUTH="Authorization: Bearer $PW"
+HOST=http://<Mac局域网IP>:44321
+AUTH="Authorization: Bearer $PW"
+MUTATION="X-Phone-Control: 1"
+curl -s -H "$AUTH" "$HOST/agent/status"
 curl -s -H "$AUTH" "$HOST/agent/screenshot" -o screen.png
-curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'
-curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
-curl -s -H "$AUTH" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'   # 收起键盘 (wda)
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"tap","x":0.5,"y":0.3}'
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"text","text":"你好"}'
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/actions" -d '{"steps":[{"kind":"action","action":{"type":"shortcut","name":"home"}},{"kind":"wait_for","expect":{"present":[{"label":"搜索"}]},"timeout_ms":3000}]}'
 ```
 
-## MCP 服务器
+## MCP server
 
-[`iphone-use-mcp`](crates/mcp/README.md) 是一个 MCP stdio 服务器（`crates/mcp`），
-把 MCP 客户端（Claude Desktop、Claude Code）桥接到守护进程的智能体 API。九个工具：
-`phone_status`、`screenshot`、`elements`（UI 元素树）、`tap`、`tap_label`（按标签点按）、
-`scroll`、`type`（WDA 在线时中文直通）、`key`、`shortcut`。两个环境变量：
-`PHONE_REMOTE_URL`（默认 `http://127.0.0.1:44321`）和 `PHONE_REMOTE_TOKEN`（可选；对应守护进程侧的 `PHONE_REMOTE_AGENT_TOKEN`）。
-
-加到你的 `claude_desktop_config.json`（或 Claude Code 的 MCP 配置）：
+[`iphone-use-mcp`](crates/mcp/README.md) 提供 12 个 MCP 工具：
+`phone_status`、`screenshot`、`elements`、`tap`、`tap_element`、`tap_label`、
+`scroll`、`type`、`key`、`shortcut`、`phone_run_steps` 和 `phone_reconnect`。`tap_element` 必须使用
+同一次 `phone_elements` 返回的 index 和 snapshot；`tap_label` 只在精确标签唯一时
+执行，零匹配或重名都不会发送动作。`phone_reconnect` 无参数，只恢复持久化的
+canonical managed Direct/WDA 目标；它不接受 UDID、不换设备，也不回退 Mirroring。
+`phone_run_steps` 可在一次 MCP 调用里组合稳定动作、picker 和语义等待，完整批次由
+daemon 预校验并失败即停。MCP client 会给它发出的状态变更请求自动添加
+`X-Phone-Control: 1`。MCP 没有通用 mode 切换。long-press、swipe、drag 也可作为
+`phone_run_steps` 的 step；键盘收起、卸载仍走 HTTP API。按格式校验 bundle id
+的 App 启动可作为 `launch_app` step。
+主要配置：
 
 ```json
 {
   "mcpServers": {
     "iphone-use": {
-      "command": "/path/to/iphone-use-mcp",
+      "command": "/Users/YOUR_ACCOUNT/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp",
       "env": {
         "PHONE_REMOTE_URL": "http://127.0.0.1:44321",
-        "PHONE_REMOTE_TOKEN": "<你的-agent-token>"
+        "PHONE_REMOTE_TOKEN": "<agent-token>"
       }
     }
   }
 }
 ```
 
-完整的工具 schema 和构建说明见 [`crates/mcp/README.md`](crates/mcp/README.md)。
+正常安装器会把同版本 daemon、MCP 与 agent skill 一起交付；请把
+`YOUR_ACCOUNT` 替换为 macOS 账户名。工具结构和独立安装方式见
+[`crates/mcp/README.md`](crates/mcp/README.md)。
 
-## 快捷指令桥接（实验性）
-
-![快捷指令桥接](assets/shortcuts-bridge.png)
-
-除了在 UI 上点按，智能体还能通过一个精心维护的桥接快捷指令直达 **iOS 原生 API** ——
-电量、Apple 健康、定位、信息、HomeKit。守护进程按名字触发 **「iU Bridge」** 快捷指令（剪贴板动词 + 聚焦搜索），
-快捷指令根据该动词分发到对应的原生操作，并把**结构化 JSON 回 POST 到 `/agent/inbox`** —— 拿到的是确定的数据，而不是靠刮屏。
-这是一条*增量的*快速通道：UI 自动化（点按 / 滚动，任意 App）始终是通用兜底。
-见 [`shortcuts/README.md`](shortcuts/README.md) 和 [`shortcuts/registry.json`](shortcuts/registry.json) 里的动词表。
-
-## 智能体技能（Agent skill）
-
-让任意支持 skills 的智能体（Claude Code 等）学会操作你的手机 —— 包括
-**「视觉一次 → 脚本永久」**的方法论（第一次用视觉解决一个手机任务，之后冻结成可复用的一行命令脚本）：
+同一个二进制也能直接重放审阅过的 flow，正常路径不需要模型参与：
 
 ```bash
-npx skills add leeguooooo/iphone-use
+MCP="$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+"$MCP" flow validate examples/flows/open-spotlight.json
+PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
+  "$MCP" flow run examples/flows/open-spotlight.json
+PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
+  "$MCP" flow run examples/flows/search-spotlight.json --input 'query=咖啡'
 ```
 
-> 用 `-g` 全局安装时,若 `skills` CLI 报
-> `PromptScript does not support global skill installation`,这是无害的部分失败 ——
-> PromptScript 只支持项目级 skill,所以它那一个目标被跳过,其余 agent(Claude Code 等)
-> 照常安装成功。加 `-a claude` 指定单个 agent 即可消除该警告。
+flow v1 是严格 JSON：包含 `version`、`name`、可选 `description`、显式 string
+`inputs` 和与 `phone_run_steps` 相同的 guarded `steps`。`--input KEY=VALUE`
+只在本次执行中解析参数，不会把值写回 JSON；流程也绝不会自动重试失败或结果未知的
+批次。CLI 参数仍可能出现在 shell history 或进程信息里，因此不要用它传凭据、验证码、
+隐私内容，也不要把支付、发送、发布或删除动作做成可复用 flow。
 
-技能内容涵盖智能体 API、「看 → 操作 → 验证」循环、经真机验证的输入经验（滚动方向、keycode/输入法坑），
-以及一个完整范例 —— 导出 Apple 健康全量数据（它没有 API；智能体在「健康」App 里点按操作，约 3 分钟后数据落到你的 Mac 上）。
-见 [`skills/iphone-use/SKILL.md`](skills/iphone-use/SKILL.md)。
+浏览器控制栏现在提供「多步」录制：只记录服务端确认成功的动作；从「控件」面板选择时
+优先保存精确可访问性标签；动作后的元素树出现稳定变化时，录制器只会用新出现的唯一
+可访问性 identifier 或前台应用追加 `wait_for` 语义检查点，而不是只依赖固定延迟。
+自动检查点不会保存可能包含姓名、金额的任意画面标签和值。坐标点按、滑动、长按和拖动会明确标记
+为易失；文字输入会转换成命名运行参数，刚才输入的原文会被丢弃，下载 JSON 只包含
+参数定义。停止后可成组上移或删除动作及其检查点，填写本次运行值，再下载合法的
+flow v1 文件或一次提交给 `/agent/actions`。遇到无法稳定录入的动作时，下载会明确标为
+“不完整草稿”，且界面不会开放一次执行；没有缺口的流程也必须填写全部必需参数并先
+勾选“不含支付、发送、发布、删除等不可逆操作”。
 
-## 安全须知
+## Shortcuts bridge（legacy mirror 实验）
 
-本工具把对手机的实时操控暴露在网络上，请把 URL 和密码当作敏感凭证对待。
+![Shortcuts bridge](assets/shortcuts-bridge.png)
 
-- 绑定到局域网时密码是强制的（`install.sh` 会强制要求）。
-- 远程访问的 HTTPS 由 Cloudflare 隧道终结（守护进程只提供明文 HTTP 并读取 `X-Forwarded-Proto`）；
-  会话 cookie 是 `HttpOnly` + `SameSite=Lax`。
-- 暴露访问期间，不要让支付 App、私密聊天、2FA 验证码界面停留在屏幕上。
-- 不用时停止 / 卸载 LaunchAgent。
+现有 “iU Bridge” 通过 Mac 侧的 Spotlight、剪贴板和键盘事件启动，因此只属于
+`PHONE_REMOTE_BACKEND=mirror`。Direct 已支持 Home、Spotlight 和文档列出的
+WebDriver named key；App Switcher、Control Center、Shortcuts bridge 和任意 Mac
+合成键码仍不属于 Direct 已承诺能力。
 
-## 路线图
+旧桥接说明保留在 [`shortcuts/README.md`](shortcuts/README.md) 和
+[`shortcuts/registry.json`](shortcuts/registry.json)。
 
-已交付并在 macOS 15 Sequoia / 26 Tahoe 上真机验证：WebRTC 视频、点按、滚动、keycode 文字、快捷操作、
-焦点鲁棒的输入、智能体 HTTP API、LaunchAgent 安装。接下来：
+## Agent skill
 
-- [ ] **macOS 27「Golden Gate」支持。** macOS 27 让 iPhone 镜像窗口*可变宽高比地缩放*
-  （还能渲染 iPad 布局），不再锁定竖屏。需要让窗口选取与宽高比无关（按「在屏 + 面积」排序，而非形状），
-  在 27 beta 上重新验证抓取 + 输入，并加上新的 **控制中心** 快捷操作。目标：一个构建跑通 macOS 15 / 26 / 27。
-- [x] **MCP 服务器** 封装智能体 API，让 MCP 客户端（Claude 等）把 `tap` / `type` / `scroll` / `screenshot` 当原生工具用。
-- [ ] **跨网络验证** Cloudflare 动态 TURN 链路（铸造 + 刷新代码已就绪；需要一次真实 key 的非局域网端到端跑通）。
-- [x] **基于 WebDriverAgent 的元素树控制（「L2」层）** —— 已交付并通过 *daemon 自身 API* 真机验证（iPhone 17 / iOS 27）。WDA 跑*在手机上*、驱动 iOS 辅助功能树，同一套 agent API 自动选最优路径：`{"type":"text"}` **中文直通**（像素路径的 keycode 会被拼音 IME 吃掉）、`{"type":"tap","label":"…"}` **按元素点按**（无坐标、不碰 Mac 光标）、`GET /agent/elements` 以文本返回 UI（比视觉便宜一个量级）、镜像断开时截图自动回退手机端抓取 —— **人拿着手机时 agent 依然能看能操作**。一键安装：`./scripts/setup-wda.sh`（需 Xcode）；全部真机验证过的坑见 **[`docs/wda-setup.html`](docs/wda-setup.html)**。
-- [x] **CI 发布二进制** + 一行 `curl … install.sh | sh` 安装。
-- [ ] 一个简短的 **演示**（GIF / 视频）：AI 智能体通过 API 操作手机。
+正常的 `install.sh` 会从 daemon 所属 release 的确定 commit 安装 skill 到全局标准目录，
+校验实际内容和 Claude Code 发现链接，并把 daemon 与 skill 作为同一个事务升级。以后
+仍然重跑安装器，不要单独从移动来源更新 skill。本地开发使用
+`./install.sh /path/to/iPhoneUse.app` 时，则安装当前工作树里的 skill。
 
-欢迎 Issue 和 PR。
+skill 覆盖 agent API 和“看 → 操作 → 验证”循环。依赖 Shortcuts bridge、App Switcher、
+Control Center 或任意 Mac 键码的旧示例都按 legacy 处理。Home、Spotlight 和已列出的
+named key 使用 Direct/WDA。详见 [`skills/iphone-use/SKILL.md`](skills/iphone-use/SKILL.md)。
 
-## 目录结构
+## 网络与安全
 
-- `crates/core` —— 抓取、编码、坐标/几何、输入注入、控制租约。
-- `crates/server` —— `iphone-use` 守护进程：HTTP/WS、WebRTC、信令、智能体 API、TURN。
-- `web/index.html` —— iPhone Safari 客户端（WebRTC 观看端 + 触控）。
-- `install.sh`、`scripts/make-app.sh`、`deploy/` —— 打包 + LaunchAgent。
-- `docs/` —— 设计规格、运行手册、智能体 API 参考、调研笔记。
+daemon 的密码/cookie/bearer 只保护 `44321` 上的浏览器和 agent API。
+**WDA 自己的设备端 `8100` 和 `9100` 没有认证。**
+
+USB `iproxy` 的作用是让 daemon 固定连接 `127.0.0.1`，并把 relay 绑定到指定 UDID。
+它不会给 iPhone 上的 WDA 加认证，也不能阻止同一局域网里的其他机器直接访问手机 IP
+上的 `8100/9100`。Phase 1 只适合可信、隔离的网络；不要在访客 Wi-Fi、公共网络或
+不受控办公网运行 WDA。必要时关闭手机 Wi-Fi，只保留 USB。
+
+真正的设备传输认证边界属于 Phase 2：由 companion app 或受控 tunnel 提供认证、
+加密和明确的授权生命周期。在这之前，不要把 daemon 的登录密码误当成 WDA 端口的保护。
+
+- `install.sh` 在 daemon 绑定局域网时强制要求密码。
+- 远程访问 daemon 时，应使用自己管理的 HTTPS tunnel。
+- 不要在开放访问期间停留在支付、私聊或 2FA 画面。
+- 不使用时停止 WDA/LaunchAgent。
+
+## WARP / VPN
+
+WARP 或其他 VPN 可能阻断 CoreDevice 隧道，导致 WDA 无法安装、启动或恢复。
+`setup-wda.sh doctor` 只负责检测并给出提示，**不会自动断开或恢复 WARP/VPN**。
+网络策略由操作者决定。daemon 自己管理的恢复因此受阻时，`/agent/status` 会报告
+`device_state:"blocked"`、`setup_blocked_on:"warp"` 和可执行的恢复提示，而不是
+泛泛地要求继续等待。没有阻塞项但仍在恢复时，`setup_phase` 和
+`setup_message` 会报告当前构建阶段；只有 `drivable:true` 才代表可以操作。
+企业设备应由管理员配置合适的 split tunnel。
+
+## 路线
+
+- [ ] 按下面的矩阵完成 Direct 浏览器整链路真机验收。
+- [ ] 补齐签名续期、睡眠/重连、`releasing` / `reconnecting` 状态和多设备恢复体验。
+- [ ] 逐项重验 Direct 命令，不继承 legacy Mirroring 的能力名称。
+- [x] MCP server。
+- [x] WDA 元素树、Unicode 文字、label 点按、坐标点按和手机端截图已有组件级真机记录。
+- [x] GitHub Release 二进制和 `install.sh` 安装。
+- [ ] Phase 2 companion/tunnel：为设备画面和控制补上认证传输，再评估替换 WDA MJPEG。
+
+## 真机验收边界
+
+只有下面各项都在目标 iPhone 上观察到，才能把新默认标成“已验收”：
+
+1. Mac 不给 iPhoneUse 屏幕录制/辅助功能权限，也不打开 iPhone 镜像，Direct daemon 仍启动。
+2. `/agent/status` 报告正确 UDID、`backend:"direct"`、`wda_actionable:true` 和 `drivable:true`。
+3. 另一台设备打开 `/phone`，MJPEG 持续更新；停掉 9100 relay 后，页面明确显示降级/离线。
+4. 浏览器 `/control` 的点按、拖动、长按、上下滚动、ASCII/CJK、Home、Spotlight 和 named key
+   各执行一次并收到确认；App Switcher 要诚实失败。
+5. `/agent/elements`、`/agent/screenshot`、`/agent/input` 的 bearer 鉴权和 WDA 故障路径符合文档，
+   任何失败都不能移动 Mac 光标。
+6. 验证 `releasing` → `released` → `reconnecting` → `ready`，并覆盖锁屏/解锁、USB 重连、
+   daemon/Mac 重启、WDA 重签和多设备不串机。
+7. 在隔离网络检查手机 IP 的 `8100/9100` 暴露情况，并把观察结果记入验收记录。
+
+在这份记录完成前，本文描述的是目标默认和已实现接口，不代表 `install.sh` 已经通过完整真机链路。
+
+## 目录
+
+- `crates/server`：Direct WDA 控制、MJPEG 代理、浏览器/agent API，以及 legacy mirror 信令。
+- `crates/core`：保留给 legacy mirror 的 ScreenCaptureKit、编码、几何、CGEvent 和租约。
+- `web/index.html`：默认 Direct MJPEG + HTTP 控制；显式 mirror 时使用旧 WebRTC。
+- `install.sh`、`scripts/`、`deploy/`：安装、WDA 设置和 LaunchAgent。
+- `docs/`：接口、架构、验收和排障文档。
 
 ## 许可证
 

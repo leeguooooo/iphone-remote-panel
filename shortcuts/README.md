@@ -16,16 +16,18 @@ trigger:  daemon writes {"verb":"battery","id":"abc"} to the Mac clipboard
 execute:  the shortcut reads the clipboard, dispatches on `verb`, runs the
           native action (Get Battery Level, Find Health Samples, …)
 return:   the shortcut's "Get Contents of URL" POSTs the result to
-          http://<mac>:44321/agent/inbox  (Authorization: Bearer <token>)
-collect:  agent GETs /agent/inbox, matches on `id`
+          http://<mac>:44321/agent/inbox
+          (Authorization: Bearer <token>, X-Phone-Control: 1)
+collect:  agent POSTs /agent/inbox/drain with both headers, matches on `id`
 ```
 
 ## Endpoints (shipped)
 
 | Call | Who | Purpose |
 |---|---|---|
-| `POST /agent/inbox` | the phone (shortcut) | deliver one JSON result |
-| `GET /agent/inbox` | the agent | retrieve + drain pending results (`?peek=1` to not drain) |
+| `POST /agent/inbox` | the phone (shortcut) | deliver one JSON result; requires bearer auth and `X-Phone-Control: 1` |
+| `GET /agent/inbox` | the agent | inspect pending results without consuming them |
+| `POST /agent/inbox/drain` | the agent | atomically retrieve and consume pending results; requires bearer auth and `X-Phone-Control: 1` |
 
 ## Governance — one bridge, one registry
 
