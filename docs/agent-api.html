@@ -164,6 +164,7 @@
   "setup_blocked_on": "",
   "setup_phase": "ready",
   "setup_message": "direct WDA backend and launchd supervisor verified",
+  "wda_build": { "state": "ready", "phase": "ready", "since": 1765000000, "age_secs": 12, "log_tail": "" },
   "viewer_count": 0,
   "mjpeg_viewer_count": 0,
   "version": "&lt;running version&gt;",
@@ -192,6 +193,7 @@
   <tr><td><code>setup_blocked_on</code></td><td>Fresh daemon-owned managed-Direct setup blocker: <code>warp</code>, <code>proxy</code>, <code>usb</code>, <code>trust</code>, <code>ddi</code>, <code>wda</code>, or empty. KeepAlive preserves the last blocker while the next preflight pass checks it, then clears or replaces it only after evidence; it is deliberately empty for unconfigured and externally managed targets.</td></tr>
   <tr><td><code>setup_phase</code></td><td>Fresh managed-Direct helper phase such as <code>prereq</code>, <code>ddi-wait</code>, <code>building</code>, <code>serving</code>, or <code>ready</code>. During a long first build, this distinguishes progress from a silent hang.</td></tr>
   <tr><td><code>setup_message</code></td><td>Bounded, JSON-escaped detail for <code>setup_phase</code>, including periodically refreshed WDA build elapsed time. It is progress context, not actionability proof.</td></tr>
+  <tr><td><code>wda_build</code></td><td>Bring-up progress as <code>{state, phase, since, age_secs, log_tail}</code>. <code>state</code> is <code>building</code> (working — keep waiting), <code>failed</code> (the helper gave up — read <code>log_tail</code>), <code>stalled</code> (no status write for over 5 minutes, so the helper died without reporting), <code>ready</code>, or <code>unknown</code> (no managed setup has run). This is the distinction <code>setup_blocked_on</code> cannot make: a slow first build and a dead build both leave it empty. <code>since</code> is the helper's last status write in Unix seconds and <code>age_secs</code> how long the state has held. <code>log_tail</code> carries the last lines of <code>~/.iphone-use/wda-runner.log</code>, and is populated only for <code>failed</code> and <code>stalled</code> so a routine poll stays small.</td></tr>
   <tr><td><code>hint</code></td><td>Concrete recovery guidance for locked, severed, released, or unreachable WDA.</td></tr>
 </table>
 <aside class="note">

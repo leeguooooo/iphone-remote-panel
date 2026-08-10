@@ -1333,6 +1333,19 @@ async fn agent_status(
             .unwrap_or(""),
     )
     .unwrap_or_else(|_| "\"\"".to_string());
+    // Build progress (#26 §1). Read raw — unlike `setup_status`, a *stale*
+    // status is meaningful here: it means the helper died mid-build rather
+    // than that the blocker went away.
+    let wda_build = if direct && state.managed_wda {
+        derive_wda_build(
+            read_raw_setup_status().as_ref(),
+            now_secs(),
+            read_runner_log_tail,
+        )
+    } else {
+        WdaBuild::unknown()
+    }
+    .to_json();
     // When not drivable, tell the caller HOW to recover (the recovery differs by
     // state, and auto-recovery is blocked by macOS while the phone is in use).
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
@@ -1404,7 +1417,7 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
         state.device_udid.is_some(),
         state.managed_wda,
@@ -1574,6 +1587,159 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
     status.phase = status.phase.chars().take(64).collect();
     status.message = status.message.chars().take(512).collect();
     Some(status)
+}
+
+// ---------------------------------------------------------------------------
+// wda_build — "is it compiling, or did it fail?" (issue #26 §1)
+// ---------------------------------------------------------------------------
+
+/// Bring-up progress, split into the one distinction `setup_blocked_on` can't
+/// make: **still working** vs **gave up**.
+///
+/// `setup_blocked_on` answers "what prerequisite is missing" and is empty for
+/// a run that is simply slow. But an `xcodebuild` that is three minutes into a
+/// clean build and an `xcodebuild` that died two minutes ago both present as
+/// `wda:false, setup_blocked_on:""` — so an agent polling status cannot tell
+/// "wait longer" from "stop waiting and read the log". This object makes that
+/// call explicit, and carries the log tail for the case where the answer is
+/// "go look".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WdaBuild {
+    /// `ready` | `building` | `failed` | `stalled` | `unknown`.
+    state: &'static str,
+    /// The helper's own phase string, verbatim (`building`, `ddi-wait`, …).
+    phase: String,
+    /// Unix seconds of the helper's last status write; 0 when unknown.
+    since: u64,
+    /// Seconds since that write — how long this state has been true.
+    age_secs: u64,
+    /// Tail of the runner log, non-empty only when the state is worth reading
+    /// a log for (`failed` / `stalled`).
+    log_tail: String,
+}
+
+impl WdaBuild {
+    /// No status file at all — bring-up was never attempted by this helper.
+    fn unknown() -> Self {
+        Self {
+            state: "unknown",
+            phase: String::new(),
+            since: 0,
+            age_secs: 0,
+            log_tail: String::new(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            r#"{{"state":"{}","phase":{},"since":{},"age_secs":{},"log_tail":{}}}"#,
+            self.state,
+            serde_json::to_string(&self.phase).unwrap_or_else(|_| "\"\"".into()),
+            self.since,
+            self.age_secs,
+            serde_json::to_string(&self.log_tail).unwrap_or_else(|_| "\"\"".into()),
+        )
+    }
+}
+
+/// A helper phase this stale is not "working slowly", it is gone.
+///
+/// `setup-wda.sh` rewrites its status on every step, including a per-poll
+/// "building (Ns elapsed)" heartbeat, so silence this long means the process
+/// died without writing a `-fail` phase (killed, panicked, machine slept).
+const BUILD_STALE_SECS: u64 = 300;
+
+/// Map a helper phase + its age onto a build state.
+///
+/// The helper's vocabulary is regular: `ready` is terminal-success, anything
+/// ending in `-fail` is terminal-failure, and everything else (`prereq`,
+/// `ddi-wait`, `building`, `trust`, `serving`, `supervisor`) is in-flight.
+/// Keying on the `-fail` suffix rather than an allow-list means a new failure
+/// phase added to the script reports as a failure here without a code change.
+fn classify_build_state(phase: &str, age_secs: u64) -> &'static str {
+    if phase.is_empty() {
+        return "unknown";
+    }
+    if phase == "ready" {
+        return "ready";
+    }
+    if phase.ends_with("-fail") {
+        return "failed";
+    }
+    if age_secs > BUILD_STALE_SECS {
+        return "stalled";
+    }
+    "building"
+}
+
+/// Last `max_lines` non-empty lines of `txt`, capped at `max_bytes`.
+///
+/// Bounded on both axes because this rides on every `/agent/status` poll: a
+/// runaway xcodebuild log must not turn a status check into a megabyte.
+fn tail_lines(txt: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = txt.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut out = lines[start..].join("\n");
+    if out.len() > max_bytes {
+        // Cut from the front — the end of a build log is the interesting part.
+        let cut = out
+            .char_indices()
+            .rev()
+            .map(|(i, _)| i)
+            .find(|i| out.len() - i <= max_bytes)
+            .unwrap_or(0);
+        out = out.split_off(cut);
+    }
+    out
+}
+
+/// Build [`WdaBuild`] from the helper's status file plus, when the state calls
+/// for it, the tail of the runner log.
+fn derive_wda_build(
+    status: Option<&WdaSetupStatus>,
+    now: u64,
+    read_log: impl Fn() -> String,
+) -> WdaBuild {
+    let Some(status) = status else {
+        return WdaBuild::unknown();
+    };
+    let age_secs = now.saturating_sub(status.ts);
+    let state = classify_build_state(&status.phase, age_secs);
+    // Only pay for the log read when the answer is "go read the log".
+    let log_tail = if matches!(state, "failed" | "stalled") {
+        tail_lines(&read_log(), 12, 1200)
+    } else {
+        String::new()
+    };
+    WdaBuild {
+        state,
+        phase: status.phase.clone(),
+        since: status.ts,
+        age_secs,
+        log_tail,
+    }
+}
+
+/// Read the helper status **without** the 5-minute freshness gate.
+///
+/// [`read_structured_setup_status`] drops a stale file so a finished run isn't
+/// reported as a live blocker. Build state needs the opposite: a stale
+/// `building` is exactly the signal that the helper died mid-build.
+fn read_raw_setup_status() -> Option<WdaSetupStatus> {
+    let home = std::env::var("HOME").ok()?;
+    let txt = std::fs::read_to_string(format!("{home}/.iphone-use/wda-setup-status.json")).ok()?;
+    let mut status: WdaSetupStatus = serde_json::from_str(&txt).ok()?;
+    status.phase = status.phase.chars().take(64).collect();
+    status.message = status.message.chars().take(512).collect();
+    Some(status)
+}
+
+/// Tail of `~/.iphone-use/wda-runner.log` — the xcodebuild output.
+fn read_runner_log_tail() -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return String::new();
+    };
+    std::fs::read_to_string(format!("{home}/.iphone-use/wda-runner.log")).unwrap_or_default()
 }
 
 /// launchd label for the dedicated, self-healing WDA job.
@@ -5794,6 +5960,129 @@ mod tests {
         assert!(setup_blocker_hint("warp")
             .unwrap()
             .contains("Traffic only mode"));
+    }
+
+    // --- wda_build (#26 §1) ------------------------------------------------
+
+    fn build_status(phase: &str, ts: u64) -> WdaSetupStatus {
+        WdaSetupStatus {
+            phase: phase.to_string(),
+            blocked_on: String::new(),
+            message: String::new(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn build_state_separates_working_from_gave_up() {
+        // The whole point of #26 §1: these two look identical in
+        // `setup_blocked_on` (both empty, both wda:false).
+        assert_eq!(classify_build_state("building", 90), "building");
+        assert_eq!(classify_build_state("building-fail", 90), "failed");
+    }
+
+    #[test]
+    fn build_state_covers_the_helper_phase_vocabulary() {
+        for phase in ["prereq", "ddi-wait", "trust", "serving", "supervisor"] {
+            assert_eq!(classify_build_state(phase, 10), "building", "{phase}");
+        }
+        for phase in [
+            "ddi-fail",
+            "building-fail",
+            "signing-fail",
+            "supervisor-fail",
+            "daemon-fail",
+        ] {
+            assert_eq!(classify_build_state(phase, 10), "failed", "{phase}");
+        }
+        assert_eq!(classify_build_state("ready", 10), "ready");
+        assert_eq!(classify_build_state("", 10), "unknown");
+    }
+
+    #[test]
+    fn build_state_calls_a_silent_helper_stalled_not_building() {
+        // setup-wda.sh rewrites its status every poll while building, so this
+        // much silence means the process died without writing a -fail phase.
+        assert_eq!(
+            classify_build_state("building", BUILD_STALE_SECS + 1),
+            "stalled"
+        );
+        // A finished run stays terminal no matter how old it is.
+        assert_eq!(classify_build_state("ready", 99_999), "ready");
+        assert_eq!(classify_build_state("building-fail", 99_999), "failed");
+    }
+
+    #[test]
+    fn wda_build_attaches_a_log_tail_only_when_the_log_is_the_answer() {
+        let log = || "line one\n\nline two\nboom: xcodebuild failed\n".to_string();
+
+        let failed = derive_wda_build(Some(&build_status("building-fail", 1000)), 1100, log);
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.age_secs, 100);
+        assert_eq!(failed.since, 1000);
+        assert!(failed.log_tail.contains("boom: xcodebuild failed"));
+        // Blank lines are dropped so the tail carries signal, not padding.
+        assert!(!failed.log_tail.contains("\n\n"));
+
+        // Mid-build and ready poll constantly; don't ship a log on every poll.
+        let building = derive_wda_build(Some(&build_status("building", 1000)), 1100, log);
+        assert_eq!(building.state, "building");
+        assert!(building.log_tail.is_empty());
+
+        let ready = derive_wda_build(Some(&build_status("ready", 1000)), 1100, log);
+        assert_eq!(ready.state, "ready");
+        assert!(ready.log_tail.is_empty());
+
+        // A stalled helper is the other case where you must read the log.
+        let stalled = derive_wda_build(Some(&build_status("building", 1000)), 9000, log);
+        assert_eq!(stalled.state, "stalled");
+        assert!(stalled.log_tail.contains("boom"));
+    }
+
+    #[test]
+    fn wda_build_without_a_status_file_is_unknown_not_failed() {
+        let b = derive_wda_build(None, 1000, || "irrelevant".to_string());
+        assert_eq!(b.state, "unknown");
+        assert_eq!(b.since, 0);
+        assert!(b.log_tail.is_empty());
+    }
+
+    #[test]
+    fn wda_build_json_is_valid_and_escapes_log_text() {
+        let b = derive_wda_build(Some(&build_status("building-fail", 1000)), 1100, || {
+            "error: \"quoted\"\n\tand a backslash \\ and a newline".to_string()
+        });
+        let v: serde_json::Value = serde_json::from_str(&b.to_json())
+            .expect("wda_build must be valid JSON inside the status body");
+        assert_eq!(v["state"], "failed");
+        assert_eq!(v["phase"], "building-fail");
+        assert_eq!(v["age_secs"], 100);
+        assert!(v["log_tail"].as_str().unwrap().contains("\"quoted\""));
+    }
+
+    #[test]
+    fn build_log_tail_is_bounded_on_both_lines_and_bytes() {
+        let many = (0..500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = tail_lines(&many, 12, 1200);
+        assert_eq!(tail.lines().count(), 12);
+        assert!(tail.contains("line 499"), "keeps the END of the log");
+        assert!(!tail.contains("line 400"));
+
+        // A single pathological line is capped by bytes, not left unbounded.
+        let huge = "x".repeat(50_000);
+        assert!(tail_lines(&huge, 12, 1200).len() <= 1200);
+    }
+
+    #[test]
+    fn build_log_tail_never_splits_a_utf8_char() {
+        // A byte-cap naively applied to CJK build output would panic.
+        let cjk = "构建失败：找不到设备\n".repeat(500);
+        let tail = tail_lines(&cjk, 12, 1200);
+        assert!(tail.len() <= 1200);
+        assert!(tail.contains("构建失败"));
     }
 
     #[test]
