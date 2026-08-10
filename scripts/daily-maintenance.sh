@@ -98,7 +98,7 @@ Do this:
    extend a test in crates/*/tests or crates/*/src that fails without your fix.
 3. Review each open PR with \`gh pr view <n>\` and \`gh pr diff <n>\`. Leave a
    review comment if something is wrong. Do NOT merge any PR.
-4. Commit each fix separately on main. Match the repo's commit style — run
+4. Commit each fix separately on main. Match the repository commit style — run
    \`git log --oneline -15\` and follow it (English, Conventional Commits,
    e.g. \`fix(wda): ...\`). Reference the issue as "(#N)" in the subject.
    Do NOT tag, do NOT bump any version, do NOT push. A release script handles
