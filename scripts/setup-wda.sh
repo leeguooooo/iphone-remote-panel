@@ -1815,7 +1815,11 @@ fi
 # Pitfall: 'Developer Disk Image is not mounted' usually means the phone is
 # LOCKED or just-connected — not an Xcode version problem. Keep it unlocked.
 if [ "$WDA_ALLOW_LAN" = "1" ]; then
-    _setstatus ddi-wait "" "waiting for developer services — unlock and keep the iPhone awake"
+    # Carry the sticky trust blocker through this early phase too: clearing it
+    # here made status flip back to a generic "waiting for developer services"
+    # between failed attempts while the phone still needed the same manual
+    # trust approval (operator-reported: "who knows what we're waiting for").
+    _setstatus ddi-wait "$_BUILD_BLOCKER" "waiting for developer services — unlock and keep the iPhone awake"
     info "Waiting for developer services (UNLOCK the iPhone and keep it awake)"
 else
     _setstatus ddi-wait usb "waiting for developer services — unlock + USB"
