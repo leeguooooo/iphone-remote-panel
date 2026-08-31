@@ -340,6 +340,10 @@ impl WdaClient {
                 "{}/session/{}/element/{}/clear",
                 self.base, sid, element_id
             ))
+            // A bodyless POST is rejected with 400 by current WDA builds
+            // (hardware-hit on 9.15.3 during the set_value("") validation);
+            // send the same empty JSON object every other element POST sends.
+            .json(&serde_json::json!({}))
             .send()
             .await
             .context("POST element/clear")?;
@@ -595,6 +599,8 @@ impl WdaClient {
                 "{}/session/{}/element/{}/clear",
                 self.base, sid, id
             ))
+            // Same bodyless-POST 400 as clear_element on current WDA builds.
+            .json(&serde_json::json!({}))
             .send()
             .await
             .context("POST /element/clear")?;
