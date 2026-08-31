@@ -214,6 +214,8 @@ the heaviest users make the product better.
 | `PHONE_REMOTE_WDA_URL` | `http://127.0.0.1:8100` in direct installs | WDA control loopback. WDA itself has no authentication; direct input fails closed when this endpoint is unavailable. |
 | `PHONE_REMOTE_WDA_MJPEG_URL` | `http://127.0.0.1:9100` in direct installs | WDA MJPEG loopback. WDA itself has no authentication; the daemon exposes it to authenticated viewers at `/agent/mjpeg`. |
 | `PHONE_REMOTE_WDA_MANAGED` | on for Direct loopback endpoints | Whether this daemon owns the local WDA supervisor/relay lifecycle. Remote endpoints must be externally managed. |
+| `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | *(unset — WDA default 50)* | Opt-in bound on WDA's accessibility snapshot depth (`snapshotMaxDepth`), applied once per WDA session. Try `20`–`30` if an app with an enormous tree (e.g. KakaoTalk, issue #44) kills the runner during `/agent/elements`. |
+| `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` | *(unset — WDA default 15)* | Opt-in bound on WDA's snapshot resolution time in seconds (`customSnapshotTimeout`), so an oversized snapshot fails that one request instead of wedging until testmanagerd kills the runner. |
 | `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | After this many seconds without agent activity or a live viewer, stop the WDA runner so the phone is free for hands-on use. Reconnect starts it again; unlock the phone if required. Set `0` to keep WDA running. |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Legacy mirror/WebRTC Cloudflare TURN credentials. Not used by the direct MJPEG path. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Legacy mirror/WebRTC static TURN credentials. |
