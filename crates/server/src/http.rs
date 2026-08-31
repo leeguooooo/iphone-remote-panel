@@ -1680,6 +1680,14 @@ fn parse_setup_log_blocked_on(txt: &str) -> String {
         || latest_attempt.contains("no USB iPhone is connected")
     {
         "usb".to_string()
+    } else if latest_attempt.contains("has no signed-in Apple account")
+        || latest_attempt.contains("No Accounts:")
+        || latest_attempt.contains("could not find or create the WDA development provisioning")
+    {
+        // A signed-out Xcode (common after an Xcode update) fails every WDA
+        // build with "No Accounts"; surfacing it beats a generic wda blocker
+        // that sends the operator to a log they may not know exists.
+        "account".to_string()
     } else {
         String::new()
     }
@@ -1702,6 +1710,9 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
         "ddi" => Some(
             "the iPhone Developer Disk Image is unavailable — open Xcode with the phone connected, let device preparation finish, then poll status",
         ),
+        "account" => Some(
+            "Xcode has no usable signed-in Apple account or WDA provisioning profile — open Xcode → Settings → Accounts, sign in and select the development team, then poll status; the managed service retries automatically",
+        ),
         "wda" => Some(
             "WebDriverAgent failed to start — inspect ~/.iphone-use/wda-agent.log and run setup-wda.sh doctor before retrying",
         ),
@@ -1723,7 +1734,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
     }
     if !matches!(
         status.blocked_on.as_str(),
-        "" | "warp" | "proxy" | "usb" | "trust" | "ddi" | "wda"
+        "" | "warp" | "proxy" | "usb" | "trust" | "ddi" | "account" | "wda"
     ) {
         return None;
     }
@@ -6766,7 +6777,7 @@ mod tests {
 
     #[test]
     fn setup_status_accepts_every_setup_script_blocker() {
-        for blocker in ["warp", "proxy", "usb", "trust", "ddi", "wda"] {
+        for blocker in ["warp", "proxy", "usb", "trust", "ddi", "account", "wda"] {
             let payload = format!(r#"{{"blocked_on":"{blocker}","ts":1000}}"#);
             assert_eq!(parse_setup_blocked_on(&payload, 1100), blocker);
             assert!(
@@ -6780,6 +6791,22 @@ mod tests {
         assert!(setup_blocker_hint("warp")
             .unwrap()
             .contains("Traffic only mode"));
+        // A signed-out Xcode must send the operator to Accounts, not to a log.
+        assert!(setup_blocker_hint("account")
+            .unwrap()
+            .contains("Settings → Accounts"));
+    }
+
+    #[test]
+    fn setup_log_fallback_recognizes_signed_out_xcode_from_latest_attempt_only() {
+        let signed_out = "== Checking prerequisites\n\
+            ✓ Xcode: Xcode 26.6\n\
+            ✗ Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,\n";
+        assert_eq!(parse_setup_log_blocked_on(signed_out), "account");
+
+        // A later attempt that got past signing must clear the stale blocker.
+        let recovered = format!("{signed_out}== Checking prerequisites\n✓ Team: 43G3AR9DT8\n");
+        assert_eq!(parse_setup_log_blocked_on(&recovered), "");
     }
 
     // --- wda_died_reason (#26 §2) ------------------------------------------
