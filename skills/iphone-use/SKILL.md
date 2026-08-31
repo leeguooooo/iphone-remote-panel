@@ -61,7 +61,7 @@ and is not a Direct readiness signal.
   build after an Xcode update can take several minutes. Never send input until
   `drivable:true`.
 - `device_state:"blocked"` or `"offline"` → read `hint` and
-  `setup_blocked_on` (`warp|proxy|usb|trust|ddi`) and fix that blocker first.
+  `setup_blocked_on` (`warp|proxy|usb|trust|ddi|account`) and fix that blocker first.
 - Never switch to `mode=mirror` as automatic recovery. Mirror is an explicit
   operator-selected compatibility mode.
 
@@ -181,7 +181,7 @@ documented or unit-tested action is not automatically a current-device proof:
   setup, and restart the daemon to switch devices. Never pass a one-off UDID
   during recovery.
 - **`mode=agent` stuck / `wda` stays false → read `status.setup_blocked_on`**
-  (`warp|proxy|usb|trust|ddi`). The #1 blocker is **`warp`**: Cloudflare WARP (or any
+  (`warp|proxy|usb|trust|ddi|account`). The #1 blocker is **`warp`**: Cloudflare WARP (or any
   VPN) wedges the CoreDevice tunnel xcodebuild needs when its effective Split
   Tunnel exclusions omit `fe80::/10` or the device RSD ULA range `fd00::/8`.
   If WARP is only needed for selected destinations, prefer **Traffic only** mode

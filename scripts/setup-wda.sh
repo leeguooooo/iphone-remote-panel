@@ -1897,13 +1897,13 @@ while [ -z "$PHONE_URL" ]; do
     # first used to hide the real account/profile error behind a generic
     # "runner exited" message.
     if grep -q "No Accounts:" "$RUN_LOG" 2>/dev/null; then
-        _setstatus signing-fail wda "sign in to an Apple account in Xcode"
+        _setstatus signing-fail account "sign in to an Apple account in Xcode"
         die "Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,
    sign in and select the development team, then rerun."
     fi
     if grep -q "No profiles for .* were found\|requires a provisioning profile" \
         "$RUN_LOG" 2>/dev/null; then
-        _setstatus signing-fail wda "Xcode could not create the WDA provisioning profile"
+        _setstatus signing-fail account "Xcode could not create the WDA provisioning profile"
         die "Xcode could not find or create the WDA development provisioning profile.
    In Xcode → Settings → Accounts, refresh the selected team, keep the iPhone
    registered, then rerun. If WARP is connected, its effective Excluded routes
