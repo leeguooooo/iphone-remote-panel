@@ -640,6 +640,15 @@ impl WdaClient {
     /// private-use range.  Keeping the mapping here gives HTTP, MCP, and the web
     /// client one device-native implementation instead of falling back to Mac
     /// keyboard events.
+    ///
+    /// Dispatched through the W3C Actions API (`POST /session/<id>/actions`)
+    /// with a **key input source**, NOT through [`Self::keys`]. `/wda/keys`
+    /// bottoms out in `FBKeyboard typeText:`, which is literal text entry: it
+    /// never interprets the private-use code points, so it *typed* them into the
+    /// focused field while WDA still answered `{"ok":true}` (issue #42 —
+    /// `return` left the search unsubmitted, `delete` made the text longer).
+    /// Only the Actions key source translates `\u{E007}` &co. into real key
+    /// events. Plain text keeps using [`Self::keys`], which is correct for it.
     pub async fn named_key(&mut self, name: &str) -> Result<()> {
         let value = match name {
             "return" | "enter" => "\u{E007}",
@@ -653,7 +662,25 @@ impl WdaClient {
             "down" => "\u{E015}",
             _ => anyhow::bail!("unsupported named key: {name}"),
         };
-        self.keys(value).await
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!("{}/session/{}/actions", self.base, sid))
+            .json(&serde_json::json!({
+                "actions": [{
+                    "type": "key",
+                    "id": "keyboard",
+                    "actions": [
+                        { "type": "keyDown", "value": value },
+                        { "type": "keyUp",   "value": value }
+                    ]
+                }]
+            }))
+            .send()
+            .await
+            .context("POST /actions (key)")?;
+        ensure_wda_success(response, "POST /actions").await?;
+        Ok(())
     }
 
     /// Dismiss the on-screen keyboard so it stops covering a web page's own
@@ -1186,6 +1213,42 @@ mod tests {
 
         assert!(error.contains("invalid session id"), "{error}");
         assert!(error.contains("response lost"), "{error}");
+    }
+
+    #[test]
+    fn named_key_uses_actions_key_source_not_wda_keys() {
+        // issue #42: /wda/keys goes through `FBKeyboard typeText:`, which typed
+        // the private-use code point into the field instead of pressing the key.
+        // Only a key input source on /actions produces a real key event.
+        let (base, server) = mock_wda(1, |request| {
+            assert!(
+                request.starts_with("POST /session/SESSION/actions "),
+                "{request}"
+            );
+            assert!(!request.contains("/wda/keys"), "{request}");
+            assert!(request.contains(r#""type":"key""#), "{request}");
+            assert!(request.contains(r#""id":"keyboard""#), "{request}");
+            assert!(request.contains(r#""keyDown""#), "{request}");
+            assert!(request.contains(r#""keyUp""#), "{request}");
+            // U+E007 (WebDriver "Enter") travels as raw UTF-8 in the JSON body.
+            assert!(request.contains('\u{E007}'), "{request}");
+            r#"{"value":null}"#.to_string()
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        client.session = Some("SESSION".to_string());
+
+        let sent = block(client.named_key("return"));
+        server.join().unwrap();
+        sent.unwrap();
+    }
+
+    #[test]
+    fn named_key_rejects_unsupported_name() {
+        let mut client = WdaClient::new("http://127.0.0.1:1".to_string()).unwrap();
+        client.session = Some("SESSION".to_string());
+
+        let error = block(client.named_key("f13")).unwrap_err().to_string();
+        assert!(error.contains("unsupported named key: f13"), "{error}");
     }
 
     #[test]
