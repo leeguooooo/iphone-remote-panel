@@ -298,6 +298,25 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Clear a specific element's text (`POST .../element/:id/clear`). Unlike
+    /// [`Self::clear_active`] this does not depend on keyboard focus, so a
+    /// `set_value` action can replace a field's contents without tapping it
+    /// first.
+    pub async fn clear_element(&mut self, element_id: &str) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!(
+                "{}/session/{}/element/{}/clear",
+                self.base, sid, element_id
+            ))
+            .send()
+            .await
+            .context("POST element/clear")?;
+        ensure_wda_success(response, "POST element/clear").await?;
+        Ok(())
+    }
+
     /// Coordinate tap via the W3C Actions API (`POST /session/<id>/actions`, a
     /// touch down-up at the point). Useful when there's no addressable element;
     /// still synthesized on the phone, so no host-cursor contention. Coords are

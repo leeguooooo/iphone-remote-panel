@@ -237,12 +237,12 @@ The bundled web and MCP clients add the header automatically.
 | `GET` | `/agent/mjpeg` | Authenticated live on-device screen stream for browsers. |
 | `POST` | `/control` | Cookie-authenticated browser input. Requires the mutation header and a bounded `ttl_ms`; the only success body is `{"ok":true}`. |
 | `POST` | `/agent/mode` | Requires the mutation header and recovers only the configured backend: Direct accepts `{"mode":"agent"}`, Mirror accepts `{"mode":"mirror"}`. It never changes backend or the canonical UDID. |
-| `POST` | `/agent/input` | Requires bearer auth and the mutation header. Sends tap / drag / long-press / scroll / text and currently supported WDA commands. |
+| `POST` | `/agent/input` | Requires bearer auth and the mutation header. Sends tap / drag / long-press / scroll / text / `set_value` and currently supported WDA commands. `?return=delta` also returns the settled post-action element change in the same response. |
 | `POST` | `/agent/actions` | Direct/WDA-only bounded multi-step execution. The whole batch is validated before dispatch; `wait_for` provides semantic checkpoints and the first failure prevents every later action. |
 | `GET` / `POST` | `/agent/inbox` | GET safely peeks at the legacy Shortcuts result queue. POST requires bearer auth plus the mutation header and appends one result. |
 | `POST` | `/agent/inbox/drain` | Requires bearer auth plus the mutation header; atomically returns and clears the queued results. |
 | `GET` | `/agent/screenshot` | Current phone screen as PNG from the on-device path. |
-| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
+| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
 
 Gate actions on **`drivable`** and, for direct mode, require
 `backend:"direct"` plus `wda_actionable:true`. `phone_target`, `mirror_state`, and
@@ -268,6 +268,16 @@ An element index is only valid with the `snapshot` returned by the same
 other stable locators in scripts, never snapshot tokens or element indexes.
 Exact-label taps also fail closed before acting when there are zero or multiple
 matches; repeated labels must be disambiguated from the element tree.
+`set_value` (`{"type":"set_value","element":N,"snapshot":"…","value":"…"}`) writes a
+field's contents directly through WDA (clear-then-type; empty string clears), and
+`scroll` with `element`+`snapshot` keeps both gesture endpoints inside that element's
+rectangle so a list scrolls without straying into a neighboring scroll view. Both are
+snapshot-bound and fail closed exactly like indexed taps.
+`POST /agent/input?return=delta` (optionally `&since=<snapshot>&settle_ms=<ms>`)
+settles after an applied action and returns `snapshot` plus a `delta` against the
+baseline (or full `elements` when no baseline is cached) in the same response —
+halving the act-then-verify round trips. A failed post-action read reports
+`delta_error` alongside `ok:true`; the action still applied.
 `/agent/actions` accepts at most 24 `action`, `wait_for`, or bounded `pause` steps,
 holds one WDA control lock, and stops at the first failure. Its response includes
 `completed`, `applied_actions`, `failed_step`, `outcome`, and `retry_safe` where

@@ -105,6 +105,9 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         mjpeg_stream_activity: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::new(),
+        )),
     })
 }
 
@@ -250,6 +253,9 @@ fn build_state_with_agent_token(
         live_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mjpeg_stream_activity: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
+        )),
+        element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::new(),
         )),
     })
 }

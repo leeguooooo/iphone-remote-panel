@@ -415,7 +415,18 @@ pub struct AppState {
     /// stream id. The web client asks for its own stream age on `/agent/status`
     /// so another viewer cannot make a frozen local image look fresh.
     pub mjpeg_stream_activity: Arc<Mutex<std::collections::HashMap<String, (u64, Instant)>>>,
+    /// Recently served element trees keyed by their `snapshot` token, so
+    /// `GET /agent/elements?since=<snapshot>` and `POST /agent/input?return=delta`
+    /// can answer with a diff instead of the full tree. Bounded ring — an agent
+    /// only ever diffs against its own last read or two, and a miss degrades
+    /// gracefully to the full tree.
+    pub element_snapshots: Arc<Mutex<ElementSnapshotCache>>,
 }
+
+/// The bounded ring behind [`AppState::element_snapshots`]: recently served
+/// element trees keyed by their snapshot token, oldest first.
+pub type ElementSnapshotCache =
+    std::collections::VecDeque<(String, Arc<Vec<crate::wda::ElementRow>>)>;
 
 impl AppState {
     /// Stamp "remote driving happened just now" for the idle-release watchdog.
@@ -2695,18 +2706,11 @@ pub(crate) async fn wda_swipe(
     dx: f64,
     dy: f64,
 ) -> anyhow::Result<()> {
-    let travel = |d: f64, axis: f64| -> f64 {
-        if d == 0.0 {
-            0.0
-        } else {
-            (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
-        }
-    };
     let (sw, sh) = w.window_size().await?;
     let cx = normalized_wda_axis(nx, sw)?;
     let cy = normalized_wda_axis(ny, sh)?;
-    let tx = travel(dx, sw);
-    let ty = travel(dy, sh);
+    let tx = swipe_travel(dx, sw);
+    let ty = swipe_travel(dy, sh);
     let x1 = (cx + tx / 2.0).clamp(1.0, sw - 1.0);
     let x2 = (cx - tx / 2.0).clamp(1.0, sw - 1.0);
     let y1 = (cy + ty / 2.0).clamp(1.0, sh - 1.0);
@@ -2896,14 +2900,182 @@ fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
 }
 
+/// How many recent element trees the daemon retains for `?since=` diffs.
+/// An agent diffs against its own previous read, so a handful is plenty; a
+/// miss simply degrades to the full tree.
+const ELEMENT_SNAPSHOT_CACHE_CAP: usize = 8;
+
+/// Retain `rows` under its snapshot token so a later `?since=` can diff
+/// against it. Re-serving an already-cached snapshot refreshes its position.
+fn remember_element_snapshot(
+    state: &AppState,
+    snapshot: &str,
+    rows: &Arc<Vec<crate::wda::ElementRow>>,
+) {
+    let mut cache = recover(state.element_snapshots.lock());
+    if let Some(position) = cache.iter().position(|(id, _)| id == snapshot) {
+        cache.remove(position);
+    }
+    cache.push_back((snapshot.to_string(), rows.clone()));
+    while cache.len() > ELEMENT_SNAPSHOT_CACHE_CAP {
+        cache.pop_front();
+    }
+}
+
+fn lookup_element_snapshot(
+    state: &AppState,
+    snapshot: &str,
+) -> Option<Arc<Vec<crate::wda::ElementRow>>> {
+    recover(state.element_snapshots.lock())
+        .iter()
+        .find(|(id, _)| id == snapshot)
+        .map(|(_, rows)| rows.clone())
+}
+
+/// Index-level diff between two element trees (see [`diff_element_rows`]).
+#[derive(Debug, PartialEq, Eq)]
+struct ElementRowsDelta {
+    /// Indexes into the CURRENT tree of rows with no identity match in the
+    /// baseline — directly usable as `element` with the new snapshot token.
+    added: Vec<usize>,
+    /// Indexes into the CURRENT tree of rows whose identity exists in the
+    /// baseline but whose state or geometry differs (value, rect, flags, depth).
+    changed: Vec<usize>,
+    /// Indexes into the BASELINE tree of rows that are gone from the current one.
+    removed: Vec<usize>,
+    /// Rows identical in both trees.
+    unchanged: usize,
+}
+
+/// Diff two flattened element trees for `?since=` responses.
+///
+/// Rows are matched by semantic identity — `(kind, label, identifier,
+/// placeholder)` — pairing duplicates in document order. A matched pair whose
+/// remaining fields differ is `changed`; unmatched current rows are `added` and
+/// unmatched baseline rows are `removed`. Index-positional matching would
+/// misreport every row after one insertion, so identity matching is what keeps
+/// a small UI change a small diff.
+fn diff_element_rows(
+    baseline: &[crate::wda::ElementRow],
+    current: &[crate::wda::ElementRow],
+) -> ElementRowsDelta {
+    use std::collections::HashMap;
+
+    type IdentityKey<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
+    fn identity(row: &crate::wda::ElementRow) -> IdentityKey<'_> {
+        (
+            row.kind.as_str(),
+            row.label.as_str(),
+            row.identifier.as_deref(),
+            row.placeholder.as_deref(),
+        )
+    }
+
+    let mut baseline_by_identity: HashMap<IdentityKey<'_>, std::collections::VecDeque<usize>> =
+        HashMap::new();
+    for (index, row) in baseline.iter().enumerate() {
+        baseline_by_identity
+            .entry(identity(row))
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut delta = ElementRowsDelta {
+        added: Vec::new(),
+        changed: Vec::new(),
+        removed: Vec::new(),
+        unchanged: 0,
+    };
+    let mut matched_baseline = vec![false; baseline.len()];
+    for (index, row) in current.iter().enumerate() {
+        match baseline_by_identity
+            .get_mut(&identity(row))
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            Some(baseline_index) => {
+                matched_baseline[baseline_index] = true;
+                if baseline[baseline_index] == *row {
+                    delta.unchanged += 1;
+                } else {
+                    delta.changed.push(index);
+                }
+            }
+            None => delta.added.push(index),
+        }
+    }
+    delta.removed = matched_baseline
+        .iter()
+        .enumerate()
+        .filter(|(_, matched)| !**matched)
+        .map(|(index, _)| index)
+        .collect();
+    delta
+}
+
+/// Serialize a computed delta for the wire: `added`/`changed` carry the full
+/// current rows with their indexes (so a follow-up snapshot-bound action needs
+/// no re-read), `removed` is baseline indexes only.
+fn elements_delta_json(
+    delta: &ElementRowsDelta,
+    current: &[crate::wda::ElementRow],
+) -> serde_json::Value {
+    let indexed = |indexes: &[usize]| -> Vec<serde_json::Value> {
+        indexes
+            .iter()
+            .filter_map(|&index| {
+                current.get(index).map(|row| {
+                    serde_json::json!({
+                        "index": index,
+                        "element": row,
+                    })
+                })
+            })
+            .collect()
+    };
+    serde_json::json!({
+        "added": indexed(&delta.added),
+        "changed": indexed(&delta.changed),
+        "removed": delta.removed,
+        "unchanged": delta.unchanged,
+    })
+}
+
 #[derive(Debug)]
 enum SnapshotElementTapError {
     Invalid,
     Stale,
     NotFound,
     Ambiguous,
+    /// The row was resolved fresh but cannot carry this action (no semantic
+    /// locator where one is required, or a degenerate rectangle).
+    InvalidTarget,
     BeforeDispatch(anyhow::Error),
     AfterDispatch(anyhow::Error),
+}
+
+/// Map a finished snapshot-bound element action onto the control outcome
+/// grammar shared by every dispatcher: `Err(outcome)` is a terminal outcome the
+/// caller returns as-is, `Ok(result)` feeds the dispatcher's normal
+/// applied/failed handling.
+fn snapshot_element_outcome(
+    result: Result<(), SnapshotElementTapError>,
+    w: &mut crate::wda::WdaClient,
+    context: &str,
+) -> Result<anyhow::Result<()>, WdaControlOutcome> {
+    match result {
+        Ok(()) => Ok(Ok(())),
+        Err(SnapshotElementTapError::Invalid) => Err(WdaControlOutcome::InvalidElementSnapshot),
+        Err(SnapshotElementTapError::Stale) => Err(WdaControlOutcome::StaleElementSnapshot),
+        Err(SnapshotElementTapError::NotFound) => Err(WdaControlOutcome::ElementNotFound),
+        Err(SnapshotElementTapError::Ambiguous) => Err(WdaControlOutcome::AmbiguousElement),
+        Err(SnapshotElementTapError::InvalidTarget) => Err(WdaControlOutcome::InvalidElementTarget),
+        Err(SnapshotElementTapError::BeforeDispatch(error)) => {
+            w.invalidate_session();
+            tracing::warn!("wda {context} failed before dispatch: {error:#}");
+            Err(WdaControlOutcome::NotSent)
+        }
+        Err(SnapshotElementTapError::AfterDispatch(error)) => Ok(Err(error)),
+    }
 }
 
 fn element_center(row: &crate::wda::ElementRow) -> Option<(f64, f64)> {
@@ -2937,10 +3109,13 @@ fn snapshot_row_locator(row: &crate::wda::ElementRow) -> Option<AgentElementLoca
     })
 }
 
-async fn tap_snapshot_element(
+/// Parse a snapshot-bound target (`{"element":N,"snapshot":"…"}`), re-read the
+/// live tree, and require the snapshot token to still match before any
+/// mutation. Returns the fresh rows plus the selected index.
+async fn fetch_snapshot_row(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
-) -> Result<(), SnapshotElementTapError> {
+) -> Result<(Vec<crate::wda::ElementRow>, usize), SnapshotElementTapError> {
     let index = value
         .get("element")
         .and_then(serde_json::Value::as_u64)
@@ -2961,8 +3136,37 @@ async fn tap_snapshot_element(
     if current_snapshot != expected_snapshot {
         return Err(SnapshotElementTapError::Stale);
     }
+    if index >= rows.len() {
+        return Err(SnapshotElementTapError::Invalid);
+    }
+    Ok((rows, index))
+}
 
-    let row = rows.get(index).ok_or(SnapshotElementTapError::Invalid)?;
+/// Resolve a fresh snapshot row to exactly one live WDA element through its
+/// semantic locator. Rows without semantics cannot be addressed this way.
+async fn resolve_snapshot_row_element(
+    w: &mut crate::wda::WdaClient,
+    row: &crate::wda::ElementRow,
+) -> Result<String, SnapshotElementTapError> {
+    let locator = snapshot_row_locator(row).ok_or(SnapshotElementTapError::InvalidTarget)?;
+    let (using, value) = locator_wda_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
+    let element_ids = w
+        .find_elements(using, &value)
+        .await
+        .map_err(SnapshotElementTapError::BeforeDispatch)?;
+    match element_ids.as_slice() {
+        [] => Err(SnapshotElementTapError::NotFound),
+        [element_id] => Ok(element_id.clone()),
+        _ => Err(SnapshotElementTapError::Ambiguous),
+    }
+}
+
+async fn tap_snapshot_element(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+) -> Result<(), SnapshotElementTapError> {
+    let (rows, index) = fetch_snapshot_row(w, value).await?;
+    let row = &rows[index];
     if let Some(locator) = snapshot_row_locator(row) {
         // System-owned sheets and document pickers can publish stale or offset
         // rectangles while their native XCUIElement remains clickable. The
@@ -2987,6 +3191,91 @@ async fn tap_snapshot_element(
 
     let (x, y) = element_center(row).ok_or(SnapshotElementTapError::Invalid)?;
     w.tap_point(x, y)
+        .await
+        .map_err(SnapshotElementTapError::AfterDispatch)
+}
+
+/// `{"type":"set_value","element":N,"snapshot":"…","value":"…"}` — write a text
+/// field's contents directly through WDA's `element/:id/value` instead of the
+/// focus-tap-then-type dance. Clears first so the value REPLACES stale text;
+/// an empty string means "clear the field".
+async fn set_value_snapshot_element(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+) -> Result<(), SnapshotElementTapError> {
+    let text = value
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(SnapshotElementTapError::Invalid)?
+        .to_string();
+    let (rows, index) = fetch_snapshot_row(w, value).await?;
+    let element_id = resolve_snapshot_row_element(w, &rows[index]).await?;
+    if text.is_empty() {
+        // Clearing IS the requested mutation — report its real outcome.
+        return w
+            .clear_element(&element_id)
+            .await
+            .map_err(SnapshotElementTapError::AfterDispatch);
+    }
+    // Clear-then-type is one intentional compound action (same contract as
+    // `text` with `clear:true`): the clear is best-effort, the type is still
+    // dispatched at most once.
+    if let Err(error) = w.clear_element(&element_id).await {
+        tracing::warn!("wda clear_element before set_value: {error:#}");
+    }
+    w.type_into(&element_id, &text)
+        .await
+        .map_err(SnapshotElementTapError::AfterDispatch)
+}
+
+/// Shared swipe-travel curve: how far a scroll gesture actually moves for a
+/// requested delta `d` along an axis of the given size.
+fn swipe_travel(d: f64, axis: f64) -> f64 {
+    if d == 0.0 {
+        0.0
+    } else {
+        (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
+    }
+}
+
+/// `{"type":"scroll","element":N,"snapshot":"…","dx":…,"dy":…}` — scroll INSIDE
+/// a specific element's rectangle (both gesture endpoints stay within it), so a
+/// list scrolls without the gesture straying into a neighboring scroll view.
+async fn scroll_snapshot_element(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+) -> Result<(), SnapshotElementTapError> {
+    let dx = value
+        .get("dx")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let dy = value
+        .get("dy")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+        return Err(SnapshotElementTapError::Invalid);
+    }
+    let (rows, index) = fetch_snapshot_row(w, value).await?;
+    let [x, y, width, height] = rows[index].rect;
+    // A meaningful in-element gesture needs room for both endpoints.
+    if ![x, y, width, height].into_iter().all(f64::is_finite) || width < 8.0 || height < 8.0 {
+        return Err(SnapshotElementTapError::InvalidTarget);
+    }
+    let cx = x + width / 2.0;
+    let cy = y + height / 2.0;
+    let tx = swipe_travel(dx, width);
+    let ty = swipe_travel(dy, height);
+    // Same direction convention as full-screen scroll: positive dy starts low
+    // and ends high (content moves down). Endpoints are inset 2pt so the touch
+    // cannot land on the element's border.
+    let x1 = (cx + tx / 2.0).clamp(x + 2.0, x + width - 2.0);
+    let x2 = (cx - tx / 2.0).clamp(x + 2.0, x + width - 2.0);
+    let y1 = (cy + ty / 2.0).clamp(y + 2.0, y + height - 2.0);
+    let y2 = (cy - ty / 2.0).clamp(y + 2.0, y + height - 2.0);
+    let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+    let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
+    w.swipe(x1, y1, x2, y2, duration)
         .await
         .map_err(SnapshotElementTapError::AfterDispatch)
 }
@@ -3138,27 +3427,27 @@ async fn wda_control_with_client(
                 Err(UniqueLabelTapError::AfterDispatch(error)) => Err(error),
             }
         }
-        "tap" if v.get("element").is_some() => match tap_snapshot_element(w, v).await {
-            Ok(()) => Ok(()),
-            Err(SnapshotElementTapError::Invalid) => {
-                return WdaControlOutcome::InvalidElementSnapshot;
+        "tap" if v.get("element").is_some() => {
+            let result = tap_snapshot_element(w, v).await;
+            match snapshot_element_outcome(result, w, "control snapshot tap") {
+                Ok(result) => result,
+                Err(outcome) => return outcome,
             }
-            Err(SnapshotElementTapError::Stale) => {
-                return WdaControlOutcome::StaleElementSnapshot;
+        }
+        "set_value" => {
+            let result = set_value_snapshot_element(w, v).await;
+            match snapshot_element_outcome(result, w, "control set_value") {
+                Ok(result) => result,
+                Err(outcome) => return outcome,
             }
-            Err(SnapshotElementTapError::NotFound) => {
-                return WdaControlOutcome::ElementNotFound;
+        }
+        "scroll" if v.get("element").is_some() => {
+            let result = scroll_snapshot_element(w, v).await;
+            match snapshot_element_outcome(result, w, "control element scroll") {
+                Ok(result) => result,
+                Err(outcome) => return outcome,
             }
-            Err(SnapshotElementTapError::Ambiguous) => {
-                return WdaControlOutcome::AmbiguousElement;
-            }
-            Err(SnapshotElementTapError::BeforeDispatch(error)) => {
-                w.invalidate_session();
-                tracing::warn!("wda control snapshot tap failed before dispatch: {error:#}");
-                return WdaControlOutcome::NotSent;
-            }
-            Err(SnapshotElementTapError::AfterDispatch(error)) => Err(error),
-        },
+        }
         "tap" => {
             match (
                 v.get("x").and_then(|x| x.as_f64()),
@@ -3465,27 +3754,13 @@ async fn direct_agent_action(
                 Err(UniqueLabelTapError::AfterDispatch(error)) => Some(Err(error)),
             }
         }
-        "tap" if value.get("element").is_some() => match tap_snapshot_element(w, value).await {
-            Ok(()) => Some(Ok(())),
-            Err(SnapshotElementTapError::Invalid) => {
-                return WdaControlOutcome::InvalidElementSnapshot;
+        "tap" if value.get("element").is_some() => {
+            let result = tap_snapshot_element(w, value).await;
+            match snapshot_element_outcome(result, w, "agent snapshot tap") {
+                Ok(result) => Some(result),
+                Err(outcome) => return outcome,
             }
-            Err(SnapshotElementTapError::Stale) => {
-                return WdaControlOutcome::StaleElementSnapshot;
-            }
-            Err(SnapshotElementTapError::NotFound) => {
-                return WdaControlOutcome::ElementNotFound;
-            }
-            Err(SnapshotElementTapError::Ambiguous) => {
-                return WdaControlOutcome::AmbiguousElement;
-            }
-            Err(SnapshotElementTapError::BeforeDispatch(error)) => {
-                w.invalidate_session();
-                tracing::warn!("wda agent snapshot tap failed before dispatch: {error:#}");
-                return WdaControlOutcome::NotSent;
-            }
-            Err(SnapshotElementTapError::AfterDispatch(error)) => Some(Err(error)),
-        },
+        }
         "tap_locator" => {
             let Some(locator) = value
                 .get("locator")
@@ -3950,21 +4225,62 @@ fn validate_agent_action_value(
             }
         }
         "scroll" => {
-            let x = action.get("x").map_or(Some(0.5), serde_json::Value::as_f64);
-            let y = action.get("y").map_or(Some(0.5), serde_json::Value::as_f64);
             let dx = action
                 .get("dx")
                 .map_or(Some(0.0), serde_json::Value::as_f64);
             let dy = action
                 .get("dy")
                 .map_or(Some(0.0), serde_json::Value::as_f64);
-            if !finite_unit(x)
-                || !finite_unit(y)
-                || !dx.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
-                || !dy.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
-                || (dx == Some(0.0) && dy == Some(0.0))
+            let valid_deltas = dx.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
+                && dy.is_some_and(|value| value.is_finite() && value.abs() <= 1_000.0)
+                && !(dx == Some(0.0) && dy == Some(0.0));
+            if action.contains_key("element") {
+                // Element-relative scroll: the gesture stays inside that
+                // element's rectangle, so x/y have no meaning here.
+                if action.contains_key("x") || action.contains_key("y") {
+                    return invalid("element scroll does not take x/y coordinates");
+                }
+                if action
+                    .get("element")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                    || !action
+                        .get("snapshot")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|snapshot| {
+                            !snapshot.is_empty() && snapshot.chars().count() <= 200
+                        })
+                {
+                    return invalid("element scroll needs a non-negative element and snapshot");
+                }
+                if !valid_deltas {
+                    return invalid("scroll geometry is invalid");
+                }
+            } else {
+                let x = action.get("x").map_or(Some(0.5), serde_json::Value::as_f64);
+                let y = action.get("y").map_or(Some(0.5), serde_json::Value::as_f64);
+                if !finite_unit(x) || !finite_unit(y) || !valid_deltas {
+                    return invalid("scroll geometry is invalid");
+                }
+            }
+        }
+        "set_value" => {
+            if action
+                .get("element")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+                || !action
+                    .get("snapshot")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|snapshot| !snapshot.is_empty() && snapshot.chars().count() <= 200)
+                || action
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.chars().count() > 1_000)
             {
-                return invalid("scroll geometry is invalid");
+                return invalid(
+                    "set_value needs element, snapshot, and a string value up to 1000 characters",
+                );
             }
         }
         "text" => {
@@ -4689,11 +5005,86 @@ async fn agent_actions(
     )
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AgentInputQuery {
+    /// `delta`: after a successfully applied Direct action, wait for the UI to
+    /// settle and include the resulting element-tree change in the SAME
+    /// response — collapsing the act-then-read round trip pair into one.
+    #[serde(rename = "return", default)]
+    return_mode: Option<String>,
+    /// Explicit baseline snapshot for the returned delta. Defaults to the
+    /// action's own `snapshot` field (present on snapshot-bound actions).
+    #[serde(default)]
+    since: Option<String>,
+    /// Settle budget in milliseconds (default 1200, capped): how long to wait
+    /// for two consecutive identical tree reads before answering.
+    #[serde(default)]
+    settle_ms: Option<u64>,
+}
+
+const AGENT_INPUT_SETTLE_DEFAULT_MS: u64 = 1_200;
+const AGENT_INPUT_SETTLE_MAX_MS: u64 = 5_000;
+
+/// One post-action tree read with a single stale-session retry (mirroring
+/// `/agent/elements`' read loop, but bounded — this runs inside an action's
+/// deadline).
+async fn read_elements_once(
+    w: &mut crate::wda::WdaClient,
+) -> anyhow::Result<(String, Vec<crate::wda::ElementRow>)> {
+    let rows = match w.elements().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            w.invalidate_session();
+            w.elements()
+                .await
+                .map_err(|retry| retry.context(format!("first error: {error:#}")))?
+        }
+    };
+    let id = element_snapshot_id(&rows)?;
+    Ok((id, rows))
+}
+
+/// Wait (bounded) for the post-action UI to quiesce, then return the settled
+/// tree: poll until two consecutive reads hash identically or the budget runs
+/// out, and return the latest read either way.
+async fn settle_and_read_elements(
+    w: &mut crate::wda::WdaClient,
+    budget: std::time::Duration,
+) -> anyhow::Result<(String, Vec<crate::wda::ElementRow>)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    tokio::time::sleep(std::cmp::min(std::time::Duration::from_millis(150), budget)).await;
+    let (mut id, mut rows) = read_elements_once(w).await?;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok((id, rows));
+        }
+        tokio::time::sleep(std::cmp::min(
+            std::time::Duration::from_millis(250),
+            remaining,
+        ))
+        .await;
+        let (next_id, next_rows) = read_elements_once(w).await?;
+        let stable = next_id == id;
+        id = next_id;
+        rows = next_rows;
+        if stable {
+            return Ok((id, rows));
+        }
+    }
+}
+
 /// `POST /agent/input` — inject one control message (same JSON shape as the
 /// WebRTC control channel): `{"type":"tap","x":0.5,"y":0.5}`,
 /// `{"type":"text","text":"hi"}`, `{"type":"scroll","x":..,"y":..,"dx":..,"dy":..}`,
 /// `{"type":"shortcut","name":"home"}`, `{"type":"key","name":"return"}`,
 /// `{"type":"uninstall","bundle":"com.example.app"}` (via devicectl), etc.
+///
+/// `?return=delta` (optional, Direct only): after an applied action the
+/// response also carries the settled post-action element tree — as a `delta`
+/// against `?since=` / the action's own `snapshot` when that baseline is still
+/// cached, else as full `elements` — plus the fresh `snapshot` token. A failed
+/// observation never fails the applied action; it is reported as `delta_error`.
 ///
 /// Coordinates are normalized `[0,1]` over the phone content rect (geometry-agnostic,
 /// like the web client). Acquiring an `Agent` control lease makes the injector gate
@@ -4701,6 +5092,7 @@ async fn agent_actions(
 /// wins). Returns 200 on accept, 400 on an unparseable message.
 async fn agent_input(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<AgentInputQuery>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -4964,6 +5356,7 @@ async fn agent_input(
         let _priority = state.begin_wda_control();
         let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dispatch_marker = dispatched.clone();
+        let want_delta = query.return_mode.as_deref() == Some("delta");
         let outcome = tokio::time::timeout_at(agent_wda_deadline, async {
             let mut client = wda.lock().await;
             if tokio::time::Instant::now() >= agent_wda_deadline
@@ -4973,11 +5366,34 @@ async fn agent_input(
                 return None;
             }
             dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
-            Some(direct_agent_action(&mut client, &state.wda_actionable, &value).await)
+            let outcome = direct_agent_action(&mut client, &state.wda_actionable, &value).await;
+            // Post-action observation (`?return=delta`), in the SAME lock scope
+            // so no other control interleaves between the action and its read.
+            // The budget stays under the endpoint deadline with a safety margin
+            // so a slow observation can never turn an applied action into an
+            // "outcome unknown" timeout.
+            let mut settled = None;
+            if want_delta && outcome == WdaControlOutcome::Applied {
+                let requested = query
+                    .settle_ms
+                    .unwrap_or(AGENT_INPUT_SETTLE_DEFAULT_MS)
+                    .min(AGENT_INPUT_SETTLE_MAX_MS);
+                let remaining = agent_wda_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .saturating_sub(std::time::Duration::from_secs(3));
+                let budget = std::cmp::min(std::time::Duration::from_millis(requested), remaining);
+                settled = Some(
+                    settle_and_read_elements(&mut client, budget)
+                        .await
+                        .map(|(snapshot, rows)| (snapshot, Arc::new(rows)))
+                        .map_err(|error| format!("{error:#}")),
+                );
+            }
+            Some((outcome, settled))
         })
         .await;
-        let outcome = match outcome {
-            Ok(Some(outcome)) => outcome,
+        let (outcome, settled) = match outcome {
+            Ok(Some(pair)) => pair,
             Ok(None) => return wda_deadline_response(false),
             Err(_) => {
                 return wda_deadline_response(
@@ -4986,12 +5402,57 @@ async fn agent_input(
             }
         };
         return match outcome {
-            WdaControlOutcome::Applied => with_security_headers(
-                Response::builder()
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"ok":true,"transport":"wda"}"#))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-            ),
+            WdaControlOutcome::Applied => {
+                let body = match settled {
+                    None => r#"{"ok":true,"transport":"wda"}"#.to_string(),
+                    // The action DID apply; a failed observation is reported
+                    // alongside the success, never as a failure.
+                    Some(Err(error)) => serde_json::json!({
+                        "ok": true,
+                        "transport": "wda",
+                        "delta_error": error,
+                    })
+                    .to_string(),
+                    Some(Ok((snapshot, rows))) => {
+                        remember_element_snapshot(&state, &snapshot, &rows);
+                        let baseline = query
+                            .since
+                            .as_deref()
+                            .filter(|since| !since.is_empty())
+                            .or_else(|| value.get("snapshot").and_then(serde_json::Value::as_str))
+                            .and_then(|since| {
+                                lookup_element_snapshot(&state, since)
+                                    .map(|baseline| (since, baseline))
+                            });
+                        match baseline {
+                            Some((baseline_id, baseline_rows)) => {
+                                let delta = diff_element_rows(&baseline_rows, &rows);
+                                serde_json::json!({
+                                    "ok": true,
+                                    "transport": "wda",
+                                    "snapshot": snapshot,
+                                    "baseline": baseline_id,
+                                    "delta": elements_delta_json(&delta, &rows),
+                                })
+                                .to_string()
+                            }
+                            None => serde_json::json!({
+                                "ok": true,
+                                "transport": "wda",
+                                "snapshot": snapshot,
+                                "elements": &*rows,
+                            })
+                            .to_string(),
+                        }
+                    }
+                };
+                with_security_headers(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                )
+            }
             WdaControlOutcome::NotSent => {
                 mark_wda_read_path_unactionable(&state);
                 wda_failed_before_dispatch_response()
@@ -5095,7 +5556,19 @@ async fn agent_input(
 /// text — an order of magnitude cheaper. Prefer snapshot-bound element indexes;
 /// exact label taps are accepted only when one current row matches. 503 when
 /// WDA is not configured; 502 when it's configured but unreachable.
-async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+///
+/// `?since=<snapshot>` (optional): when the daemon still holds that snapshot's
+/// tree, the response replaces `elements` with a `delta`
+/// (`{added,changed,removed,unchanged}` — see [`diff_element_rows`]) against it
+/// plus the fresh `snapshot` token. iOS trees are large and multi-step flows
+/// change little of them per step, so this is the main token/latency saver.
+/// An unknown or evicted `since` falls back to the full tree, so old callers
+/// and cold caches behave exactly as before.
+async fn agent_elements(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AgentElementsQuery>,
+    headers: HeaderMap,
+) -> Response {
     // The browser's accessible-controls drawer reads the same on-device tree
     // that agents use. It is read-only, so accept the authenticated browser
     // session just like `/agent/status` and `/agent/screenshot`; machine callers
@@ -5215,26 +5688,58 @@ async fn agent_elements(State(state): State<Arc<AppState>>, headers: HeaderMap) 
             );
         }
     };
-    match serde_json::to_string(&serde_json::json!({
-        "screen": screen.map(|(width, height)| serde_json::json!({"width": width, "height": height})),
-        "snapshot": match element_snapshot_id(&rows) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!("serialize WDA element snapshot: {error:#}");
-                return json_body(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
-                );
-            }
-        },
-        "elements": rows,
-    })) {
+    let snapshot = match element_snapshot_id(&rows) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!("serialize WDA element snapshot: {error:#}");
+            return json_body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
+            );
+        }
+    };
+    let rows = Arc::new(rows);
+    remember_element_snapshot(&state, &snapshot, &rows);
+    let screen =
+        screen.map(|(width, height)| serde_json::json!({"width": width, "height": height}));
+    // `?since=` with a still-cached baseline answers with a delta instead of
+    // the full tree; anything else (no param, evicted, unknown) stays the
+    // exact pre-diff response shape.
+    let body = match query
+        .since
+        .as_deref()
+        .filter(|since| !since.is_empty())
+        .and_then(|since| lookup_element_snapshot(&state, since).map(|rows| (since, rows)))
+    {
+        Some((since, baseline)) => {
+            let delta = diff_element_rows(&baseline, &rows);
+            serde_json::json!({
+                "screen": screen,
+                "snapshot": snapshot,
+                "baseline": since,
+                "delta": elements_delta_json(&delta, &rows),
+            })
+        }
+        None => serde_json::json!({
+            "screen": screen,
+            "snapshot": snapshot,
+            "elements": &*rows,
+        }),
+    };
+    match serde_json::to_string(&body) {
         Ok(body) => json_body(StatusCode::OK, body),
         Err(_) => json_body(
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
         ),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AgentElementsQuery {
+    /// Prior `snapshot` token to diff against (see [`agent_elements`]).
+    #[serde(default)]
+    since: Option<String>,
 }
 
 /// A read-path failure is enough to revoke `drivable`, even when the last
@@ -5933,6 +6438,181 @@ mod tests {
 
         changed[0].rect[1] = 120.0;
         assert_ne!(snapshot, element_snapshot_id(&changed).unwrap());
+    }
+
+    fn delta_row(kind: &str, label: &str, y: f64) -> crate::wda::ElementRow {
+        crate::wda::ElementRow {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            identifier: None,
+            rect: [10.0, y, 80.0, 44.0],
+            depth: 2,
+            value: None,
+            enabled: None,
+            visible: None,
+            accessible: None,
+            focused: None,
+            placeholder: None,
+        }
+    }
+
+    #[test]
+    fn diff_identical_trees_is_all_unchanged() {
+        let baseline = vec![
+            delta_row("Button", "继续", 20.0),
+            delta_row("Cell", "设置", 80.0),
+        ];
+        let current = vec![
+            delta_row("Button", "继续", 20.0),
+            delta_row("Cell", "设置", 80.0),
+        ];
+
+        let delta = diff_element_rows(&baseline, &current);
+        assert_eq!(
+            delta,
+            ElementRowsDelta {
+                added: vec![],
+                changed: vec![],
+                removed: vec![],
+                unchanged: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn diff_matches_identity_across_insertion_shift() {
+        // One row inserted at the top must NOT report every later row as
+        // changed — identity matching, not index alignment.
+        let baseline = vec![
+            delta_row("Button", "继续", 20.0),
+            delta_row("Cell", "设置", 80.0),
+        ];
+        let current = vec![
+            delta_row("Other", "新横幅", 0.0),
+            delta_row("Button", "继续", 20.0),
+            delta_row("Cell", "设置", 80.0),
+        ];
+
+        let delta = diff_element_rows(&baseline, &current);
+        assert_eq!(delta.added, vec![0]);
+        assert_eq!(delta.changed, Vec::<usize>::new());
+        assert_eq!(delta.removed, Vec::<usize>::new());
+        assert_eq!(delta.unchanged, 2);
+    }
+
+    #[test]
+    fn diff_reports_changed_state_and_removed_rows() {
+        let baseline = vec![
+            delta_row("Button", "继续", 20.0),
+            delta_row("Cell", "已删除的行", 80.0),
+            delta_row("Switch", "飞行模式", 140.0),
+        ];
+        let mut moved = delta_row("Button", "继续", 20.0);
+        moved.rect[1] = 300.0;
+        let mut toggled = delta_row("Switch", "飞行模式", 140.0);
+        toggled.value = Some("1".to_string());
+        let current = vec![moved, toggled];
+
+        let delta = diff_element_rows(&baseline, &current);
+        assert_eq!(delta.added, Vec::<usize>::new());
+        assert_eq!(delta.changed, vec![0, 1]);
+        assert_eq!(delta.removed, vec![1]);
+        assert_eq!(delta.unchanged, 0);
+    }
+
+    #[test]
+    fn diff_pairs_duplicate_identities_in_document_order() {
+        // Two rows with the same identity (e.g. two unlabeled TextFields):
+        // dropping one is a removal, not a change to the survivor.
+        let baseline = vec![
+            delta_row("TextField", "", 20.0),
+            delta_row("TextField", "", 80.0),
+        ];
+        let current = vec![delta_row("TextField", "", 20.0)];
+
+        let delta = diff_element_rows(&baseline, &current);
+        assert_eq!(delta.added, Vec::<usize>::new());
+        assert_eq!(delta.changed, Vec::<usize>::new());
+        assert_eq!(delta.removed, vec![1]);
+        assert_eq!(delta.unchanged, 1);
+    }
+
+    #[test]
+    fn elements_delta_json_carries_current_rows_with_indexes() {
+        let baseline = vec![delta_row("Button", "继续", 20.0)];
+        let current = vec![
+            delta_row("Other", "横幅", 0.0),
+            delta_row("Button", "继续", 20.0),
+        ];
+        let delta = diff_element_rows(&baseline, &current);
+
+        let json = elements_delta_json(&delta, &current);
+        assert_eq!(json["unchanged"], 1);
+        assert_eq!(json["removed"].as_array().unwrap().len(), 0);
+        let added = json["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["index"], 0);
+        assert_eq!(added[0]["element"]["label"], "横幅");
+    }
+
+    fn validate_action(value: serde_json::Value) -> Result<(), String> {
+        validate_agent_action_value(value.as_object().unwrap(), 0)
+    }
+
+    #[test]
+    fn validate_scroll_accepts_element_mode_and_rejects_mixed_targets() {
+        assert!(validate_action(
+            serde_json::json!({"type":"scroll","element":3,"snapshot":"abc","dy":120.0})
+        )
+        .is_ok());
+        // Element scroll with coordinates is contradictory.
+        assert!(validate_action(
+            serde_json::json!({"type":"scroll","element":3,"snapshot":"abc","x":0.5,"dy":120.0})
+        )
+        .is_err());
+        // Element scroll still needs a snapshot and a non-zero delta.
+        assert!(
+            validate_action(serde_json::json!({"type":"scroll","element":3,"dy":120.0})).is_err()
+        );
+        assert!(
+            validate_action(serde_json::json!({"type":"scroll","element":3,"snapshot":"abc"}))
+                .is_err()
+        );
+        // The classic coordinate mode is untouched.
+        assert!(
+            validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dy":80.0})).is_ok()
+        );
+        assert!(validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5})).is_err());
+    }
+
+    #[test]
+    fn validate_set_value_requires_element_snapshot_and_bounded_value() {
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","element":2,"snapshot":"abc","value":"你好"})
+        )
+        .is_ok());
+        // Empty string means "clear the field" and is valid.
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","element":2,"snapshot":"abc","value":""})
+        )
+        .is_ok());
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","snapshot":"abc","value":"你好"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","element":2,"value":"你好"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","element":2,"snapshot":"abc"})
+        )
+        .is_err());
+        let oversized = "字".repeat(1_001);
+        assert!(validate_action(
+            serde_json::json!({"type":"set_value","element":2,"snapshot":"abc","value":oversized})
+        )
+        .is_err());
     }
 
     #[test]
