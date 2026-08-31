@@ -151,6 +151,36 @@ impl WdaClient {
                 .await
                 .context("POST /session body")?;
             self.session = Some(parse_session_id(&text)?);
+            // Opt-in bounded-snapshot settings (issue #44): apps with an
+            // enormous accessibility tree (hardware-reported with KakaoTalk)
+            // can make WDA's hierarchy snapshot run so long that testmanagerd
+            // kills the whole runner (`** BUILD INTERRUPTED **`) and the
+            // device goes blocked. WDA's `snapshotMaxDepth` /
+            // `customSnapshotTimeout` settings live in its process-global
+            // configuration, so applying them once per session also bounds the
+            // session-less `/source` reads behind `/agent/elements`. Off by
+            // default — behavior is byte-identical unless the operator sets
+            // the env vars. Best-effort: a failure to apply must not take
+            // down session creation.
+            if let Some(settings) = snapshot_settings_from_env() {
+                let sid = self.session.as_deref().unwrap().to_string();
+                let result = self
+                    .http
+                    .post(format!("{}/session/{}/appium/settings", self.base, sid))
+                    .json(&serde_json::json!({ "settings": settings }))
+                    .send()
+                    .await;
+                match result {
+                    Ok(response) => {
+                        if let Err(error) =
+                            ensure_wda_success(response, "POST /appium/settings (snapshot)").await
+                        {
+                            tracing::warn!("apply WDA snapshot settings: {error:#}");
+                        }
+                    }
+                    Err(error) => tracing::warn!("apply WDA snapshot settings: {error:#}"),
+                }
+            }
         }
         Ok(self.session.as_deref().unwrap())
     }
@@ -841,6 +871,31 @@ impl WdaClient {
         ensure_wda_success(response, "POST wda/lock").await?;
         Ok(())
     }
+}
+
+/// Bounded-snapshot WDA settings from the environment (issue #44), applied
+/// once per created session. `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` maps to
+/// WDA's `snapshotMaxDepth` (tree levels; WDA's own default is 50) and
+/// `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` to `customSnapshotTimeout` (seconds;
+/// WDA's default 15). Unset or unparseable values are simply omitted, so the
+/// default daemon applies no settings at all.
+fn snapshot_settings_from_env() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut settings = serde_json::Map::new();
+    if let Some(depth) = std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|depth| *depth > 0)
+    {
+        settings.insert("snapshotMaxDepth".to_string(), depth.into());
+    }
+    if let Some(timeout) = std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|timeout| timeout.is_finite() && *timeout > 0.0)
+    {
+        settings.insert("customSnapshotTimeout".to_string(), timeout.into());
+    }
+    (!settings.is_empty()).then_some(settings)
 }
 
 /// One row of the flattened element tree.

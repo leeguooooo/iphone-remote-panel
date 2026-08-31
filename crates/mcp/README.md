@@ -56,6 +56,12 @@ cargo build --release -p iphone-use-mcp
 }
 ```
 
+**Telling resident processes apart** (issue #46): with several agent sessions
+open, `ps` shows many identical `iphone-use-mcp` rows. Add an optional
+`"args": ["--label", "my-project"]` to the server entry — the tag is ignored
+functionally but appears in `ps`/Activity Monitor argv, so each process is
+attributable to its session or project.
+
 ### Claude Code (project `.claude/settings.json` or `~/.claude/settings.json`)
 
 ```json

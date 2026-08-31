@@ -29,6 +29,12 @@ mod types;
     about = "MCP bridge and deterministic flow runner for iphone-use"
 )]
 struct Cli {
+    /// Free-form identity tag shown in `ps` output (issue #46). The server
+    /// ignores the value; passing e.g. `--label my-project` from your MCP
+    /// client config makes each of many otherwise-identical resident
+    /// `iphone-use-mcp` processes attributable to its session/project.
+    #[arg(long, value_name = "TAG")]
+    label: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -83,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the daemon client from env.
     let daemon = client::DaemonClient::from_env();
-    tracing::info!(url = %daemon.base_url(), "iphone-use-mcp starting");
+    tracing::info!(
+        url = %daemon.base_url(),
+        label = cli.label.as_deref().unwrap_or(""),
+        "iphone-use-mcp starting"
+    );
 
     // Run until the MCP client closes the pipe.
     let handler = server::PhoneHandler::new(daemon);
