@@ -70,7 +70,7 @@ and is not a Direct readiness signal.
 | Call | Purpose |
 |---|---|
 | `GET /agent/status` | `{ok, backend, device_state, screen_state, wda, wda_actionable, wda_locked, drivable, released, hint, setup_blocked_on, setup_phase, setup_message, …}` — gate on **`drivable`** |
-| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read |
+| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree) |
 | `GET /agent/screenshot` | Current phone screen as a device-side PNG; no Mirroring session required |
 | `POST /agent/input` | One action (JSON body, below); requires `X-Phone-Control: 1` |
 | `POST /agent/actions` | One bounded, fail-closed sequence of `action`, `wait_for`, and short `pause` steps; Direct/WDA only; requires `X-Phone-Control: 1` |
@@ -92,7 +92,18 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"key",
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'      # home|spotlight
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"longpress","x":0.4,"y":0.6,"duration_ms":700}'
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'                     # dismiss the on-screen keyboard
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"set_value","element":5,"snapshot":"…","value":"你好"}'  # write a field directly (clear-then-type; "" clears); no focus tap, no keyboard dance
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"scroll","element":7,"snapshot":"…","dy":120}'          # scroll INSIDE that element's rect — never strays into a neighboring scroll view
 ```
+
+**Halve the round trips**: `POST /agent/input?return=delta` makes an applied
+action settle briefly and return the post-action element change in the same
+response — `{"ok":true,"snapshot":…,"baseline":…,"delta":{…}}` when the
+baseline (the `since` query param, or the action's own `snapshot` field) is
+still server-cached, else full `elements`. That replaces the separate
+act-then-`GET /agent/elements` verify pair for routine steps; `delta_error`
+alongside `ok:true` means the action applied but the read failed — verify with
+a normal `GET /agent/elements`.
 
 After typing into a web form the keyboard covers the page's own submit/next
 buttons — send `{"type":"keyboard"}` to dismiss it before tapping them.

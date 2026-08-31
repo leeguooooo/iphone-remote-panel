@@ -377,6 +377,7 @@ fn serve() -> Result<()> {
         wda_lifecycle: Arc::new(http::WdaLifecycle::new()),
         live_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mjpeg_stream_activity: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        element_snapshots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
     });
 
     run_server(cfg, state, dir)
