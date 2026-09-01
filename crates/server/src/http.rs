@@ -3332,7 +3332,18 @@ async fn perform_snapshot_element(
     if !perform_action_kind_permitted(&action, row) {
         return Err(SnapshotElementTapError::InvalidTarget);
     }
-    let element_id = resolve_snapshot_row_element(w, row).await?;
+    // Hardware reality (stock Settings, iOS 27): the ACTUAL UISwitch is a
+    // semantic-less row (empty label, no identifier) sitting beside a labeled
+    // full-row accessibility wrapper whose element-click lands on the row
+    // middle and toggles nothing. So `toggle` must work without a semantic
+    // locator: fall back to the same snapshot-bound coordinate tap that
+    // `tap` uses for semantic-less rows. Every other perform verb still
+    // requires the semantic resolution.
+    let element_id = match resolve_snapshot_row_element(w, row).await {
+        Ok(element_id) => Some(element_id),
+        Err(SnapshotElementTapError::InvalidTarget) if action == "toggle" => None,
+        Err(error) => return Err(error),
+    };
     let after_dispatch = |error: anyhow::Error| {
         if wda_error_is_missing_element(&error) {
             SnapshotElementTapError::NotFound
@@ -3340,6 +3351,29 @@ async fn perform_snapshot_element(
             SnapshotElementTapError::AfterDispatch(error)
         }
     };
+    if action == "toggle" {
+        return match &element_id {
+            None => {
+                let (x, y) = element_center(row).ok_or(SnapshotElementTapError::InvalidTarget)?;
+                w.tap_point(x, y).await.map_err(after_dispatch)
+            }
+            Some(element_id) => {
+                // A labeled Switch row is usually the full-row wrapper; the
+                // clickable control is its (sole) descendant Switch. Prefer
+                // that; fall back to clicking the resolved element itself.
+                let descendants = w
+                    .find_elements_from(element_id, "class chain", "**/XCUIElementTypeSwitch")
+                    .await
+                    .unwrap_or_default();
+                let target = match descendants.as_slice() {
+                    [switch] if switch != element_id => switch,
+                    _ => element_id,
+                };
+                w.click_element(target).await.map_err(after_dispatch)
+            }
+        };
+    }
+    let element_id = element_id.expect("non-toggle actions always resolve or return above");
     match action.as_str() {
         "increment" | "decrement" => match row.kind.as_str() {
             "PickerWheel" => {
@@ -3409,7 +3443,6 @@ async fn perform_snapshot_element(
                 .await
                 .map_err(after_dispatch)
         }
-        "toggle" => w.click_element(&element_id).await.map_err(after_dispatch),
         "menu" => {
             // The element-scoped secondary-action surface on iOS IS the
             // long-press context menu.
