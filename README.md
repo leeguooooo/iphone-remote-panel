@@ -216,6 +216,8 @@ the heaviest users make the product better.
 | `PHONE_REMOTE_WDA_MANAGED` | on for Direct loopback endpoints | Whether this daemon owns the local WDA supervisor/relay lifecycle. Remote endpoints must be externally managed. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | *(unset — WDA default 50)* | Opt-in bound on WDA's accessibility snapshot depth (`snapshotMaxDepth`), applied once per WDA session. Try `20`–`30` if an app with an enormous tree (e.g. KakaoTalk, issue #44) kills the runner during `/agent/elements`. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` | *(unset — WDA default 15)* | Opt-in bound on WDA's snapshot resolution time in seconds (`customSnapshotTimeout`), so an oversized snapshot fails that one request instead of wedging until testmanagerd kills the runner. |
+| `PHONE_REMOTE_ELEMENTS_AFFORDANCES` | *(unset — off)* | Set `1` to enrich `/agent/elements` rows with sparse action affordances derived from the accessibility traits WDA already sends: `actions` (e.g. `["increment","decrement","adjust"]` on sliders/steppers/picker wheels, `["toggle"]` on switches), `selected` (tab bars/segmented controls), and `min`/`max` (slider/stepper range). Off = byte-identical JSON. |
+| `PHONE_REMOTE_ELEMENTS_TRAITS` | *(unset — off)* | Set `1` to also emit each row's verbatim accessibility `traits` names (debugging/forward-compat; most duplicate `kind`). |
 | `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | After this many seconds without agent activity or a live viewer, stop the WDA runner so the phone is free for hands-on use. Reconnect starts it again; unlock the phone if required. Set `0` to keep WDA running. |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | Legacy mirror/WebRTC Cloudflare TURN credentials. Not used by the direct MJPEG path. |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | Legacy mirror/WebRTC static TURN credentials. |
@@ -246,7 +248,7 @@ The bundled web and MCP clients add the header automatically.
 | `GET` | `/agent/intents` | The curated semantic-intent registry (`~/.iphone-use/intents-registry.json`), served per request. A missing file returns an empty list with a setup hint, never an error; malformed entries are skipped fail-closed. |
 | `POST` | `/agent/intent` | Requires bearer auth and the mutation header. Dispatches one registered verb (`{"name":"battery","args":{}}`) by opening a `shortcuts://run-shortcut` deep link on-device through WDA's sessionless `POST /url`; the bridge shortcut's result arrives on `/agent/inbox`, matched by the returned `id`. First use of each verb needs one interactive permission blessing on the phone, and the Shortcuts app foregrounds during a call. Errors carry the honest `outcome`/`retry_safe` taxonomy; a devicectl fallback is only ever a hint, never auto-dispatched. |
 | `GET` | `/agent/screenshot` | Current phone screen as PNG from the on-device path. |
-| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
+| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Both shapes include a read-only `ax_stats` block (`n`, `n_interactive`, `labeled_frac`, `coverage`, `container_only`, `max_depth`) so clients can judge tree usability before falling back to vision. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
 
 Gate actions on **`drivable`** and, for direct mode, require
 `backend:"direct"` plus `wda_actionable:true`. `phone_target`, `mirror_state`, and
@@ -277,6 +279,19 @@ field's contents directly through WDA (clear-then-type; empty string clears), an
 `scroll` with `element`+`snapshot` keeps both gesture endpoints inside that element's
 rectangle so a list scrolls without straying into a neighboring scroll view. Both are
 snapshot-bound and fail closed exactly like indexed taps.
+`perform` (`{"type":"perform","element":N,"snapshot":"…","action":"…"}`) invokes a
+named affordance on a snapshot-bound element through WDA's element-scoped routes:
+`increment`/`decrement` (picker wheels, steppers, sliders), `adjust` (set a picker
+wheel's value, or a slider's normalized 0–1 position, via `"value"`), `toggle`
+(switches), `menu` (long-press context menu, optional `duration_ms`), `double_tap`,
+`two_finger_tap`, `scroll_to_visible`, `pinch` (`scale`, optional `velocity`),
+`rotate` (`rotation` radians, optional `velocity`), and `force_press` (optional
+`pressure`+`duration_ms`). An unknown action name returns
+`422 unsupported_perform_action` without dispatching; an element that cannot carry
+the action returns `invalid_element_target`. With
+`PHONE_REMOTE_ELEMENTS_AFFORDANCES=1`, `/agent/elements` rows advertise their
+non-default actions (plus `selected` and `min`/`max`) so an agent can discover them
+without vision.
 `POST /agent/input?return=delta` (optionally `&since=<snapshot>&settle_ms=<ms>`)
 settles after an applied action and returns `snapshot` plus a `delta` against the
 baseline (or full `elements` when no baseline is cached) in the same response —

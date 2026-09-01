@@ -351,6 +351,200 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Find ALL elements matching a locator UNDER an already-resolved element
+    /// (`POST .../element/:id/elements`), in document order. Used to address a
+    /// composite control's children (e.g. a Stepper's Increment/Decrement
+    /// buttons) without widening the search to the whole tree.
+    pub async fn find_elements_from(
+        &mut self,
+        element_id: &str,
+        using: &str,
+        value: &str,
+    ) -> Result<Vec<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!(
+                "{}/session/{}/element/{}/elements",
+                self.base, sid, element_id
+            ))
+            .json(&serde_json::json!({ "using": using, "value": value }))
+            .send()
+            .await
+            .context("POST element/elements")?;
+        let value = ensure_wda_success(response, "POST element/elements").await?;
+        let elements = value
+            .as_array()
+            .ok_or_else(|| anyhow!("POST element/elements returned non-array value: {value}"))?;
+        Ok(elements
+            .iter()
+            .filter_map(|e| {
+                e.get("ELEMENT")
+                    .or_else(|| e.get("element-6066-11e4-a52e-4f735466cecf"))
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .collect())
+    }
+
+    /// POST one element-scoped `/wda/element/:id/<command>` gesture. Every
+    /// call sends a JSON body (at least `{}`) because a bodyless POST is
+    /// rejected with 400 by current WDA builds (see [`Self::clear_element`]).
+    async fn post_element_gesture(
+        &mut self,
+        element_id: &str,
+        command: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let operation = format!("POST wda/element/{command}");
+        let response = self
+            .http
+            .post(format!(
+                "{}/session/{}/wda/element/{}/{}",
+                self.base, sid, element_id, command
+            ))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| operation.clone())?;
+        ensure_wda_success(response, &operation).await?;
+        Ok(())
+    }
+
+    /// Long-press an element (`POST .../wda/element/:id/touchAndHold`) — the
+    /// element-scoped context-menu ("secondary action") gesture. WDA computes
+    /// the geometry, so this is immune to stale source-tree rectangles.
+    pub async fn touch_and_hold_element(
+        &mut self,
+        element_id: &str,
+        duration_s: f64,
+    ) -> Result<()> {
+        self.post_element_gesture(
+            element_id,
+            "touchAndHold",
+            serde_json::json!({ "duration": duration_s }),
+        )
+        .await
+    }
+
+    /// Double-tap an element (`POST .../wda/element/:id/doubleTap`).
+    pub async fn double_tap_element(&mut self, element_id: &str) -> Result<()> {
+        self.post_element_gesture(element_id, "doubleTap", serde_json::json!({}))
+            .await
+    }
+
+    /// Two-finger tap an element (`POST .../wda/element/:id/twoFingerTap`).
+    pub async fn two_finger_tap_element(&mut self, element_id: &str) -> Result<()> {
+        self.post_element_gesture(element_id, "twoFingerTap", serde_json::json!({}))
+            .await
+    }
+
+    /// Scroll an element into view (`POST .../wda/element/:id/scrollTo`).
+    pub async fn scroll_element_to_visible(&mut self, element_id: &str) -> Result<()> {
+        self.post_element_gesture(element_id, "scrollTo", serde_json::json!({}))
+            .await
+    }
+
+    /// Pinch an element (`POST .../wda/element/:id/pinch`). `scale` above 1
+    /// zooms in, below 1 zooms out; XCUITest wants `velocity`'s sign to match.
+    pub async fn pinch_element(
+        &mut self,
+        element_id: &str,
+        scale: f64,
+        velocity: f64,
+    ) -> Result<()> {
+        self.post_element_gesture(
+            element_id,
+            "pinch",
+            serde_json::json!({ "scale": scale, "velocity": velocity }),
+        )
+        .await
+    }
+
+    /// Rotate an element (`POST .../wda/element/:id/rotate`). `rotation` is in
+    /// radians; XCUITest wants `velocity`'s sign to match the rotation's.
+    pub async fn rotate_element(
+        &mut self,
+        element_id: &str,
+        rotation: f64,
+        velocity: f64,
+    ) -> Result<()> {
+        self.post_element_gesture(
+            element_id,
+            "rotate",
+            serde_json::json!({ "rotation": rotation, "velocity": velocity }),
+        )
+        .await
+    }
+
+    /// Force-press an element (`POST .../wda/element/:id/forceTouch`). WDA
+    /// treats `pressure` and `duration` as a pair, so a caller providing
+    /// either gets both (defaults: pressure 1.0, duration 0.5 s); providing
+    /// neither sends the plain default force press.
+    pub async fn force_touch_element(
+        &mut self,
+        element_id: &str,
+        pressure: Option<f64>,
+        duration_s: Option<f64>,
+    ) -> Result<()> {
+        let body = if pressure.is_some() || duration_s.is_some() {
+            serde_json::json!({
+                "pressure": pressure.unwrap_or(1.0),
+                "duration": duration_s.unwrap_or(0.5),
+            })
+        } else {
+            serde_json::json!({})
+        };
+        self.post_element_gesture(element_id, "forceTouch", body)
+            .await
+    }
+
+    /// Move a picker wheel one notch (`POST .../wda/pickerwheel/:id/select`).
+    /// `order` is `"next"` (increment) or `"previous"` (decrement); `offset`
+    /// is WDA's tap offset from the wheel's center (0.2 is its documented
+    /// sweet spot for one-notch moves).
+    pub async fn pickerwheel_select(
+        &mut self,
+        element_id: &str,
+        order: &str,
+        offset: f64,
+    ) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!(
+                "{}/session/{}/wda/pickerwheel/{}/select",
+                self.base, sid, element_id
+            ))
+            .json(&serde_json::json!({ "order": order, "offset": offset }))
+            .send()
+            .await
+            .context("POST wda/pickerwheel/select")?;
+        ensure_wda_success(response, "POST wda/pickerwheel/select").await?;
+        Ok(())
+    }
+
+    /// Adjust a wheel/slider by POSTing a BARE `{"value":[…]}` to
+    /// `element/:id/value` — no `text` key, exactly like [`Self::set_picker`]:
+    /// the extra `text` makes WDA keyboard-type instead of calling
+    /// `adjustToPickerWheelValue:` / `adjustToNormalizedSliderPosition:`.
+    pub async fn adjust_element_value(&mut self, element_id: &str, value: &str) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!(
+                "{}/session/{}/element/{}/value",
+                self.base, sid, element_id
+            ))
+            .json(&serde_json::json!({ "value": [value] }))
+            .send()
+            .await
+            .context("POST element/value (adjust)")?;
+        ensure_wda_success(response, "POST element/value (adjust)").await?;
+        Ok(())
+    }
+
     /// Coordinate tap via the W3C Actions API (`POST /session/<id>/actions`, a
     /// touch down-up at the point). Useful when there's no addressable element;
     /// still synthesized on the phone, so no host-cursor contention. Coords are
@@ -880,6 +1074,28 @@ impl WdaClient {
         Err(last_err.unwrap_or_else(|| anyhow!("element not found: {label}")))
     }
 
+    /// One element's frame in WDA points (`GET .../element/:id/rect`).
+    /// Used to match a semantic-less source-tree row onto its live XCUIElement
+    /// when nothing but geometry identifies it (e.g. a bare `UISwitch`).
+    pub async fn element_rect(&mut self, element_id: &str) -> Result<[f64; 4]> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .get(format!(
+                "{}/session/{}/element/{}/rect",
+                self.base, sid, element_id
+            ))
+            .send()
+            .await
+            .context("GET element/rect")?;
+        let value = ensure_wda_success(response, "GET element/rect").await?;
+        let g = |k: &str| value.get(k).and_then(serde_json::Value::as_f64);
+        match (g("x"), g("y"), g("width"), g("height")) {
+            (Some(x), Some(y), Some(w), Some(h)) => Ok([x, y, w, h]),
+            _ => Err(anyhow!("GET element/rect returned bad frame: {value}")),
+        }
+    }
+
     /// Drop the cached session (e.g. after an error that suggests it went
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {
@@ -930,7 +1146,7 @@ fn snapshot_settings_from_env() -> Option<serde_json::Map<String, serde_json::Va
 }
 
 /// One row of the flattened element tree.
-#[derive(Debug, serde::Serialize, PartialEq)]
+#[derive(Debug, Default, serde::Serialize, PartialEq)]
 pub struct ElementRow {
     /// Element type without the `XCUIElementType` prefix (e.g. `Button`).
     pub kind: String,
@@ -969,6 +1185,29 @@ pub struct ElementRow {
     /// Text-input placeholder when WDA exposes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Derived non-default affordances (`PHONE_REMOTE_ELEMENTS_AFFORDANCES=1`
+    /// only): the named `perform` actions this element supports beyond the
+    /// universal tap/longpress family, from `type` + accessibility traits +
+    /// min/max — e.g. `["increment","decrement","adjust"]`. Emitted only for
+    /// kinds the daemon can actually drive, so plain Buttons/Cells/StaticText
+    /// emit nothing and the default JSON stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
+    /// From the `Selected` accessibility trait (tab bars, segmented controls,
+    /// filter chips); only `true` is emitted. Affordances flag only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// Slider/Stepper range, parsed from WDA's `minValue`/`maxValue` strings.
+    /// Affordances flag only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Verbatim accessibility trait names (`PHONE_REMOTE_ELEMENTS_TRAITS=1`
+    /// only, for debugging/forward-compat) — most values duplicate `kind`, so
+    /// this is not part of the default or affordances payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traits: Option<Vec<String>>,
 }
 
 fn wda_bool(node: &serde_json::Value, key: &str) -> Option<bool> {
@@ -996,23 +1235,112 @@ fn non_empty_string(node: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Element kinds an agent can act on directly. Shared between the tree
+/// flattener (row inclusion) and the `/agent/elements` `ax_stats` block
+/// (`n_interactive`), so the two can never drift apart.
+pub const INTERACTIVE_KINDS: [&str; 11] = [
+    "Button",
+    "Cell",
+    "TextField",
+    "SecureTextField",
+    "SearchField",
+    "Switch",
+    "Slider",
+    "TextView",
+    "PickerWheel",
+    "Picker",
+    "Stepper",
+];
+
+/// A finite number WDA emits either natively or as an `NSNumber.stringValue`
+/// string (`minValue`/`maxValue` arrive as strings on v9.15.3).
+fn wda_number(node: &serde_json::Value, key: &str) -> Option<f64> {
+    match node.get(key)? {
+        serde_json::Value::Number(value) => value.as_f64(),
+        serde_json::Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+/// The node's `UIAccessibilityTraits` names, from WDA's comma-separated
+/// `traits` string (e.g. `"Button, Selected"`).
+fn node_traits(node: &serde_json::Value) -> Vec<String> {
+    node.get("traits")
+        .and_then(serde_json::Value::as_str)
+        .map(|traits| {
+            traits
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Derive the sparse non-default `perform` affordances for one element.
+///
+/// Only kinds the daemon can actually drive are listed (a bare `Adjustable`
+/// trait on an `Other` row has no reachable WDA increment path, so emitting
+/// it would advertise an action `perform` must refuse). Universal gestures
+/// (tap, longpress/menu, double_tap, swipes) are deliberately NOT listed per
+/// row — `perform` still accepts them everywhere.
+fn derived_actions(
+    kind: &str,
+    traits: &[String],
+    min: Option<f64>,
+    max: Option<f64>,
+) -> Option<Vec<String>> {
+    let actions: &[&str] = match kind {
+        "PickerWheel" | "Slider" => &["increment", "decrement", "adjust"],
+        "Stepper" => &["increment", "decrement"],
+        "Switch" => &["toggle"],
+        // iOS 17+ marks on/off buttons that are not tree-level Switches.
+        _ if traits.iter().any(|name| name == "ToggleButton") => &["toggle"],
+        // A min/max pair on an otherwise untyped control is Stepper-like.
+        _ if min.is_some() && max.is_some() => &["increment", "decrement"],
+        _ => return None,
+    };
+    Some(actions.iter().map(|action| action.to_string()).collect())
+}
+
+/// Opt-in extras for [`flatten_tree`], read from the environment once per
+/// flatten (mirroring the `snapshot_settings_from_env` opt-in pattern). Both
+/// default to off, which keeps the emitted JSON byte-identical.
+#[derive(Debug, Clone, Copy, Default)]
+struct FlattenOptions {
+    /// `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1`: emit sparse `actions`,
+    /// `selected`, `min`, and `max` derived from traits + min/max values.
+    affordances: bool,
+    /// `PHONE_REMOTE_ELEMENTS_TRAITS=1`: emit the verbatim `traits` names.
+    raw_traits: bool,
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value.trim() == "1")
+}
+
+fn flatten_options_from_env() -> FlattenOptions {
+    FlattenOptions {
+        affordances: env_flag("PHONE_REMOTE_ELEMENTS_AFFORDANCES"),
+        raw_traits: env_flag("PHONE_REMOTE_ELEMENTS_TRAITS"),
+    }
+}
+
 /// Recursively flatten a WDA `/source?format=json` tree, keeping only rows an
 /// agent can act on or learn from: anything with a non-empty label, or an
 /// interactive type. Order is document order (roughly top-to-bottom).
 fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>) {
-    const INTERACTIVE: [&str; 11] = [
-        "Button",
-        "Cell",
-        "TextField",
-        "SecureTextField",
-        "SearchField",
-        "Switch",
-        "Slider",
-        "TextView",
-        "PickerWheel",
-        "Picker",
-        "Stepper",
-    ];
+    flatten_tree_with(node, depth, out, flatten_options_from_env());
+}
+
+fn flatten_tree_with(
+    node: &serde_json::Value,
+    depth: u32,
+    out: &mut Vec<ElementRow>,
+    options: FlattenOptions,
+) {
     let kind = node
         .get("type")
         .and_then(|t| t.as_str())
@@ -1026,7 +1354,7 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
         .or_else(|| node.get("name").and_then(|l| l.as_str()))
         .unwrap_or("")
         .to_string();
-    if !label.is_empty() || INTERACTIVE.contains(&kind.as_str()) {
+    if !label.is_empty() || INTERACTIVE_KINDS.contains(&kind.as_str()) {
         let r = node.get("rect").cloned().unwrap_or_default();
         let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         // Current value/state (issue #20). WDA reports `value` as a string
@@ -1042,6 +1370,26 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
         let visible = wda_bool(node, "isVisible").filter(|value| !value);
         let accessible = wda_bool(node, "isAccessible").filter(|value| *value);
         let focused = wda_bool(node, "isFocused").filter(|value| *value);
+        // Affordance extras (both env-gated; the default daemon parses none of
+        // this and every field stays None → byte-identical serialized rows).
+        let traits = if options.affordances || options.raw_traits {
+            node_traits(node)
+        } else {
+            Vec::new()
+        };
+        let (actions, selected, min, max) = if options.affordances {
+            let min = wda_number(node, "minValue");
+            let max = wda_number(node, "maxValue");
+            (
+                derived_actions(&kind, &traits, min, max),
+                traits.iter().any(|name| name == "Selected").then_some(true),
+                min,
+                max,
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let traits = (options.raw_traits && !traits.is_empty()).then_some(traits);
         out.push(ElementRow {
             kind,
             label,
@@ -1054,11 +1402,16 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
             accessible,
             focused,
             placeholder: non_empty_string(node, "placeholderValue"),
+            actions,
+            selected,
+            min,
+            max,
+            traits,
         });
     }
     if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
         for c in children {
-            flatten_tree(c, depth + 1, out);
+            flatten_tree_with(c, depth + 1, out, options);
         }
     }
 }
@@ -1527,5 +1880,175 @@ mod tests {
         assert!(json.get("visible").is_none());
         assert!(json.get("accessible").is_none());
         assert!(json.get("focused").is_none());
+    }
+
+    /// A tree that carries `traits`/`minValue`/`maxValue`; the affordance
+    /// tests below all parse this one fixture.
+    fn affordance_tree() -> serde_json::Value {
+        serde_json::json!({
+            "type": "XCUIElementTypeApplication",
+            "children": [
+                {"type": "XCUIElementTypeSwitch", "label": "Wi-Fi", "value": "1",
+                 "traits": "Button",
+                 "rect": {"x": 300, "y": 100, "width": 51, "height": 31}},
+                {"type": "XCUIElementTypeSlider", "label": "亮度", "value": "45%",
+                 "traits": "Adjustable", "minValue": "0", "maxValue": "1",
+                 "rect": {"x": 20, "y": 200, "width": 380, "height": 30}},
+                {"type": "XCUIElementTypePickerWheel", "label": "", "value": "三月",
+                 "traits": "Adjustable",
+                 "rect": {"x": 40, "y": 300, "width": 120, "height": 200}},
+                {"type": "XCUIElementTypeStepper", "label": "份数",
+                 "traits": "Adjustable", "minValue": "1", "maxValue": "10",
+                 "rect": {"x": 40, "y": 520, "width": 94, "height": 32}},
+                {"type": "XCUIElementTypeButton", "label": "浏览",
+                 "traits": "Button, Selected",
+                 "rect": {"x": 0, "y": 900, "width": 110, "height": 48}},
+                {"type": "XCUIElementTypeButton", "label": "静音",
+                 "traits": "ToggleButton",
+                 "rect": {"x": 120, "y": 900, "width": 110, "height": 48}},
+                {"type": "XCUIElementTypeOther", "label": "自定义调节",
+                 "traits": "Adjustable",
+                 "rect": {"x": 20, "y": 600, "width": 400, "height": 44}}
+            ]
+        })
+    }
+
+    #[test]
+    fn flatten_default_is_byte_identical_with_traits_present() {
+        // With the affordance flags unset (the default in this test process),
+        // a tree carrying traits/minValue/maxValue must serialize exactly like
+        // the same tree without them — existing snapshot-token hashes and
+        // clients see no difference.
+        let with_extras = affordance_tree();
+        let mut without_extras = with_extras.clone();
+        for child in without_extras["children"].as_array_mut().unwrap() {
+            let child = child.as_object_mut().unwrap();
+            child.remove("traits");
+            child.remove("minValue");
+            child.remove("maxValue");
+        }
+
+        let mut rows = Vec::new();
+        flatten_tree(&with_extras, 0, &mut rows);
+        let mut plain_rows = Vec::new();
+        flatten_tree(&without_extras, 0, &mut plain_rows);
+
+        assert_eq!(rows, plain_rows);
+        assert_eq!(
+            serde_json::to_string(&rows).unwrap(),
+            serde_json::to_string(&plain_rows).unwrap()
+        );
+        assert!(!serde_json::to_string(&rows).unwrap().contains("actions"));
+    }
+
+    #[test]
+    fn flatten_with_affordances_derives_actions_selected_and_range() {
+        let mut rows = Vec::new();
+        flatten_tree_with(
+            &affordance_tree(),
+            0,
+            &mut rows,
+            FlattenOptions {
+                affordances: true,
+                raw_traits: false,
+            },
+        );
+        assert_eq!(rows.len(), 7);
+
+        let by_kind = |kind: &str| rows.iter().find(|row| row.kind == kind).unwrap();
+        assert_eq!(
+            by_kind("Switch").actions.as_deref(),
+            Some(&["toggle".to_string()][..])
+        );
+        let slider = by_kind("Slider");
+        assert_eq!(
+            slider.actions.as_deref(),
+            Some(
+                &[
+                    "increment".to_string(),
+                    "decrement".to_string(),
+                    "adjust".to_string()
+                ][..]
+            )
+        );
+        assert_eq!(slider.min, Some(0.0));
+        assert_eq!(slider.max, Some(1.0));
+        assert_eq!(
+            by_kind("PickerWheel").actions.as_deref(),
+            Some(
+                &[
+                    "increment".to_string(),
+                    "decrement".to_string(),
+                    "adjust".to_string()
+                ][..]
+            )
+        );
+        let stepper = by_kind("Stepper");
+        assert_eq!(
+            stepper.actions.as_deref(),
+            Some(&["increment".to_string(), "decrement".to_string()][..])
+        );
+        assert_eq!(stepper.min, Some(1.0));
+        assert_eq!(stepper.max, Some(10.0));
+
+        // Selected trait → state, not an action; the plain tab Button gets
+        // no actions list at all.
+        let tab = rows.iter().find(|row| row.label == "浏览").unwrap();
+        assert_eq!(tab.selected, Some(true));
+        assert_eq!(tab.actions, None);
+
+        // ToggleButton trait on a Button → toggle.
+        let mute = rows.iter().find(|row| row.label == "静音").unwrap();
+        assert_eq!(mute.actions.as_deref(), Some(&["toggle".to_string()][..]));
+        assert_eq!(mute.selected, None);
+
+        // Bare Adjustable on an untyped row has no reachable WDA increment
+        // path — advertise nothing rather than an action perform must refuse.
+        let custom = by_kind("Other");
+        assert_eq!(custom.actions, None);
+
+        // Raw traits stay behind their own flag.
+        assert!(rows.iter().all(|row| row.traits.is_none()));
+    }
+
+    #[test]
+    fn flatten_with_raw_traits_emits_verbatim_names() {
+        let mut rows = Vec::new();
+        flatten_tree_with(
+            &affordance_tree(),
+            0,
+            &mut rows,
+            FlattenOptions {
+                affordances: false,
+                raw_traits: true,
+            },
+        );
+        let tab = rows.iter().find(|row| row.label == "浏览").unwrap();
+        assert_eq!(
+            tab.traits.as_deref(),
+            Some(&["Button".to_string(), "Selected".to_string()][..])
+        );
+        // Traits alone never derive actions/selected/min/max.
+        assert!(rows.iter().all(|row| row.actions.is_none()
+            && row.selected.is_none()
+            && row.min.is_none()
+            && row.max.is_none()));
+        let switch = rows.iter().find(|row| row.kind == "Switch").unwrap();
+        assert_eq!(switch.traits.as_deref(), Some(&["Button".to_string()][..]));
+    }
+
+    #[test]
+    fn wda_number_parses_nsnumber_strings_and_numbers() {
+        let node = serde_json::json!({
+            "minValue": "0.25",
+            "maxValue": 10,
+            "bad": "wide open",
+            "inf": "inf"
+        });
+        assert_eq!(wda_number(&node, "minValue"), Some(0.25));
+        assert_eq!(wda_number(&node, "maxValue"), Some(10.0));
+        assert_eq!(wda_number(&node, "bad"), None);
+        assert_eq!(wda_number(&node, "inf"), None);
+        assert_eq!(wda_number(&node, "missing"), None);
     }
 }
