@@ -2895,6 +2895,10 @@ enum WdaControlOutcome {
     Applied,
     NotSent,
     Unsupported,
+    /// A `perform` action name outside the allowlist. Terminal like
+    /// `Unsupported`, but with its own error code so an agent can tell "this
+    /// verb does not exist" from "this control message shape is unknown".
+    UnsupportedPerformAction,
     InvalidElementSnapshot,
     StaleElementSnapshot,
     ElementNotFound,
@@ -3259,6 +3263,305 @@ async fn set_value_snapshot_element(
     })
 }
 
+/// The closed `perform` action vocabulary (fail-closed allowlist): named
+/// affordances on a snapshot-bound element that have no coordinate-verb home.
+/// A name outside this list is `unsupported_perform_action`, never a guess.
+const PERFORM_ACTION_NAMES: [&str; 11] = [
+    "increment",
+    "decrement",
+    "adjust",
+    "toggle",
+    "menu",
+    "double_tap",
+    "two_finger_tap",
+    "scroll_to_visible",
+    "pinch",
+    "rotate",
+    "force_press",
+];
+
+/// Whether the matched row can carry a `perform` action at all. Gestures are
+/// universal; the value-shaped verbs are limited to kinds WDA can actually
+/// drive (a plain Button cannot `increment`), surfacing as
+/// `invalid_element_target` without any dispatch.
+fn perform_action_kind_permitted(action: &str, row: &crate::wda::ElementRow) -> bool {
+    match action {
+        "increment" | "decrement" => {
+            matches!(row.kind.as_str(), "PickerWheel" | "Stepper" | "Slider")
+        }
+        "adjust" => matches!(row.kind.as_str(), "PickerWheel" | "Slider"),
+        "toggle" => {
+            row.kind == "Switch"
+                || row
+                    .actions
+                    .as_ref()
+                    .is_some_and(|actions| actions.iter().any(|action| action == "toggle"))
+        }
+        _ => true,
+    }
+}
+
+/// Parse a slider row's current `value` into WDA's normalized 0..1 position.
+/// WDA reports sliders as a percent string (`"45%"`) or a bare fraction.
+fn slider_normalized_position(value: Option<&str>) -> Option<f64> {
+    let value = value?.trim();
+    let position = match value.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f64>().ok()? / 100.0,
+        None => value.parse::<f64>().ok()?,
+    };
+    (position.is_finite() && (0.0..=1.0).contains(&position)).then_some(position)
+}
+
+/// `{"type":"perform","element":N,"snapshot":"…","action":"…"}` — invoke a
+/// named affordance on a snapshot-bound element through WDA's element-scoped
+/// routes (the caller has already checked the action against
+/// [`PERFORM_ACTION_NAMES`]). Reuses the whole fail-closed pipeline: snapshot
+/// token check, semantic re-resolution, and the 404 → `NotFound` remap on
+/// every post-resolution route.
+async fn perform_snapshot_element(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+) -> Result<(), SnapshotElementTapError> {
+    let action = value
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(SnapshotElementTapError::Invalid)?
+        .to_string();
+    let (rows, index) = fetch_snapshot_row(w, value).await?;
+    let row = &rows[index];
+    if !perform_action_kind_permitted(&action, row) {
+        return Err(SnapshotElementTapError::InvalidTarget);
+    }
+    // Hardware reality (stock Settings, iOS 27): the ACTUAL UISwitch is a
+    // semantic-less row (empty label, no identifier) sitting beside a labeled
+    // full-row accessibility wrapper whose element-click lands on the row
+    // middle and toggles nothing. So `toggle` must work without a semantic
+    // locator: fall back to the same snapshot-bound coordinate tap that
+    // `tap` uses for semantic-less rows. Every other perform verb still
+    // requires the semantic resolution.
+    let element_id = match resolve_snapshot_row_element(w, row).await {
+        Ok(element_id) => Some(element_id),
+        Err(SnapshotElementTapError::InvalidTarget) if action == "toggle" => None,
+        Err(error) => return Err(error),
+    };
+    let after_dispatch = |error: anyhow::Error| {
+        if wda_error_is_missing_element(&error) {
+            SnapshotElementTapError::NotFound
+        } else {
+            SnapshotElementTapError::AfterDispatch(error)
+        }
+    };
+    if action == "toggle" {
+        return match &element_id {
+            None => {
+                // A synthesized coordinate tap at the switch's center is
+                // ACKed but does not flip stock Settings switches on iOS 27
+                // (hardware-verified); only an XCUIElement click does. Match
+                // the semantic-less row onto its live element by geometry:
+                // enumerate on-screen Switch elements and pick the one whose
+                // frame equals the row's rect.
+                let candidates = w
+                    .find_elements("class chain", "**/XCUIElementTypeSwitch")
+                    .await
+                    .map_err(SnapshotElementTapError::BeforeDispatch)?;
+                let mut matched = None;
+                for candidate in &candidates {
+                    if let Ok(rect) = w.element_rect(candidate).await {
+                        let close = rect
+                            .iter()
+                            .zip(row.rect.iter())
+                            .all(|(a, b)| (a - b).abs() <= 2.0);
+                        if close {
+                            if matched.is_some() {
+                                return Err(SnapshotElementTapError::Ambiguous);
+                            }
+                            matched = Some(candidate.clone());
+                        }
+                    }
+                }
+                let matched = matched.ok_or(SnapshotElementTapError::NotFound)?;
+                w.click_element(&matched).await.map_err(after_dispatch)
+            }
+            Some(element_id) => {
+                // A labeled Switch row is usually the full-row wrapper; the
+                // clickable control is its (sole) descendant Switch. Prefer
+                // that; fall back to clicking the resolved element itself.
+                let descendants = w
+                    .find_elements_from(element_id, "class chain", "**/XCUIElementTypeSwitch")
+                    .await
+                    .unwrap_or_default();
+                let target = match descendants.as_slice() {
+                    [switch] if switch != element_id => switch,
+                    _ => element_id,
+                };
+                w.click_element(target).await.map_err(after_dispatch)
+            }
+        };
+    }
+    let element_id = element_id.expect("non-toggle actions always resolve or return above");
+    match action.as_str() {
+        "increment" | "decrement" => match row.kind.as_str() {
+            "PickerWheel" => {
+                let order = if action == "increment" {
+                    "next"
+                } else {
+                    "previous"
+                };
+                w.pickerwheel_select(&element_id, order, 0.2)
+                    .await
+                    .map_err(after_dispatch)
+            }
+            "Stepper" => {
+                // A Stepper has no single WDA primitive; its two child
+                // Buttons carry the affordance. Their labels are localized by
+                // iOS ("Increment"/"Decrement" on English devices).
+                let label = if action == "increment" {
+                    "Increment"
+                } else {
+                    "Decrement"
+                };
+                let buttons = w
+                    .find_elements_from(
+                        &element_id,
+                        "class chain",
+                        &format!("**/XCUIElementTypeButton[`label == \"{label}\"`]"),
+                    )
+                    .await
+                    .map_err(SnapshotElementTapError::BeforeDispatch)?;
+                let button = match buttons.as_slice() {
+                    [] => return Err(SnapshotElementTapError::NotFound),
+                    [button] => button.clone(),
+                    _ => return Err(SnapshotElementTapError::Ambiguous),
+                };
+                w.click_element(&button).await.map_err(after_dispatch)
+            }
+            "Slider" => {
+                // No native slider increment: read the current normalized
+                // position from the snapshot row, step 10% of the range, and
+                // let WDA's adjustToNormalizedSliderPosition land it.
+                let position = slider_normalized_position(row.value.as_deref())
+                    .ok_or(SnapshotElementTapError::InvalidTarget)?;
+                let step = if action == "increment" { 0.1 } else { -0.1 };
+                let target = (position + step).clamp(0.0, 1.0);
+                w.adjust_element_value(&element_id, &format!("{target:.3}"))
+                    .await
+                    .map_err(after_dispatch)
+            }
+            _ => Err(SnapshotElementTapError::InvalidTarget),
+        },
+        "adjust" => {
+            let target = value
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(SnapshotElementTapError::Invalid)?;
+            if row.kind == "Slider"
+                && !target
+                    .trim()
+                    .parse::<f64>()
+                    .is_ok_and(|position| position.is_finite() && (0.0..=1.0).contains(&position))
+            {
+                // A slider adjust is a normalized 0..1 position by contract;
+                // anything else would silently clamp on-device.
+                return Err(SnapshotElementTapError::InvalidTarget);
+            }
+            w.adjust_element_value(&element_id, target)
+                .await
+                .map_err(after_dispatch)
+        }
+        "menu" => {
+            // The element-scoped secondary-action surface on iOS IS the
+            // long-press context menu.
+            let duration_ms = value
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(600);
+            let duration_s = (duration_ms as f64 / 1000.0).clamp(0.3, 2.0);
+            w.touch_and_hold_element(&element_id, duration_s)
+                .await
+                .map_err(after_dispatch)
+        }
+        "double_tap" => w
+            .double_tap_element(&element_id)
+            .await
+            .map_err(after_dispatch),
+        "two_finger_tap" => w
+            .two_finger_tap_element(&element_id)
+            .await
+            .map_err(after_dispatch),
+        "scroll_to_visible" => w
+            .scroll_element_to_visible(&element_id)
+            .await
+            .map_err(after_dispatch),
+        "pinch" => {
+            let scale = value
+                .get("scale")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 10.0)
+                .ok_or(SnapshotElementTapError::Invalid)?;
+            let velocity = value
+                .get("velocity")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|velocity| {
+                    velocity.is_finite() && *velocity != 0.0 && velocity.abs() <= 10.0
+                })
+                .unwrap_or(if scale >= 1.0 { 1.0 } else { -1.0 });
+            w.pinch_element(&element_id, scale, velocity)
+                .await
+                .map_err(after_dispatch)
+        }
+        "rotate" => {
+            let rotation = value
+                .get("rotation")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|rotation| {
+                    rotation.is_finite()
+                        && *rotation != 0.0
+                        && rotation.abs() <= std::f64::consts::TAU
+                })
+                .ok_or(SnapshotElementTapError::Invalid)?;
+            let velocity = value
+                .get("velocity")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|velocity| {
+                    velocity.is_finite() && *velocity != 0.0 && velocity.abs() <= 10.0
+                })
+                .unwrap_or_else(|| rotation.signum());
+            w.rotate_element(&element_id, rotation, velocity)
+                .await
+                .map_err(after_dispatch)
+        }
+        "force_press" => {
+            let pressure = match value.get("pressure") {
+                None => None,
+                Some(pressure) => Some(
+                    pressure
+                        .as_f64()
+                        .filter(|pressure| {
+                            pressure.is_finite() && *pressure > 0.0 && *pressure <= 5.0
+                        })
+                        .ok_or(SnapshotElementTapError::Invalid)?,
+                ),
+            };
+            let duration_s = match value.get("duration_ms") {
+                None => None,
+                Some(duration) => Some(
+                    duration
+                        .as_u64()
+                        .filter(|duration| *duration > 0 && *duration <= 10_000)
+                        .ok_or(SnapshotElementTapError::Invalid)? as f64
+                        / 1000.0,
+                ),
+            };
+            w.force_touch_element(&element_id, pressure, duration_s)
+                .await
+                .map_err(after_dispatch)
+        }
+        // The caller allowlists names before dispatch; anything else here is
+        // a programming error, and failing closed beats acting.
+        _ => Err(SnapshotElementTapError::Invalid),
+    }
+}
+
 /// Shared swipe-travel curve: how far a scroll gesture actually moves for a
 /// requested delta `d` along an axis of the given size.
 fn swipe_travel(d: f64, axis: f64) -> f64 {
@@ -3472,6 +3775,22 @@ async fn wda_control_with_client(
         "set_value" => {
             let result = set_value_snapshot_element(w, v).await;
             match snapshot_element_outcome(result, w, "control set_value") {
+                Ok(result) => result,
+                Err(outcome) => return outcome,
+            }
+        }
+        "perform" => {
+            // Fail closed on the verb BEFORE touching the device: an unknown
+            // action name can never become a dispatch.
+            if !v
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| PERFORM_ACTION_NAMES.contains(&action))
+            {
+                return WdaControlOutcome::UnsupportedPerformAction;
+            }
+            let result = perform_snapshot_element(w, v).await;
+            match snapshot_element_outcome(result, w, "control perform") {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
             }
@@ -3714,6 +4033,20 @@ fn ambiguous_element_response() -> Response {
 fn invalid_element_target_response() -> Response {
     element_resolution_response(
         r#"{"ok":false,"error":"invalid_element_target","outcome":"not_sent","retry_safe":true,"hint":"the matched element has no finite positive-size hit target; refresh /agent/elements and choose another locator"}"#,
+    )
+}
+
+fn unsupported_perform_action_response() -> Response {
+    // retry_safe:false mirrors unsupported_control: retrying the identical
+    // input cannot succeed.
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"error":"unsupported_perform_action","outcome":"not_sent","retry_safe":false,"hint":"supported perform actions: increment, decrement, adjust, toggle, menu, double_tap, two_finger_tap, scroll_to_visible, pinch, rotate, force_press"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
 }
 
@@ -4063,6 +4396,9 @@ async fn direct_control(
     }
     if outcome == WdaControlOutcome::InvalidElementTarget {
         return invalid_element_target_response();
+    }
+    if outcome == WdaControlOutcome::UnsupportedPerformAction {
+        return unsupported_perform_action_response();
     }
     with_security_headers(
         Response::builder()
@@ -4416,6 +4752,107 @@ fn validate_agent_action_value(
                     .is_some_and(|column| column.as_u64().is_none_or(|value| value > 20))
             {
                 return invalid("picker needs a value up to 500 characters and column 0 to 20");
+            }
+        }
+        "perform" => {
+            if action
+                .get("element")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+                || !action
+                    .get("snapshot")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|snapshot| !snapshot.is_empty() && snapshot.chars().count() <= 200)
+            {
+                return invalid("perform needs a non-negative element and snapshot");
+            }
+            let Some(name) = action
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| PERFORM_ACTION_NAMES.contains(name))
+            else {
+                return invalid("perform action name is unsupported");
+            };
+            match action.get("value") {
+                Some(value) if name == "adjust" => {
+                    if !value
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty() && value.chars().count() <= 500)
+                    {
+                        return invalid("perform adjust value must contain 1 to 500 characters");
+                    }
+                }
+                Some(_) => return invalid("perform value is only accepted with action adjust"),
+                None if name == "adjust" => {
+                    return invalid("perform adjust requires a value");
+                }
+                None => {}
+            }
+            if let Some(duration) = action.get("duration_ms") {
+                if !matches!(name, "menu" | "force_press") {
+                    return invalid(
+                        "perform duration_ms is only accepted with menu or force_press",
+                    );
+                }
+                if duration
+                    .as_u64()
+                    .is_none_or(|value| value == 0 || value > 10_000)
+                {
+                    return invalid("perform duration_ms must be 1 to 10000");
+                }
+            }
+            match action.get("scale") {
+                Some(scale) => {
+                    if name != "pinch" {
+                        return invalid("perform scale is only accepted with pinch");
+                    }
+                    if !scale
+                        .as_f64()
+                        .is_some_and(|scale| scale.is_finite() && scale > 0.0 && scale <= 10.0)
+                    {
+                        return invalid("perform pinch scale must be above 0 and at most 10");
+                    }
+                }
+                None if name == "pinch" => return invalid("perform pinch requires a scale"),
+                None => {}
+            }
+            match action.get("rotation") {
+                Some(rotation) => {
+                    if name != "rotate" {
+                        return invalid("perform rotation is only accepted with rotate");
+                    }
+                    if !rotation.as_f64().is_some_and(|rotation| {
+                        rotation.is_finite()
+                            && rotation != 0.0
+                            && rotation.abs() <= std::f64::consts::TAU
+                    }) {
+                        return invalid(
+                            "perform rotate rotation must be non-zero within 2*pi radians",
+                        );
+                    }
+                }
+                None if name == "rotate" => return invalid("perform rotate requires a rotation"),
+                None => {}
+            }
+            if let Some(velocity) = action.get("velocity") {
+                if !matches!(name, "pinch" | "rotate") {
+                    return invalid("perform velocity is only accepted with pinch or rotate");
+                }
+                if !velocity.as_f64().is_some_and(|velocity| {
+                    velocity.is_finite() && velocity != 0.0 && velocity.abs() <= 10.0
+                }) {
+                    return invalid("perform velocity must be non-zero within 10");
+                }
+            }
+            if let Some(pressure) = action.get("pressure") {
+                if name != "force_press" {
+                    return invalid("perform pressure is only accepted with force_press");
+                }
+                if !pressure.as_f64().is_some_and(|pressure| {
+                    pressure.is_finite() && pressure > 0.0 && pressure <= 5.0
+                }) {
+                    return invalid("perform pressure must be above 0 and at most 5");
+                }
             }
         }
         _ => return invalid(&format!("has unsupported type {typ:?}")),
@@ -4807,6 +5244,12 @@ async fn agent_actions(
                             "unsupported_control",
                             "not_sent",
                             true,
+                        ),
+                        WdaControlOutcome::UnsupportedPerformAction => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "unsupported_perform_action",
+                            "not_sent",
+                            false,
                         ),
                         WdaControlOutcome::InvalidElementSnapshot => (
                             StatusCode::BAD_REQUEST,
@@ -5501,6 +5944,7 @@ async fn agent_input(
                     ))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             ),
+            WdaControlOutcome::UnsupportedPerformAction => unsupported_perform_action_response(),
             WdaControlOutcome::InvalidElementSnapshot => invalid_element_snapshot_response(),
             WdaControlOutcome::StaleElementSnapshot => stale_element_snapshot_response(),
             WdaControlOutcome::ElementNotFound => element_not_found_response(),
@@ -6452,6 +6896,7 @@ mod tests {
             accessible: Some(true),
             focused: None,
             placeholder: None,
+            ..Default::default()
         }];
         let mut changed = vec![crate::wda::ElementRow {
             kind: "Button".to_string(),
@@ -6465,6 +6910,7 @@ mod tests {
             accessible: Some(true),
             focused: None,
             placeholder: None,
+            ..Default::default()
         }];
 
         let snapshot = element_snapshot_id(&first).unwrap();
@@ -6488,6 +6934,7 @@ mod tests {
             accessible: None,
             focused: None,
             placeholder: None,
+            ..Default::default()
         }
     }
 
@@ -6651,6 +7098,146 @@ mod tests {
     }
 
     #[test]
+    fn validate_perform_requires_snapshot_binding_and_known_action() {
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"increment"})
+        )
+        .is_ok());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"menu","duration_ms":1200})
+        )
+        .is_ok());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"adjust","value":"0.7"})
+        )
+        .is_ok());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"pinch","scale":2.0,"velocity":1.5})
+        )
+        .is_ok());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"rotate","rotation":1.57})
+        )
+        .is_ok());
+
+        // Snapshot binding is mandatory (same contract as set_value).
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","snapshot":"abc","action":"increment"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"action":"increment"})
+        )
+        .is_err());
+        // Unknown verbs fail closed at validation, matching the runtime's
+        // unsupported_perform_action.
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"levitate"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_perform_scopes_parameters_to_their_actions() {
+        // value is exclusive to adjust — required there, rejected elsewhere.
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"adjust"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"increment","value":"5"})
+        )
+        .is_err());
+        let oversized = "字".repeat(501);
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"adjust","value":oversized})
+        )
+        .is_err());
+        // duration_ms only for menu/force_press, bounded.
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"double_tap","duration_ms":500})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"menu","duration_ms":10_001})
+        )
+        .is_err());
+        // pinch requires a bounded scale; rotate a bounded non-zero rotation.
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"pinch"})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"pinch","scale":0.0})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"rotate","rotation":0.0})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"menu","scale":2.0})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"toggle","velocity":1.0})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"menu","pressure":1.0})
+        )
+        .is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"perform","element":4,"snapshot":"abc","action":"force_press","pressure":0.8,"duration_ms":900})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn perform_kind_gating_limits_value_verbs_to_drivable_kinds() {
+        let row = |kind: &str| crate::wda::ElementRow {
+            kind: kind.to_string(),
+            label: "目标".to_string(),
+            rect: [10.0, 20.0, 80.0, 44.0],
+            depth: 2,
+            ..Default::default()
+        };
+        for kind in ["PickerWheel", "Stepper", "Slider"] {
+            assert!(perform_action_kind_permitted("increment", &row(kind)));
+            assert!(perform_action_kind_permitted("decrement", &row(kind)));
+        }
+        assert!(!perform_action_kind_permitted("increment", &row("Button")));
+        assert!(perform_action_kind_permitted("adjust", &row("Slider")));
+        assert!(perform_action_kind_permitted("adjust", &row("PickerWheel")));
+        assert!(!perform_action_kind_permitted("adjust", &row("Cell")));
+        assert!(perform_action_kind_permitted("toggle", &row("Switch")));
+        assert!(!perform_action_kind_permitted("toggle", &row("Button")));
+        // A ToggleButton-trait Button carries toggle through its derived
+        // actions when the affordances flag populated them.
+        let mut toggle_button = row("Button");
+        toggle_button.actions = Some(vec!["toggle".to_string()]);
+        assert!(perform_action_kind_permitted("toggle", &toggle_button));
+        // Gesture verbs stay universal.
+        for action in ["menu", "double_tap", "two_finger_tap", "scroll_to_visible"] {
+            assert!(perform_action_kind_permitted(action, &row("Cell")));
+        }
+    }
+
+    #[test]
+    fn slider_position_parses_percent_and_fraction_only() {
+        assert_eq!(slider_normalized_position(Some("45%")), Some(0.45));
+        assert_eq!(slider_normalized_position(Some("0.7")), Some(0.7));
+        assert_eq!(slider_normalized_position(Some(" 100 %")), Some(1.0));
+        assert_eq!(slider_normalized_position(Some("37")), None); // ambiguous scale
+        assert_eq!(slider_normalized_position(Some("garbage")), None);
+        assert_eq!(slider_normalized_position(None), None);
+    }
+
+    #[test]
     fn locator_wda_query_uses_element_clickable_predicate_fields() {
         let locator = AgentElementLocator {
             label: Some("保存到“文件”".to_string()),
@@ -6705,6 +7292,7 @@ mod tests {
             accessible: Some(true),
             focused: Some(false),
             placeholder: None,
+            ..Default::default()
         };
 
         let locator = snapshot_row_locator(&row).unwrap();
@@ -6728,6 +7316,7 @@ mod tests {
             accessible: None,
             focused: None,
             placeholder: None,
+            ..Default::default()
         };
 
         assert!(snapshot_row_locator(&row).is_none());
@@ -6748,6 +7337,7 @@ mod tests {
                 accessible: None,
                 focused: None,
                 placeholder: None,
+                ..Default::default()
             },
             crate::wda::ElementRow {
                 kind: "TextField".to_string(),
@@ -6761,6 +7351,7 @@ mod tests {
                 accessible: Some(true),
                 focused: Some(true),
                 placeholder: Some("搜索交易".to_string()),
+                ..Default::default()
             },
         ];
         let expect = AgentUiExpectation {
