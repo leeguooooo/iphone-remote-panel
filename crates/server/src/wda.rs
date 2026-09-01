@@ -683,14 +683,18 @@ impl WdaClient {
     /// established. The JSON body is required: current WDA rejects bodyless
     /// POSTs with a 400, so the URL always rides in `{"url": ...}`.
     pub async fn open_url(&mut self, url: &str) -> Result<()> {
+        // Session-scoped route: the sessionless `POST /url` the design
+        // expected 404s on WDA 9.15.3 (hardware-verified); the W3C
+        // `POST /session/:sid/url` opens the deep link fine.
+        let sid = self.ensure_session().await?.to_string();
         let response = self
             .http
-            .post(format!("{}/url", self.base))
+            .post(format!("{}/session/{}/url", self.base, sid))
             .json(&serde_json::json!({ "url": url }))
             .send()
             .await
-            .context("POST /url")?;
-        ensure_wda_success(response, "POST /url").await?;
+            .context("POST /session/:sid/url")?;
+        ensure_wda_success(response, "POST /session/:sid/url").await?;
         Ok(())
     }
 
