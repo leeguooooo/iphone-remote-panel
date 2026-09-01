@@ -243,6 +243,8 @@ The bundled web and MCP clients add the header automatically.
 | `POST` | `/agent/actions` | Direct/WDA-only bounded multi-step execution. The whole batch is validated before dispatch; `wait_for` provides semantic checkpoints and the first failure prevents every later action. |
 | `GET` / `POST` | `/agent/inbox` | GET safely peeks at the legacy Shortcuts result queue. POST requires bearer auth plus the mutation header and appends one result. |
 | `POST` | `/agent/inbox/drain` | Requires bearer auth plus the mutation header; atomically returns and clears the queued results. |
+| `GET` | `/agent/intents` | The curated semantic-intent registry (`~/.iphone-use/intents-registry.json`), served per request. A missing file returns an empty list with a setup hint, never an error; malformed entries are skipped fail-closed. |
+| `POST` | `/agent/intent` | Requires bearer auth and the mutation header. Dispatches one registered verb (`{"name":"battery","args":{}}`) by opening a `shortcuts://run-shortcut` deep link on-device through WDA's sessionless `POST /url`; the bridge shortcut's result arrives on `/agent/inbox`, matched by the returned `id`. First use of each verb needs one interactive permission blessing on the phone, and the Shortcuts app foregrounds during a call. Errors carry the honest `outcome`/`retry_safe` taxonomy; a devicectl fallback is only ever a hint, never auto-dispatched. |
 | `GET` | `/agent/screenshot` | Current phone screen as PNG from the on-device path. |
 | `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
 
@@ -395,6 +397,15 @@ acceptance.
 
 Legacy details remain in [`shortcuts/README.md`](shortcuts/README.md) and
 [`shortcuts/registry.json`](shortcuts/registry.json).
+
+The Direct-native successor is the **semantic intents channel**
+(`GET /agent/intents` + `POST /agent/intent`): the daemon opens the
+`shortcuts://run-shortcut` deep link on-device through WDA — no Spotlight, no
+clipboard carrier — and the bridge shortcut still answers via `/agent/inbox`.
+Curate verbs in `~/.iphone-use/intents-registry.json` (start from
+[`deploy/intents-registry.example.json`](deploy/intents-registry.example.json)).
+First run of each verb needs one interactive permission blessing on the phone,
+and Shortcuts foregrounds during a call.
 
 ## Agent skill
 

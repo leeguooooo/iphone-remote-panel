@@ -590,6 +590,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // CSRF-protected POST endpoint.
         .route("/agent/inbox", get(agent_inbox_get).post(agent_inbox_post))
         .route("/agent/inbox/drain", post(agent_inbox_drain))
+        // Semantic intents channel: curated Shortcuts verbs dispatched
+        // on-device via WDA's sessionless `POST /url`
+        // (`shortcuts://run-shortcut` deep link). Results return through the
+        // existing `/agent/inbox`; the registry file — not the phone — is the
+        // capability list.
+        .route("/agent/intents", get(agent_intents))
+        .route("/agent/intent", post(agent_intent))
         .with_state(state)
 }
 
@@ -6304,6 +6311,644 @@ async fn agent_inbox_drain(State(state): State<Arc<AppState>>, headers: HeaderMa
     inbox_items_response(items)
 }
 
+// ---------------------------------------------------------------------------
+// Semantic intents channel
+// ---------------------------------------------------------------------------
+//
+// Curated Shortcuts verbs ("intents") dispatched on-device: the daemon opens a
+// `shortcuts://run-shortcut?...` deep link through WDA's sessionless
+// `POST /url`, the one reviewed bridge shortcut dispatches on `verb` and POSTs
+// its structured result back to the existing `/agent/inbox`. The registry file
+// (`~/.iphone-use/intents-registry.json`) — not the phone — is the capability
+// list: agents can only invoke what a human curated into it (App Intents are
+// not externally enumerable; Shortcuts is the only broker Apple provides).
+// Purely additive: the AX/snapshot/guarded UI channel is untouched, and this
+// channel never falls back to it (or to devicectl) automatically — automatic
+// double-dispatch would break at-most-once delivery.
+
+/// Registry files past this size are refused outright (fail closed) — the
+/// curated list is supposed to be small, and an unbounded read from a
+/// user-editable path is not.
+const INTENTS_REGISTRY_MAX_BYTES: u64 = 256 * 1024;
+/// Serialized `args` cap for one intent call. The payload rides URL-encoded in
+/// the deep link and practical `shortcuts://` URL length is finite; larger
+/// blobs should be fetched by the shortcut from the daemon by id.
+const INTENT_ARGS_MAX_BYTES: usize = 2048;
+
+/// One curated verb from the intents registry (v3 schema).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct IntentEntry {
+    name: String,
+    summary: String,
+    /// `none` | `read` | `write` — `write` verbs are never retry-safe after an
+    /// unknown outcome.
+    side_effect: String,
+    /// JSON Schema subset describing `args` (informational; `{}` = no args).
+    args_schema: serde_json::Value,
+    /// JSON Schema subset for the inbox reply's `data` (`{}` = returns nothing;
+    /// verify via the UI channel).
+    returns_schema: serde_json::Value,
+    min_bridge_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission: Option<String>,
+    status: String,
+    /// `none` | `operator` — `operator` verbs are refused unless the request
+    /// carries `"operator_confirmed":true` (set only after a human confirms).
+    confirm: String,
+}
+
+/// The parsed intents registry: which bridge shortcut to run plus the curated
+/// verbs it implements.
+#[derive(Debug, Clone)]
+struct IntentsRegistry {
+    bridge_name: String,
+    bridge_required_version: u64,
+    intents: Vec<IntentEntry>,
+}
+
+/// Outcome of a per-request registry read. `Missing` is a normal, hint-worthy
+/// state (feature not set up); `Unreadable` fails closed.
+enum IntentsRegistryLoad {
+    Missing,
+    Unreadable(String),
+    Loaded(IntentsRegistry),
+}
+
+/// Canonical on-disk registry location. Factored out of the handlers so tests
+/// exercise [`load_intents_registry`] with injected temp paths instead.
+fn intents_registry_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home)
+        .join(".iphone-use")
+        .join("intents-registry.json")
+}
+
+fn valid_intent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn valid_bridge_shortcut_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= 100 && !name.chars().any(char::is_control)
+}
+
+/// Read and validate the registry, bounded and fail-closed: an oversized or
+/// syntactically broken file is `Unreadable`, malformed entries are skipped
+/// with a warn, and a missing file is simply `Missing` (empty list upstream).
+fn load_intents_registry(path: &std::path::Path) -> IntentsRegistryLoad {
+    let metadata = match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return IntentsRegistryLoad::Missing
+        }
+        Err(error) => return IntentsRegistryLoad::Unreadable(format!("stat failed: {error}")),
+        Ok(metadata) => metadata,
+    };
+    if metadata.len() > INTENTS_REGISTRY_MAX_BYTES {
+        return IntentsRegistryLoad::Unreadable(format!(
+            "registry file is {} bytes (max {INTENTS_REGISTRY_MAX_BYTES})",
+            metadata.len()
+        ));
+    }
+    let text = match std::fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return IntentsRegistryLoad::Missing
+        }
+        Err(error) => return IntentsRegistryLoad::Unreadable(format!("read failed: {error}")),
+        Ok(text) => text,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => return IntentsRegistryLoad::Unreadable(format!("not valid JSON: {error}")),
+    };
+    parse_intents_registry(&value)
+}
+
+/// Pure half of the registry load (unit-tested directly): validate the bridge
+/// block, then keep every well-formed entry and skip the rest with a warn.
+fn parse_intents_registry(value: &serde_json::Value) -> IntentsRegistryLoad {
+    let bridge = value.get("bridge");
+    let bridge_name = bridge
+        .and_then(|b| b.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    if !valid_bridge_shortcut_name(bridge_name) {
+        return IntentsRegistryLoad::Unreadable(
+            "bridge.name missing or invalid (non-empty, ≤100 chars, no control chars)".to_string(),
+        );
+    }
+    let bridge_required_version = bridge
+        .and_then(|b| b.get("required_version"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .min(1_000_000);
+    let mut intents: Vec<IntentEntry> = Vec::new();
+    if let Some(list) = value.get("intents").and_then(|v| v.as_array()) {
+        for (index, raw) in list.iter().enumerate() {
+            let Some(entry) = parse_intent_entry(raw) else {
+                tracing::warn!(
+                    "intents registry: entry {index} is malformed; skipped (fail closed)"
+                );
+                continue;
+            };
+            if intents.iter().any(|existing| existing.name == entry.name) {
+                tracing::warn!(
+                    "intents registry: duplicate name {:?} at entry {index}; skipped",
+                    entry.name
+                );
+                continue;
+            }
+            intents.push(entry);
+        }
+    }
+    IntentsRegistryLoad::Loaded(IntentsRegistry {
+        bridge_name: bridge_name.to_string(),
+        bridge_required_version,
+        intents,
+    })
+}
+
+/// Validate/clamp one registry entry. `None` = malformed, skip it (fail
+/// closed) — a bad `name`, `side_effect`, `confirm`, or a non-object schema
+/// disqualifies the entry rather than being silently coerced.
+fn parse_intent_entry(raw: &serde_json::Value) -> Option<IntentEntry> {
+    let object = raw.as_object()?;
+    let name = object.get("name")?.as_str()?;
+    if !valid_intent_name(name) {
+        return None;
+    }
+    let side_effect = object.get("side_effect")?.as_str()?;
+    if !matches!(side_effect, "none" | "read" | "write") {
+        return None;
+    }
+    let schema = |key: &str| match object.get(key) {
+        None => Some(serde_json::json!({})),
+        Some(value) if value.is_object() => Some(value.clone()),
+        Some(_) => None,
+    };
+    let clamped = |key: &str, max_chars: usize| match object.get(key) {
+        None => Some(None),
+        Some(serde_json::Value::String(s)) => Some(Some(s.chars().take(max_chars).collect())),
+        Some(_) => None,
+    };
+    let confirm = match object.get("confirm") {
+        None => "none".to_string(),
+        Some(serde_json::Value::String(c)) if c == "none" || c == "operator" => c.clone(),
+        Some(_) => return None,
+    };
+    let min_bridge_version = match object.get("min_bridge_version") {
+        None => 1,
+        Some(value) => value.as_u64().filter(|v| *v <= 1_000_000)?,
+    };
+    Some(IntentEntry {
+        name: name.to_string(),
+        summary: clamped("summary", 200)?.unwrap_or_default(),
+        side_effect: side_effect.to_string(),
+        args_schema: schema("args_schema")?,
+        returns_schema: schema("returns_schema")?,
+        min_bridge_version,
+        permission: clamped("permission", 100)?,
+        status: clamped("status", 32)?.unwrap_or_else(|| "experiment".to_string()),
+        confirm,
+    })
+}
+
+/// Percent-encode one URL component per RFC 3986: unreserved characters
+/// (ALPHA / DIGIT / `-` `.` `_` `~`) pass through, everything else — including
+/// space, `&`, `=`, and every non-ASCII UTF-8 byte — becomes `%XX`.
+fn percent_encode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Build the `shortcuts://run-shortcut` deep link for one intent call.
+/// `input=text` passes the URL-encoded `{"verb","id","args"}` JSON as the
+/// shortcut's input — replacing the legacy clipboard carrier. The wire keys
+/// stay `verb`/`id`/`args` for compatibility with the existing bridge
+/// shortcut protocol (`shortcuts/registry.json`).
+fn intent_deep_link(
+    bridge_shortcut: &str,
+    verb: &str,
+    id: &str,
+    args: &serde_json::Value,
+) -> String {
+    let payload = serde_json::json!({"verb": verb, "id": id, "args": args}).to_string();
+    format!(
+        "shortcuts://run-shortcut?name={}&input=text&text={}",
+        percent_encode_component(bridge_shortcut),
+        percent_encode_component(&payload)
+    )
+}
+
+/// Server-generated correlation id, `intent-`-prefixed so `/agent/intent`
+/// results are distinguishable from legacy manual-bridge items in the shared
+/// inbox. Only needs uniqueness within one inbox window, not unguessability.
+fn new_intent_correlation_id() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes = now_secs().to_be_bytes();
+    }
+    let mut id = String::from("intent-");
+    for byte in bytes {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
+/// Everything that can go wrong on `POST /agent/intent`, mapped to the
+/// daemon's honest outcome taxonomy (`outcome` ∈ `not_sent|unknown`,
+/// `retry_safe` truthful). Deliberately NO automatic devicectl fallback —
+/// double-dispatch would break at-most-once — it appears only as a
+/// `"fallback":"devicectl"` hint on pre-dispatch failures.
+enum IntentError {
+    /// Unparseable/invalid request body. Nothing dispatched.
+    InvalidRequest { detail: String },
+    /// Serialized `args` exceed [`INTENT_ARGS_MAX_BYTES`]. Nothing dispatched.
+    ArgsTooLarge { bytes: usize },
+    /// Name not in the registry (or no usable registry). Nothing dispatched.
+    NotFound {
+        name: String,
+        known: Vec<String>,
+        registry_hint: Option<String>,
+    },
+    /// Registry marks the verb `confirm:"operator"` and the request lacks
+    /// `"operator_confirmed":true`. Nothing dispatched.
+    OperatorConfirmationRequired { name: String },
+    /// WDA (the only dispatch path) is unreachable/not configured/recovering —
+    /// failed before anything was sent.
+    BridgeUnavailable { reason: String },
+    /// Deadline or lifecycle pre-check fired before dispatch. Nothing sent.
+    NotSent,
+    /// WDA accepted the request but answered an error — the deep link may or
+    /// may not have fired. Outcome unknown; never blind-retry.
+    DispatchFailed { id: String, detail: String },
+    /// Deadline expired after the request went out. Outcome unknown.
+    DispatchTimeout { id: String },
+}
+
+/// Pure taxonomy mapping (unit-tested): every variant to an HTTP status plus
+/// the JSON body agents key their retry decisions off.
+fn intent_error_parts(error: &IntentError) -> (StatusCode, serde_json::Value) {
+    match error {
+        IntentError::InvalidRequest { detail } => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false, "error": "intent_invalid_request",
+                "outcome": "not_sent", "retry_safe": true,
+                "detail": detail,
+                "hint": "body must be {\"name\":\"<registered intent>\",\"args\":{...}}",
+            }),
+        ),
+        IntentError::ArgsTooLarge { bytes } => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false, "error": "intent_args_too_large",
+                "outcome": "not_sent", "retry_safe": true,
+                "args_bytes": bytes, "max_bytes": INTENT_ARGS_MAX_BYTES,
+                "hint": "args ride URL-encoded in the deep link — keep them small and pass large blobs by reference (an id the shortcut fetches from the daemon)",
+            }),
+        ),
+        IntentError::NotFound {
+            name,
+            known,
+            registry_hint,
+        } => {
+            let mut body = serde_json::json!({
+                "ok": false, "error": "intent_not_found",
+                "outcome": "not_sent", "retry_safe": true,
+                "intent": name, "known": known,
+                "hint": "GET /agent/intents lists the curated registry; adding a verb is a reviewed registry + bridge-shortcut change, never runtime discovery",
+            });
+            if let Some(hint) = registry_hint {
+                body["registry"] = serde_json::Value::String(hint.clone());
+            }
+            (StatusCode::NOT_FOUND, body)
+        }
+        IntentError::OperatorConfirmationRequired { name } => (
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "ok": false, "error": "intent_requires_operator_confirmation",
+                "outcome": "not_sent", "retry_safe": true,
+                "intent": name,
+                "hint": "this verb is registered confirm:\"operator\" — resend with \"operator_confirmed\":true only after a human explicitly approved this exact call",
+            }),
+        ),
+        IntentError::BridgeUnavailable { reason } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false, "error": "intent_bridge_unavailable",
+                "outcome": "not_sent", "retry_safe": true,
+                "reason": reason,
+                "fallback": "devicectl",
+                "hint": "nothing was dispatched; the deep link can be delivered manually via `xcrun devicectl device process launch --payload-url <shortcuts-url> com.apple.shortcuts` — the daemon never auto-dispatches that fallback (at-most-once)",
+            }),
+        ),
+        IntentError::NotSent => (
+            StatusCode::REQUEST_TIMEOUT,
+            serde_json::json!({
+                "ok": false, "error": "not_sent",
+                "outcome": "not_sent", "retry_safe": true,
+                "fallback": "devicectl",
+            }),
+        ),
+        IntentError::DispatchFailed { id, detail } => (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "ok": false, "error": "intent_dispatch_failed",
+                "outcome": "unknown", "retry_safe": false,
+                "id": id, "detail": detail,
+                "result_path": "/agent/inbox",
+                "hint": "the deep link may have fired — check /agent/inbox for this id and observe device state before ever re-sending a side-effecting verb",
+            }),
+        ),
+        IntentError::DispatchTimeout { id } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            serde_json::json!({
+                "ok": false, "error": "intent_timeout",
+                "outcome": "unknown", "retry_safe": false,
+                "id": id,
+                "result_path": "/agent/inbox",
+                "hint": "dispatched but unconfirmed — check /agent/inbox for this id and observe device state before ever re-sending a side-effecting verb",
+            }),
+        ),
+    }
+}
+
+fn intent_error_response(error: &IntentError) -> Response {
+    let (status, body) = intent_error_parts(error);
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// `GET /agent/intents` — the curated semantic-intent registry, read from
+/// `~/.iphone-use/intents-registry.json` per request (no daemon restart to
+/// pick up a curation change). A missing file is a normal state: empty list
+/// plus a setup hint, never an error. Read-only, so no mutation header.
+async fn agent_intents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    let path = intents_registry_path();
+    let body = match load_intents_registry(&path) {
+        IntentsRegistryLoad::Missing => serde_json::json!({
+            "ok": true,
+            "intents": [],
+            "bridge": null,
+            "result_path": "/agent/inbox",
+            "hint": format!(
+                "no registry at {} — copy deploy/intents-registry.example.json there, curate it, and install the bridge shortcut on the phone",
+                path.display()
+            ),
+        }),
+        IntentsRegistryLoad::Unreadable(reason) => serde_json::json!({
+            "ok": true,
+            "intents": [],
+            "bridge": null,
+            "result_path": "/agent/inbox",
+            "warning": format!("registry unreadable, fail closed: {reason}"),
+        }),
+        IntentsRegistryLoad::Loaded(registry) => serde_json::json!({
+            "ok": true,
+            "bridge": {
+                "name": registry.bridge_name,
+                "required_version": registry.bridge_required_version,
+                // Static registry truth only: the daemon has no cheap proof the
+                // shortcut exists on this phone (a future `ping` round trip is
+                // the only real one), so it never claims more than "unknown".
+                "installed": "unknown",
+            },
+            "intents": registry.intents,
+            "result_path": "/agent/inbox",
+            "hint": "POST /agent/intent {\"name\":...,\"args\":{...}} dispatches a verb; the bridge shortcut POSTs its result to /agent/inbox (match on the response id)",
+        }),
+    };
+    with_security_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// `POST /agent/intent` — dispatch one registered semantic intent:
+/// `{"name":"battery","args":{}}`. The daemon looks the name up in the curated
+/// registry, builds the `shortcuts://run-shortcut` deep link, and opens it
+/// on-device through WDA's sessionless `POST /url` under the same auth,
+/// lifecycle gating, control-priority, and 15-second deadline as
+/// [`agent_input`]'s Direct branch. The response acknowledges the *dispatch*
+/// only — the bridge shortcut's result arrives on `/agent/inbox`, matched by
+/// the returned `id`. The Shortcuts app foregrounds for the duration of the
+/// run, so never interleave this with a mid-flight UI flow.
+async fn agent_intent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    // Same total server deadline as `/agent/input`: the authoritative outcome
+    // must arrive before a 30-second MCP client can abandon the call.
+    let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
+    let parsed = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return intent_error_response(&IntentError::InvalidRequest {
+                detail: "body must be a JSON object".to_string(),
+            })
+        }
+    };
+    let name = match parsed.get("name").and_then(|n| n.as_str()) {
+        Some(name) if valid_intent_name(name) => name.to_string(),
+        _ => {
+            return intent_error_response(&IntentError::InvalidRequest {
+                detail: "\"name\" must be 1-64 chars of [A-Za-z0-9_-]".to_string(),
+            })
+        }
+    };
+    let args = match parsed.get("args") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => {
+            return intent_error_response(&IntentError::InvalidRequest {
+                detail: "\"args\" must be a JSON object".to_string(),
+            })
+        }
+    };
+    let args_bytes = args.to_string().len();
+    if args_bytes > INTENT_ARGS_MAX_BYTES {
+        return intent_error_response(&IntentError::ArgsTooLarge { bytes: args_bytes });
+    }
+    let operator_confirmed = parsed
+        .get("operator_confirmed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let registry_path = intents_registry_path();
+    let registry = match load_intents_registry(&registry_path) {
+        IntentsRegistryLoad::Loaded(registry) => registry,
+        IntentsRegistryLoad::Missing => {
+            return intent_error_response(&IntentError::NotFound {
+                name,
+                known: vec![],
+                registry_hint: Some(format!(
+                "no registry at {} — copy deploy/intents-registry.example.json there and curate it",
+                registry_path.display()
+            )),
+            })
+        }
+        IntentsRegistryLoad::Unreadable(reason) => {
+            return intent_error_response(&IntentError::NotFound {
+                name,
+                known: vec![],
+                registry_hint: Some(format!("registry unreadable (fail closed): {reason}")),
+            })
+        }
+    };
+    let Some(entry) = registry.intents.iter().find(|entry| entry.name == name) else {
+        let known = registry
+            .intents
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        return intent_error_response(&IntentError::NotFound {
+            name,
+            known,
+            registry_hint: None,
+        });
+    };
+    if entry.confirm == "operator" && !operator_confirmed {
+        return intent_error_response(&IntentError::OperatorConfirmationRequired {
+            name: name.clone(),
+        });
+    }
+    // Lifecycle gating, mirroring `agent_input`'s Direct branch. The one
+    // deliberate difference: a released device does NOT start recovery here —
+    // that stays `/agent/input`/`/agent/mode`'s job, and this pre-dispatch
+    // failure is honestly retry-safe.
+    if state.wda_lifecycle.is_releasing() {
+        return intent_error_response(&IntentError::BridgeUnavailable {
+            reason: "device_release_in_progress — retry in a few seconds".to_string(),
+        });
+    }
+    if state.released.load(std::sync::atomic::Ordering::Acquire) {
+        return intent_error_response(&IntentError::BridgeUnavailable {
+            reason: "phone was idle-released; POST /agent/mode {\"mode\":\"agent\"} to restart managed WDA, then retry".to_string(),
+        });
+    }
+    if state.backend == crate::config::DeviceBackend::Direct && state.managed_wda_pending {
+        return target_not_configured_response();
+    }
+    if state.wda_lifecycle.is_reconnecting() {
+        return intent_error_response(&IntentError::BridgeUnavailable {
+            reason: "reconnect_in_progress — poll /agent/status until drivable, then retry"
+                .to_string(),
+        });
+    }
+    state.touch_activity();
+    let Some(wda) = &state.wda else {
+        return intent_error_response(&IntentError::BridgeUnavailable {
+            reason: "WDA is not configured (PHONE_REMOTE_WDA_URL / setup)".to_string(),
+        });
+    };
+    if tokio::time::Instant::now() >= agent_wda_deadline {
+        return intent_error_response(&IntentError::NotSent);
+    }
+    let _priority = state.begin_wda_control();
+    let correlation_id = new_intent_correlation_id();
+    let deep_link = intent_deep_link(&registry.bridge_name, &name, &correlation_id, &args);
+    let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dispatch_marker = dispatched.clone();
+    let result = tokio::time::timeout_at(agent_wda_deadline, async {
+        let mut client = wda.lock().await;
+        if tokio::time::Instant::now() >= agent_wda_deadline
+            || state.wda_lifecycle.is_transitioning()
+            || state.released.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
+        Some(client.open_url(&deep_link).await)
+    })
+    .await;
+    match result {
+        Ok(Some(Ok(()))) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "intent": name,
+                "id": correlation_id,
+                "outcome": "applied",
+                "side_effect": entry.side_effect,
+                "result_path": "/agent/inbox",
+                "hint": "dispatch applied (deep link opened on-device); the bridge shortcut POSTs its result to /agent/inbox — peek GET /agent/inbox or POST /agent/inbox/drain and match on this id. The Shortcuts app foregrounds during the run.",
+            });
+            with_security_headers(
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            )
+        }
+        Ok(Some(Err(error))) => {
+            // Deliberately log the error only, never the deep link: `args` may
+            // carry private content and must not leak into daemon logs.
+            tracing::warn!("intent dispatch ({name}): {error:#}");
+            intent_error_response(&IntentError::DispatchFailed {
+                id: correlation_id,
+                detail: format!("{error:#}"),
+            })
+        }
+        Ok(None) => intent_error_response(&IntentError::NotSent),
+        Err(_) => {
+            if dispatched.load(std::sync::atomic::Ordering::Acquire) {
+                intent_error_response(&IntentError::DispatchTimeout { id: correlation_id })
+            } else {
+                intent_error_response(&IntentError::NotSent)
+            }
+        }
+    }
+}
+
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6437,6 +7082,245 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Semantic intents channel ---
+
+    #[test]
+    fn intents_registry_missing_file_is_missing_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents-registry.json");
+        assert!(matches!(
+            load_intents_registry(&path),
+            IntentsRegistryLoad::Missing
+        ));
+    }
+
+    #[test]
+    fn intents_registry_valid_file_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents-registry.json");
+        std::fs::write(
+            &path,
+            r#"{"version":3,"bridge":{"name":"iU Bridge","required_version":3},
+                "intents":[{"name":"ping","summary":"liveness","side_effect":"none",
+                            "min_bridge_version":3,"status":"validated"}]}"#,
+        )
+        .unwrap();
+        let IntentsRegistryLoad::Loaded(registry) = load_intents_registry(&path) else {
+            panic!("valid registry must load");
+        };
+        assert_eq!(registry.bridge_name, "iU Bridge");
+        assert_eq!(registry.bridge_required_version, 3);
+        assert_eq!(registry.intents.len(), 1);
+        let ping = &registry.intents[0];
+        assert_eq!(ping.name, "ping");
+        assert_eq!(ping.summary, "liveness");
+        assert_eq!(ping.side_effect, "none");
+        assert_eq!(ping.min_bridge_version, 3);
+        assert_eq!(ping.status, "validated");
+        assert_eq!(ping.confirm, "none");
+        assert_eq!(ping.args_schema, serde_json::json!({}));
+        assert_eq!(ping.returns_schema, serde_json::json!({}));
+    }
+
+    #[test]
+    fn intents_registry_skips_malformed_entries_and_duplicates() {
+        let value = serde_json::json!({
+            "version": 3,
+            "bridge": {"name": "iU Bridge", "required_version": 3},
+            "intents": [
+                {"name": "battery", "side_effect": "none"},
+                {"name": "battery", "side_effect": "read"},
+                {"name": "no side effect declared"},
+                {"name": "bad_side", "side_effect": "mutate"},
+                {"name": "坏名字", "side_effect": "none"},
+                {"name": "bad_schema", "side_effect": "none", "args_schema": "not an object"},
+                {"name": "bad_confirm", "side_effect": "write", "confirm": "maybe"},
+                {"name": "ok_write", "side_effect": "write", "confirm": "operator",
+                 "min_bridge_version": 3, "permission": "Messages", "status": "planned"},
+            ],
+        });
+        let IntentsRegistryLoad::Loaded(registry) = parse_intents_registry(&value) else {
+            panic!("registry with a valid bridge must load");
+        };
+        let names: Vec<&str> = registry
+            .intents
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["battery", "ok_write"]);
+        // First occurrence wins on duplicates.
+        assert_eq!(registry.intents[0].side_effect, "none");
+        let ok_write = &registry.intents[1];
+        assert_eq!(ok_write.confirm, "operator");
+        assert_eq!(ok_write.min_bridge_version, 3);
+        assert_eq!(ok_write.permission.as_deref(), Some("Messages"));
+        assert_eq!(ok_write.status, "planned");
+    }
+
+    #[test]
+    fn intents_registry_oversized_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents-registry.json");
+        std::fs::write(&path, vec![b' '; (INTENTS_REGISTRY_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(matches!(
+            load_intents_registry(&path),
+            IntentsRegistryLoad::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn intents_registry_invalid_json_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents-registry.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(matches!(
+            load_intents_registry(&path),
+            IntentsRegistryLoad::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn intents_registry_requires_a_bridge_name() {
+        let value = serde_json::json!({"version": 3, "intents": []});
+        assert!(matches!(
+            parse_intents_registry(&value),
+            IntentsRegistryLoad::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn shipped_example_registry_parses_with_its_entries_kept() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/intents-registry.example.json");
+        let IntentsRegistryLoad::Loaded(registry) = load_intents_registry(&path) else {
+            panic!("deploy/intents-registry.example.json must parse");
+        };
+        assert_eq!(registry.bridge_name, "iU Bridge");
+        assert!(registry.intents.iter().any(|entry| entry.name == "ping"));
+        assert!(registry.intents.iter().any(|entry| entry.name == "battery"));
+    }
+
+    #[test]
+    fn percent_encoding_is_rfc3986_component_strict() {
+        assert_eq!(percent_encode_component("AZaz09-._~"), "AZaz09-._~");
+        assert_eq!(
+            percent_encode_component("a b&c=你"),
+            "a%20b%26c%3D%E4%BD%A0"
+        );
+        assert_eq!(percent_encode_component("?#/+%"), "%3F%23%2F%2B%25");
+    }
+
+    fn percent_decode(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn intent_deep_link_encodes_cjk_and_specials_and_round_trips() {
+        let args = serde_json::json!({"text": "你好 world &=?#+%\"", "count": 3});
+        let url = intent_deep_link("iU Bridge", "send_message", "intent-00ff", &args);
+        let prefix = "shortcuts://run-shortcut?name=iU%20Bridge&input=text&text=";
+        assert!(url.starts_with(prefix), "unexpected url: {url}");
+        let encoded = &url[prefix.len()..];
+        // The encoded payload must contain only unreserved chars and %XX —
+        // no raw separators, spaces, quotes, or non-ASCII may leak through.
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~%".contains(c)));
+        let decoded: serde_json::Value = serde_json::from_str(&percent_decode(encoded)).unwrap();
+        assert_eq!(decoded["verb"], "send_message");
+        assert_eq!(decoded["id"], "intent-00ff");
+        assert_eq!(decoded["args"], args);
+    }
+
+    #[test]
+    fn intent_correlation_ids_are_prefixed_hex_and_distinct() {
+        let a = new_intent_correlation_id();
+        let b = new_intent_correlation_id();
+        assert!(a.starts_with("intent-"));
+        assert_eq!(a.len(), "intent-".len() + 16);
+        assert!(a["intent-".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn intent_error_taxonomy_is_honest() {
+        let (status, body) = intent_error_parts(&IntentError::NotFound {
+            name: "nope".to_string(),
+            known: vec!["battery".to_string()],
+            registry_hint: None,
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "intent_not_found");
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["known"], serde_json::json!(["battery"]));
+
+        let (status, body) = intent_error_parts(&IntentError::BridgeUnavailable {
+            reason: "down".to_string(),
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "intent_bridge_unavailable");
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+        // devicectl is a hint only — never auto-dispatched.
+        assert_eq!(body["fallback"], "devicectl");
+
+        let (status, body) = intent_error_parts(&IntentError::NotSent);
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["fallback"], "devicectl");
+
+        let (status, body) = intent_error_parts(&IntentError::DispatchTimeout {
+            id: "intent-1".to_string(),
+        });
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body["error"], "intent_timeout");
+        assert_eq!(body["outcome"], "unknown");
+        assert_eq!(body["retry_safe"], false);
+        assert_eq!(body["result_path"], "/agent/inbox");
+
+        let (status, body) = intent_error_parts(&IntentError::DispatchFailed {
+            id: "intent-1".to_string(),
+            detail: "boom".to_string(),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["outcome"], "unknown");
+        assert_eq!(body["retry_safe"], false);
+
+        let (status, body) = intent_error_parts(&IntentError::OperatorConfirmationRequired {
+            name: "send_message".to_string(),
+        });
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+
+        let (status, body) = intent_error_parts(&IntentError::ArgsTooLarge { bytes: 4096 });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+
+        let (status, body) = intent_error_parts(&IntentError::InvalidRequest {
+            detail: "x".to_string(),
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+    }
 
     #[test]
     fn element_snapshot_changes_with_the_actionable_tree() {

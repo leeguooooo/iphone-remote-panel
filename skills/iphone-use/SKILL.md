@@ -74,6 +74,8 @@ and is not a Direct readiness signal.
 | `GET /agent/screenshot` | Current phone screen as a device-side PNG; no Mirroring session required |
 | `POST /agent/input` | One action (JSON body, below); requires `X-Phone-Control: 1` |
 | `POST /agent/actions` | One bounded, fail-closed sequence of `action`, `wait_for`, and short `pause` steps; Direct/WDA only; requires `X-Phone-Control: 1` |
+| `GET /agent/intents` | Curated **semantic intents** registry (registered Shortcuts verbs). Empty list + hint when none are set up |
+| `POST /agent/intent` | Dispatch one registered verb (`{"name":"battery","args":{}}`); requires `X-Phone-Control: 1`. Results arrive on `/agent/inbox`, matched by the returned `id` |
 
 If a stale caller forgets the mutation header, the 403 response names
 `required_header:"X-Phone-Control: 1"` and includes a retry hint. Correct the
@@ -215,6 +217,23 @@ documented or unit-tested action is not automatically a current-device proof:
   replay text, scroll, back, payment, send, or delete actions.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`
   + `text <app name>` + `key return` to launch any app.
+
+## Semantic intents (registered Shortcuts verbs)
+
+When the task maps to a verb in `GET /agent/intents` (check once per session),
+prefer one semantic call over driving the UI: `POST /agent/intent` with
+`{"name":"battery","args":{}}` opens the bridge shortcut's deep link on-device
+and returns an `id`; the structured result lands on `/agent/inbox` (peek with
+GET, consume with `POST /agent/inbox/drain`, match on that `id`). The registry
+is deliberately small and human-curated — an empty list is the normal answer,
+and then you use the UI channel. Caveats: the Shortcuts app **foregrounds
+during the run** (never interleave with a mid-flight UI flow; re-orient after),
+and the first run of each verb needs a one-time interactive permission blessing
+on the phone — if a call dispatches but no inbox reply appears, a pending
+permission dialog on the phone screen is the first suspect. At-most-once rules
+apply unchanged: `outcome:"not_sent"` is retry-safe, `outcome:"unknown"`
+(`intent_timeout`/`intent_dispatch_failed`) means check the inbox and observe
+state before ever re-sending a side-effecting verb.
 
 ## Self-improvement: vision once → script forever
 
