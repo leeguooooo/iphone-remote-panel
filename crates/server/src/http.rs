@@ -3172,6 +3172,16 @@ async fn resolve_snapshot_row_element(
     }
 }
 
+/// WDA answers 404 on `element/:id/*` routes when the resolved element
+/// reference went stale between lookup and use (live-updating UI such as
+/// Spotlight results churns references within milliseconds — hardware-hit
+/// 2026-09-01). A 404 proves the mutation was NOT dispatched, so callers may
+/// safely surface it as retryable element_not_found instead of a
+/// retry_safe:false unknown outcome.
+fn wda_error_is_missing_element(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("404 Not Found")
+}
+
 async fn tap_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
@@ -3194,10 +3204,13 @@ async fn tap_snapshot_element(
             [element_id] => element_id,
             _ => return Err(SnapshotElementTapError::Ambiguous),
         };
-        return w
-            .click_element(element_id)
-            .await
-            .map_err(SnapshotElementTapError::AfterDispatch);
+        return w.click_element(element_id).await.map_err(|error| {
+            if wda_error_is_missing_element(&error) {
+                SnapshotElementTapError::NotFound
+            } else {
+                SnapshotElementTapError::AfterDispatch(error)
+            }
+        });
     }
 
     let (x, y) = element_center(row).ok_or(SnapshotElementTapError::Invalid)?;
@@ -3223,10 +3236,13 @@ async fn set_value_snapshot_element(
     let element_id = resolve_snapshot_row_element(w, &rows[index]).await?;
     if text.is_empty() {
         // Clearing IS the requested mutation — report its real outcome.
-        return w
-            .clear_element(&element_id)
-            .await
-            .map_err(SnapshotElementTapError::AfterDispatch);
+        return w.clear_element(&element_id).await.map_err(|error| {
+            if wda_error_is_missing_element(&error) {
+                SnapshotElementTapError::NotFound
+            } else {
+                SnapshotElementTapError::AfterDispatch(error)
+            }
+        });
     }
     // Clear-then-type is one intentional compound action (same contract as
     // `text` with `clear:true`): the clear is best-effort, the type is still
@@ -3234,9 +3250,13 @@ async fn set_value_snapshot_element(
     if let Err(error) = w.clear_element(&element_id).await {
         tracing::warn!("wda clear_element before set_value: {error:#}");
     }
-    w.type_into(&element_id, &text)
-        .await
-        .map_err(SnapshotElementTapError::AfterDispatch)
+    w.type_into(&element_id, &text).await.map_err(|error| {
+        if wda_error_is_missing_element(&error) {
+            SnapshotElementTapError::NotFound
+        } else {
+            SnapshotElementTapError::AfterDispatch(error)
+        }
+    })
 }
 
 /// Shared swipe-travel curve: how far a scroll gesture actually moves for a
@@ -3353,9 +3373,13 @@ async fn tap_unique_locator(
         [element_id] => element_id,
         _ => return Err(UniqueLabelTapError::Ambiguous),
     };
-    w.click_element(element_id)
-        .await
-        .map_err(UniqueLabelTapError::AfterDispatch)
+    w.click_element(element_id).await.map_err(|error| {
+        if wda_error_is_missing_element(&error) {
+            UniqueLabelTapError::NotFound
+        } else {
+            UniqueLabelTapError::AfterDispatch(error)
+        }
+    })
 }
 
 fn wda_predicate_literal(value: &str) -> String {
