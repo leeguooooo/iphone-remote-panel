@@ -152,7 +152,10 @@ but it cannot run until every required value is filled in.
    `phone_tap_element(element,snapshot)` after choosing by
    identifier/kind/label/state. `phone_tap_label` is safe only for an exact
    unique label; zero or multiple matches send nothing. Use raw coordinates
-   only when the control has no semantic target.
+   only when the control has no semantic target. For stateful controls
+   (Switch / Slider / Stepper / PickerWheel), prefer `perform` over any tap —
+   see the Switches & sliders rule below; when a row advertises `actions`
+   (affordances flag on), use the listed action instead of guessing a gesture.
 3. **Verify**: `elements` (or `screenshot`) again → confirm the expected change
    before the next step. Treat a non-2xx read or an empty tree with `error` as a
    failed checkpoint, even if an immediately preceding status said
@@ -162,6 +165,14 @@ but it cannot run until every required value is filled in.
 Operational rules. Hardware evidence is called out only where it exists; a
 documented or unit-tested action is not automatically a current-device proof:
 
+- **Switches & sliders** (hardware-verified, iOS 27): a coordinate tap on a
+  Switch is **acknowledged but does not flip it** — a silent false success.
+  The only reliable path is `{"type":"perform","element":N,"snapshot":"…",
+  "action":"toggle"}`, which works on both the labeled full-row switch and the
+  bare paired `UISwitch`. Sliders: `perform` `increment`/`decrement` steps
+  ~10%, `adjust` takes a normalized `"value"` in 0..1. Verify the new `value`
+  from a fresh `elements` read (or the `?return=delta` response) — never trust
+  the ACK alone for state changes.
 - **Scroll**: positive `dy` reveals content farther down; negative `dy` reveals
   content above. Positive `dx` reveals content to the right. A scroll is an
   atomic WDA swipe, not a stream of wheel events.
