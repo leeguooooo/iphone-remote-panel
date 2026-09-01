@@ -70,7 +70,7 @@ and is not a Direct readiness signal.
 | Call | Purpose |
 |---|---|
 | `GET /agent/status` | `{ok, backend, device_state, screen_state, wda, wda_actionable, wda_locked, drivable, released, hint, setup_blocked_on, setup_phase, setup_message, …}` — gate on **`drivable`** |
-| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree) |
+| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree). Both shapes carry a read-only `ax_stats` usability block — see **Vision fallback** below |
 | `GET /agent/screenshot` | Current phone screen as a device-side PNG; no Mirroring session required |
 | `POST /agent/input` | One action (JSON body, below); requires `X-Phone-Control: 1` |
 | `POST /agent/actions` | One bounded, fail-closed sequence of `action`, `wait_for`, and short `pause` steps; Direct/WDA only; requires `X-Phone-Control: 1` |
@@ -215,6 +215,65 @@ documented or unit-tested action is not automatically a current-device proof:
   replay text, scroll, back, payment, send, or delete actions.
 - A reliable "reset to known state": `shortcut home`, then `shortcut spotlight`
   + `text <app name>` + `key return` to launch any app.
+
+## Vision fallback: when the AX tree is unusable
+
+AX-first is the invariant; vision is a screen-scoped fallback. Two failure
+modes trigger it:
+
+**Mode A — tree too sparse** (games, canvas/WebGL, custom-drawn UI).
+`/agent/elements` succeeds; judge its additive `ax_stats` block
+(`{n, n_interactive, labeled_frac, coverage, container_only, max_depth}`):
+
+- **unusable → go vision**: `n_interactive == 0 && container_only` (e.g. the
+  1-element tree whose only row is the `Application` node — `coverage` ≈ 1.0
+  there is meaningless, never read coverage before those two gates).
+- **degraded → hybrid**: `n_interactive < 3`, or `labeled_frac < 0.3`, or
+  (`coverage < 0.3` and not `container_only`). Use AX for the rows it has,
+  vision for the rest.
+- Otherwise **usable**: stay AX-only. Legitimately sparse screens exist (video
+  player with one "Done" button); low `n` alone is not a trigger — zero usable
+  targets for your current intent is.
+
+**Mode B — reading the tree kills the runner** (KakaoTalk, issue #44: any AX
+hierarchy snapshot crashes on-phone WDA; recovery is a 1–3 min rebuild). The
+signal: `/agent/elements` returns 502 `wda_source_failed` / 504
+`wda_source_timeout` twice on the same foreground app while
+`GET /agent/screenshot` still succeeds. Cache that verdict per app for the
+session — do not re-probe and pay the rebuild again.
+
+**The AX-free loop** (you are the grounding model; no new infra):
+
+1. `GET /agent/screenshot` → reason over the pixels yourself and pick a target.
+2. Act with the **existing** coordinate actions only — `tap` / `longpress` /
+   `swipe`/`scroll` with normalized `[0,1]` coordinates. They dispatch via W3C
+   `/actions` and never resolve the hierarchy. Unsure of the point (< ~0.5
+   confidence)? Send nothing (that is `not_sent`, retry-safe): re-screenshot,
+   crop the region to look closer, or scroll the target into view — then
+   report with a screenshot if still lost.
+3. Verify with a **post-action screenshot** (settle ~300–800 ms), never with an
+   element read. **HARD RULE for Mode-B apps: no `?return=delta`, no
+   element/label taps, no element `wait_for` gates** — each one resolves the
+   tree and takes the device down. The loop must be hermetically AX-free while
+   such an app is foreground. (In Mode A `return=delta` is merely useless — a
+   game's tree doesn't change; screenshot diff is the verifier there too.)
+
+**Degradation ladder** on the existing outcome grammar:
+
+| Situation | Daemon says | Treat as |
+|---|---|---|
+| You abstained (low confidence) | nothing sent | `not_sent`, retry-safe: re-screenshot → crop → scroll → report |
+| Action applied | `outcome:applied` | *dispatched*, not *achieved* — screenshot diff decides |
+| 502/504 after dispatch | `outcome_unknown`, `retry_safe:false` | read a screenshot before any replay (same rule as ever) |
+| `wda_pre_dispatch_failed` / transition | `not_sent`, `retry_safe:true` | retry after status settles |
+| Applied but screen unchanged | `applied` | soft failure: one adjusted retry, then stop and report |
+
+Vision guesses are *weaker* evidence than AX labels: destructive targets
+(send / pay / delete / 2FA) keep their explicit-verification rules regardless
+of channel. Any successful AX read on a new screen flips you back to AX-first,
+and every successful vision sequence should be compiled into a flow per the
+next section — vision is how you discover a flow, not how you run it the
+tenth time.
 
 ## Self-improvement: vision once → script forever
 

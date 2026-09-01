@@ -971,23 +971,27 @@ fn non_empty_string(node: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Element kinds an agent can act on directly. Shared between the tree
+/// flattener (row inclusion) and the `/agent/elements` `ax_stats` block
+/// (`n_interactive`), so the two can never drift apart.
+pub const INTERACTIVE_KINDS: [&str; 11] = [
+    "Button",
+    "Cell",
+    "TextField",
+    "SecureTextField",
+    "SearchField",
+    "Switch",
+    "Slider",
+    "TextView",
+    "PickerWheel",
+    "Picker",
+    "Stepper",
+];
+
 /// Recursively flatten a WDA `/source?format=json` tree, keeping only rows an
 /// agent can act on or learn from: anything with a non-empty label, or an
 /// interactive type. Order is document order (roughly top-to-bottom).
 fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>) {
-    const INTERACTIVE: [&str; 11] = [
-        "Button",
-        "Cell",
-        "TextField",
-        "SecureTextField",
-        "SearchField",
-        "Switch",
-        "Slider",
-        "TextView",
-        "PickerWheel",
-        "Picker",
-        "Stepper",
-    ];
     let kind = node
         .get("type")
         .and_then(|t| t.as_str())
@@ -1001,7 +1005,7 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
         .or_else(|| node.get("name").and_then(|l| l.as_str()))
         .unwrap_or("")
         .to_string();
-    if !label.is_empty() || INTERACTIVE.contains(&kind.as_str()) {
+    if !label.is_empty() || INTERACTIVE_KINDS.contains(&kind.as_str()) {
         let r = node.get("rect").cloned().unwrap_or_default();
         let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         // Current value/state (issue #20). WDA reports `value` as a string

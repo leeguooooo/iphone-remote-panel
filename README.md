@@ -244,7 +244,7 @@ The bundled web and MCP clients add the header automatically.
 | `GET` / `POST` | `/agent/inbox` | GET safely peeks at the legacy Shortcuts result queue. POST requires bearer auth plus the mutation header and appends one result. |
 | `POST` | `/agent/inbox/drain` | Requires bearer auth plus the mutation header; atomically returns and clears the queued results. |
 | `GET` | `/agent/screenshot` | Current phone screen as PNG from the on-device path. |
-| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
+| `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Both shapes include a read-only `ax_stats` block (`n`, `n_interactive`, `labeled_frac`, `coverage`, `container_only`, `max_depth`) so clients can judge tree usability before falling back to vision. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
 
 Gate actions on **`drivable`** and, for direct mode, require
 `backend:"direct"` plus `wda_actionable:true`. `phone_target`, `mirror_state`, and
