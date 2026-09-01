@@ -2915,6 +2915,131 @@ fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
 }
 
+/// Read-only usability statistics for one flattened element tree, reported as
+/// the additive `ax_stats` block on `/agent/elements` responses.
+///
+/// The daemon computes and reports; it never decides. Whether the tree is
+/// "usable" is policy that belongs to the calling agent/skill (see the
+/// visual-fallback design: sparse game/canvas trees vs. healthy dense trees).
+/// Pure function of rows the response already serializes — it never touches
+/// [`element_snapshot_id`], which keeps hashing ROWS only, so `ax_stats` can
+/// never perturb snapshot tokens.
+#[derive(Debug, PartialEq, serde::Serialize)]
+struct AxStats {
+    /// Total serialized rows.
+    n: usize,
+    /// Rows whose `kind` is one of [`crate::wda::INTERACTIVE_KINDS`].
+    n_interactive: usize,
+    /// Interactive rows with a non-empty label ÷ `n_interactive`; `1.0` when
+    /// there are no interactive rows (nothing is missing a label).
+    labeled_frac: f64,
+    /// Union area of all rects, clipped to the screen, ÷ screen area.
+    /// `null` when the screen size is unknown. Note a single full-screen
+    /// container makes this ≈ 1.0 while being useless — gate any coverage
+    /// judgment on `n_interactive` and `container_only` first.
+    coverage: Option<f64>,
+    /// Every row's `kind` is a pure container/decoration kind
+    /// (`Application`, `Window`, `Other`, `Image`). Vacuously true when the
+    /// tree is empty.
+    container_only: bool,
+    /// Maximum row depth; `0` for an empty tree.
+    max_depth: u32,
+}
+
+/// Compute [`AxStats`] for one flattened tree. `screen` is WDA's point-space
+/// window size when the lookup succeeded (its failure is non-fatal for the
+/// endpoint, so coverage degrades to `null` rather than failing the read).
+fn ax_stats(rows: &[crate::wda::ElementRow], screen: Option<(f64, f64)>) -> AxStats {
+    const CONTAINER_KINDS: [&str; 4] = ["Application", "Window", "Other", "Image"];
+
+    let interactive: Vec<&crate::wda::ElementRow> = rows
+        .iter()
+        .filter(|row| crate::wda::INTERACTIVE_KINDS.contains(&row.kind.as_str()))
+        .collect();
+    let labeled_frac = if interactive.is_empty() {
+        1.0
+    } else {
+        interactive
+            .iter()
+            .filter(|row| !row.label.is_empty())
+            .count() as f64
+            / interactive.len() as f64
+    };
+    let coverage = screen
+        .filter(|(width, height)| {
+            width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0
+        })
+        .map(|(width, height)| {
+            let rects: Vec<[f64; 4]> = rows.iter().map(|row| row.rect).collect();
+            rect_union_area_clipped(&rects, width, height) / (width * height)
+        });
+    AxStats {
+        n: rows.len(),
+        n_interactive: interactive.len(),
+        labeled_frac,
+        coverage,
+        container_only: rows
+            .iter()
+            .all(|row| CONTAINER_KINDS.contains(&row.kind.as_str())),
+        max_depth: rows.iter().map(|row| row.depth).max().unwrap_or(0),
+    }
+}
+
+/// Area of the union of `[x, y, w, h]` rects, each clipped to
+/// `[0, screen_width] × [0, screen_height]`. Overlaps are counted once
+/// (x-coordinate sweep with a 1-D interval union per strip — O(n² log n),
+/// microseconds at element-tree sizes). Non-finite or degenerate rects are
+/// ignored.
+fn rect_union_area_clipped(rects: &[[f64; 4]], screen_width: f64, screen_height: f64) -> f64 {
+    let clipped: Vec<(f64, f64, f64, f64)> = rects
+        .iter()
+        .filter(|rect| rect.iter().all(|value| value.is_finite()))
+        .map(|&[x, y, width, height]| {
+            (
+                x.max(0.0),
+                (x + width).min(screen_width),
+                y.max(0.0),
+                (y + height).min(screen_height),
+            )
+        })
+        .filter(|(x0, x1, y0, y1)| x1 > x0 && y1 > y0)
+        .collect();
+    if clipped.is_empty() {
+        return 0.0;
+    }
+    let mut xs: Vec<f64> = clipped
+        .iter()
+        .flat_map(|&(x0, x1, _, _)| [x0, x1])
+        .collect();
+    xs.sort_by(f64::total_cmp);
+    xs.dedup();
+    let mut area = 0.0;
+    for strip in xs.windows(2) {
+        let (strip_x0, strip_x1) = (strip[0], strip[1]);
+        if strip_x1 <= strip_x0 {
+            continue;
+        }
+        let mut intervals: Vec<(f64, f64)> = clipped
+            .iter()
+            .filter(|&&(x0, x1, _, _)| x0 <= strip_x0 && x1 >= strip_x1)
+            .map(|&(_, _, y0, y1)| (y0, y1))
+            .collect();
+        intervals.sort_by(|a, b| f64::total_cmp(&a.0, &b.0));
+        let mut covered = 0.0;
+        let mut open_until = f64::NEG_INFINITY;
+        for (y0, y1) in intervals {
+            let y0 = y0.max(open_until);
+            if y1 > y0 {
+                covered += y1 - y0;
+                open_until = y1;
+            }
+            open_until = open_until.max(y1);
+        }
+        area += covered * (strip_x1 - strip_x0);
+    }
+    area
+}
+
 /// How many recent element trees the daemon retains for `?since=` diffs.
 /// An agent diffs against its own previous read, so a handful is plenty; a
 /// miss simply degrades to the full tree.
@@ -6179,11 +6304,15 @@ async fn agent_elements(
     };
     let rows = Arc::new(rows);
     remember_element_snapshot(&state, &snapshot, &rows);
+    // Additive, read-only usability signals over the same rows (visual-fallback
+    // design §1.3): the client decides AX-vs-vision policy; the daemon only
+    // reports. Computed before `screen` is consumed by JSON conversion.
+    let ax_stats = ax_stats(&rows, screen);
     let screen =
         screen.map(|(width, height)| serde_json::json!({"width": width, "height": height}));
     // `?since=` with a still-cached baseline answers with a delta instead of
     // the full tree; anything else (no param, evicted, unknown) stays the
-    // exact pre-diff response shape.
+    // exact pre-diff response shape (plus the additive `ax_stats` key).
     let body = match query
         .since
         .as_deref()
@@ -6197,12 +6326,14 @@ async fn agent_elements(
                 "snapshot": snapshot,
                 "baseline": since,
                 "delta": elements_delta_json(&delta, &rows),
+                "ax_stats": ax_stats,
             })
         }
         None => serde_json::json!({
             "screen": screen,
             "snapshot": snapshot,
             "elements": &*rows,
+            "ax_stats": ax_stats,
         }),
     };
     match serde_json::to_string(&body) {
@@ -6919,6 +7050,105 @@ mod tests {
 
         changed[0].rect[1] = 120.0;
         assert_ne!(snapshot, element_snapshot_id(&changed).unwrap());
+    }
+
+    fn stats_row(kind: &str, label: &str, rect: [f64; 4], depth: u32) -> crate::wda::ElementRow {
+        crate::wda::ElementRow {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            rect,
+            depth,
+            ..Default::default()
+        }
+    }
+
+    const STATS_SCREEN: Option<(f64, f64)> = Some((100.0, 200.0));
+
+    #[test]
+    fn ax_stats_empty_tree_reports_zero_targets() {
+        let stats = ax_stats(&[], STATS_SCREEN);
+        assert_eq!(stats.n, 0);
+        assert_eq!(stats.n_interactive, 0);
+        assert_eq!(stats.labeled_frac, 1.0);
+        assert_eq!(stats.coverage, Some(0.0));
+        assert!(stats.container_only);
+        assert_eq!(stats.max_depth, 0);
+    }
+
+    #[test]
+    fn ax_stats_application_node_only_is_container_only_despite_full_coverage() {
+        // The 1-element Mode-A tree seen on games/canvas apps: a single
+        // full-screen Application row. Coverage ≈ 1.0 must not read as healthy
+        // — container_only + zero interactive rows are the gate.
+        let rows = vec![stats_row(
+            "Application",
+            "SomeGame",
+            [0.0, 0.0, 100.0, 200.0],
+            1,
+        )];
+        let stats = ax_stats(&rows, STATS_SCREEN);
+        assert_eq!(stats.n, 1);
+        assert_eq!(stats.n_interactive, 0);
+        assert_eq!(stats.labeled_frac, 1.0);
+        assert_eq!(stats.coverage, Some(1.0));
+        assert!(stats.container_only);
+        assert_eq!(stats.max_depth, 1);
+    }
+
+    #[test]
+    fn ax_stats_healthy_dense_tree() {
+        let rows = vec![
+            stats_row("Window", "", [0.0, 0.0, 100.0, 200.0], 1),
+            stats_row("Button", "返回", [0.0, 0.0, 50.0, 50.0], 3),
+            stats_row("Button", "", [50.0, 0.0, 50.0, 50.0], 3),
+            stats_row("TextField", "搜索", [0.0, 50.0, 100.0, 50.0], 4),
+            stats_row("Cell", "第一条", [0.0, 100.0, 100.0, 50.0], 5),
+            stats_row("StaticText", "标题", [10.0, 10.0, 30.0, 10.0], 4),
+        ];
+        let stats = ax_stats(&rows, STATS_SCREEN);
+        assert_eq!(stats.n, 6);
+        assert_eq!(stats.n_interactive, 4);
+        assert_eq!(stats.labeled_frac, 0.75);
+        // The full-screen Window already covers everything; overlapping child
+        // rects must not double-count past 1.0.
+        assert_eq!(stats.coverage, Some(1.0));
+        assert!(!stats.container_only);
+        assert_eq!(stats.max_depth, 5);
+    }
+
+    #[test]
+    fn ax_stats_coverage_counts_overlap_once_and_clips_to_screen() {
+        let rows = vec![
+            // Two 50×100 rects overlapping in a 25-wide band → union 75×100.
+            stats_row("Button", "a", [0.0, 0.0, 50.0, 100.0], 2),
+            stats_row("Button", "b", [25.0, 0.0, 50.0, 100.0], 2),
+            // Hangs off-screen: only the on-screen 10×200 sliver counts.
+            stats_row("Button", "c", [90.0, -50.0, 60.0, 400.0], 2),
+            // Degenerate and non-finite rects are ignored.
+            stats_row("Button", "d", [10.0, 10.0, 0.0, 40.0], 2),
+            stats_row("Button", "e", [f64::NAN, 0.0, 10.0, 10.0], 2),
+        ];
+        let stats = ax_stats(&rows, STATS_SCREEN);
+        // 75×100 + 10×200 minus their overlap (none: x ranges 0–75 vs 90–100).
+        let expected = (75.0 * 100.0 + 10.0 * 200.0) / (100.0 * 200.0);
+        let coverage = stats.coverage.unwrap();
+        assert!(
+            (coverage - expected).abs() < 1e-9,
+            "coverage {coverage} != {expected}"
+        );
+    }
+
+    #[test]
+    fn ax_stats_without_screen_size_has_null_coverage() {
+        let rows = vec![stats_row("Button", "OK", [0.0, 0.0, 10.0, 10.0], 2)];
+        let stats = ax_stats(&rows, None);
+        assert_eq!(stats.coverage, None);
+        assert_eq!(stats.n_interactive, 1);
+        // And a snapshot id is a function of rows only, so stats can never
+        // perturb it: same rows, with or without stats computed, same token.
+        let before = element_snapshot_id(&rows).unwrap();
+        let _ = ax_stats(&rows, STATS_SCREEN);
+        assert_eq!(before, element_snapshot_id(&rows).unwrap());
     }
 
     fn delta_row(kind: &str, label: &str, y: f64) -> crate::wda::ElementRow {
