@@ -1,0 +1,42 @@
+{
+  "$comment": "Semantic intents registry (v3) — copy to ~/.iphone-use/intents-registry.json and curate. This file, not the phone, is the capability list: POST /agent/intent only dispatches verbs listed here, GET /agent/intents serves it verbatim. Adding a verb is a reviewed change (add the branch to the bridge shortcut AND the entry here); agents never create shortcuts at runtime. The daemon opens shortcuts://run-shortcut?name=<bridge>&input=text&text=<urlencoded {verb,id,args}> on-device via WDA POST /url; the bridge shortcut POSTs {id,verb,ok,data} back to /agent/inbox with the bearer token + X-Phone-Control: 1. First run of each privacy-sensitive verb (and the first POST to the daemon host) needs one interactive permission tap on the phone — run each verb once by hand after installing the bridge. The Shortcuts app foregrounds for the duration of every run.",
+  "version": 3,
+  "bridge": {
+    "$comment": "The ONE reviewed bridge shortcut. It takes its JSON request from Shortcut Input (input=text), dispatches on `verb`, runs the native action, and POSTs the result to /agent/inbox. Keep the bearer token only inside the shortcut's stored request headers — it must never appear in the deep link.",
+    "name": "iU Bridge",
+    "required_version": 3
+  },
+  "intents": [
+    {
+      "$comment": "Mandatory liveness verb: zero permissions, returns the installed bridge version. A ping round trip is the only real proof the bridge is installed and current.",
+      "name": "ping",
+      "summary": "Bridge liveness + version handshake",
+      "side_effect": "none",
+      "args_schema": {},
+      "returns_schema": {
+        "type": "object",
+        "properties": { "bridge_version": { "type": "number" } }
+      },
+      "min_bridge_version": 3,
+      "permission": "none",
+      "status": "planned"
+    },
+    {
+      "$comment": "Read-only example verb; validated the legacy round trip. side_effect none|read verbs are safe to re-dispatch after outcome not_sent; write verbs are never blindly replayed.",
+      "name": "battery",
+      "summary": "Current battery level + charging state",
+      "side_effect": "none",
+      "args_schema": {},
+      "returns_schema": {
+        "type": "object",
+        "properties": {
+          "level": { "type": "number", "minimum": 0, "maximum": 1 },
+          "charging": { "type": "boolean" }
+        }
+      },
+      "min_bridge_version": 3,
+      "permission": "none",
+      "status": "experiment"
+    }
+  ]
+}
