@@ -1049,6 +1049,28 @@ impl WdaClient {
         Err(last_err.unwrap_or_else(|| anyhow!("element not found: {label}")))
     }
 
+    /// One element's frame in WDA points (`GET .../element/:id/rect`).
+    /// Used to match a semantic-less source-tree row onto its live XCUIElement
+    /// when nothing but geometry identifies it (e.g. a bare `UISwitch`).
+    pub async fn element_rect(&mut self, element_id: &str) -> Result<[f64; 4]> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .get(format!(
+                "{}/session/{}/element/{}/rect",
+                self.base, sid, element_id
+            ))
+            .send()
+            .await
+            .context("GET element/rect")?;
+        let value = ensure_wda_success(response, "GET element/rect").await?;
+        let g = |k: &str| value.get(k).and_then(serde_json::Value::as_f64);
+        match (g("x"), g("y"), g("width"), g("height")) {
+            (Some(x), Some(y), Some(w), Some(h)) => Ok([x, y, w, h]),
+            _ => Err(anyhow!("GET element/rect returned bad frame: {value}")),
+        }
+    }
+
     /// Drop the cached session (e.g. after an error that suggests it went
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {

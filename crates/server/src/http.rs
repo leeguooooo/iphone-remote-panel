@@ -3354,8 +3354,33 @@ async fn perform_snapshot_element(
     if action == "toggle" {
         return match &element_id {
             None => {
-                let (x, y) = element_center(row).ok_or(SnapshotElementTapError::InvalidTarget)?;
-                w.tap_point(x, y).await.map_err(after_dispatch)
+                // A synthesized coordinate tap at the switch's center is
+                // ACKed but does not flip stock Settings switches on iOS 27
+                // (hardware-verified); only an XCUIElement click does. Match
+                // the semantic-less row onto its live element by geometry:
+                // enumerate on-screen Switch elements and pick the one whose
+                // frame equals the row's rect.
+                let candidates = w
+                    .find_elements("class chain", "**/XCUIElementTypeSwitch")
+                    .await
+                    .map_err(SnapshotElementTapError::BeforeDispatch)?;
+                let mut matched = None;
+                for candidate in &candidates {
+                    if let Ok(rect) = w.element_rect(candidate).await {
+                        let close = rect
+                            .iter()
+                            .zip(row.rect.iter())
+                            .all(|(a, b)| (a - b).abs() <= 2.0);
+                        if close {
+                            if matched.is_some() {
+                                return Err(SnapshotElementTapError::Ambiguous);
+                            }
+                            matched = Some(candidate.clone());
+                        }
+                    }
+                }
+                let matched = matched.ok_or(SnapshotElementTapError::NotFound)?;
+                w.click_element(&matched).await.map_err(after_dispatch)
             }
             Some(element_id) => {
                 // A labeled Switch row is usually the full-row wrapper; the
