@@ -378,6 +378,7 @@ fn serve() -> Result<()> {
         live_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mjpeg_stream_activity: Arc::new(Mutex::new(std::collections::HashMap::new())),
         element_snapshots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        hold_until: Arc::new(Mutex::new(None)),
     });
 
     run_server(cfg, state, dir)

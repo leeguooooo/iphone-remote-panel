@@ -70,7 +70,7 @@ and is not a Direct readiness signal.
 | Call | Purpose |
 |---|---|
 | `GET /agent/status` | `{ok, backend, device_state, screen_state, wda, wda_actionable, wda_locked, drivable, released, hint, setup_blocked_on, setup_phase, setup_message, …}` — gate on **`drivable`** |
-| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree). Both shapes carry a read-only `ax_stats` usability block — see **Vision fallback** below. With `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1` on the daemon, rows also carry sparse `actions` (named `perform` affordances), `selected`, and `min`/`max` |
+| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree). Both shapes carry a read-only `ax_stats` usability block — see **Vision fallback** below — and a sparse `alert:{text,buttons}` block whenever a system alert (UIAlertController) is on screen. With `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1` on the daemon, rows also carry sparse `actions` (named `perform` affordances), `selected`, and `min`/`max` |
 | `GET /agent/screenshot` | Current phone screen as a device-side PNG; no Mirroring session required |
 | `POST /agent/input` | One action (JSON body, below); requires `X-Phone-Control: 1` |
 | `POST /agent/actions` | One bounded, fail-closed sequence of `action`, `wait_for`, and short `pause` steps; Direct/WDA only; requires `X-Phone-Control: 1` |
@@ -96,6 +96,8 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"longp
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'                     # dismiss the on-screen keyboard
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"set_value","element":5,"snapshot":"…","value":"你好"}'  # write a field directly (clear-then-type; "" clears); no focus tap, no keyboard dance
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"scroll","element":7,"snapshot":"…","dy":120}'          # scroll INSIDE that element's rect — never strays into a neighboring scroll view
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"alert","button":"不是 li guo?"}'  # press a system-alert button by exact name (UIAlertController; use this, NOT an element tap — alert buttons ACK a coordinate/element tap without acting)
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"alert","action":"dismiss"}'      # or the default accept/dismiss button
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"perform","element":9,"snapshot":"…","action":"increment"}'  # named affordance on that element: increment|decrement (wheel/stepper/slider), adjust (+"value"), toggle, menu (long-press menu), double_tap, two_finger_tap, scroll_to_visible, pinch, rotate, force_press
 ```
 
@@ -165,6 +167,17 @@ but it cannot run until every required value is filled in.
 Operational rules. Hardware evidence is called out only where it exists; a
 documented or unit-tested action is not automatically a current-device proof:
 
+- **System alerts** (permission prompts, "以 X 的身份设置?", sign-in confirmations):
+  they show up as the `alert:{text,buttons}` block on `/agent/elements`, and a
+  coordinate or element tap on an alert button is **acknowledged but often does
+  nothing** (same false-success class as switches). Dismiss/answer them with
+  `{"type":"alert","button":"<exact button text>"}` or
+  `{"type":"alert","action":"accept"|"dismiss"}`.
+- **Human-in-the-loop pauses** (you are about to wait for the operator to type a
+  password, approve a prompt, or fetch a code): send
+  `POST /agent/hold {"secs":600}` first so the idle watchdog does not release
+  the phone and force a 60–120s WDA rebuild while you wait. Send `{"secs":0}`
+  when done. Status reports `hold_remaining_secs`.
 - **Switches & sliders** (hardware-verified, iOS 27): a coordinate tap on a
   Switch is **acknowledged but does not flip it** — a silent false success.
   The only reliable path is `{"type":"perform","element":N,"snapshot":"…",

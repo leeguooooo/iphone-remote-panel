@@ -1096,6 +1096,81 @@ impl WdaClient {
         }
     }
 
+    /// The system alert (`UIAlertController`) currently on screen, through
+    /// WDA's native alert routes: `(text, button names)`; `None` when no alert
+    /// is up. Alerts are the one UI layer the flattened `/source` tree handles
+    /// badly (hardware-hit on stock Settings: the alert was absent from the
+    /// tree, and an element click on its button was ACKed without effect), so
+    /// agents get them as a first-class block instead.
+    pub async fn alert_summary(&mut self) -> Result<Option<(String, Vec<String>)>> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .get(format!("{}/session/{}/alert/text", self.base, sid))
+            .send()
+            .await
+            .context("GET /alert/text")?;
+        let text = match ensure_wda_success(response, "GET /alert/text").await {
+            Ok(value) => value.as_str().unwrap_or("").to_string(),
+            // W3C maps "no such alert" to HTTP 404.
+            Err(error) if wda_error_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let response = self
+            .http
+            .get(format!("{}/session/{}/wda/alert/buttons", self.base, sid))
+            .send()
+            .await
+            .context("GET /wda/alert/buttons")?;
+        let buttons = match ensure_wda_success(response, "GET /wda/alert/buttons").await {
+            Ok(value) => value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        Ok(Some((text, buttons)))
+    }
+
+    /// Press one alert button by name (`POST /alert/accept {"name"}`), or the
+    /// default accept button when `button` is `None`.
+    pub async fn alert_accept(&mut self, button: Option<&str>) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let body = match button {
+            Some(name) => serde_json::json!({ "name": name }),
+            None => serde_json::json!({}),
+        };
+        let response = self
+            .http
+            .post(format!("{}/session/{}/alert/accept", self.base, sid))
+            .json(&body)
+            .send()
+            .await
+            .context("POST /alert/accept")?;
+        ensure_wda_success(response, "POST /alert/accept").await?;
+        Ok(())
+    }
+
+    /// Dismiss the current alert (`POST /alert/dismiss`, the cancel/default
+    /// dismiss button).
+    pub async fn alert_dismiss(&mut self) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .post(format!("{}/session/{}/alert/dismiss", self.base, sid))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("POST /alert/dismiss")?;
+        ensure_wda_success(response, "POST /alert/dismiss").await?;
+        Ok(())
+    }
+
     /// Drop the cached session (e.g. after an error that suggests it went
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {
@@ -1439,6 +1514,12 @@ impl WdaHealth {
             locked: None,
         }
     }
+}
+
+/// WDA answers 404 for W3C "no such alert" / "no such element" conditions;
+/// `ensure_wda_success` surfaces that as an HTTP-status error.
+pub fn wda_error_is_not_found(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("404 Not Found")
 }
 
 /// Require both HTTP success and a successful W3C `value` envelope.
