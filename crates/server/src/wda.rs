@@ -867,15 +867,17 @@ impl WdaClient {
         Ok(())
     }
 
-    /// Open a URL on the device via WDA's **sessionless** `POST /url`.
+    /// Open a URL on the device via WDA's **session-scoped** `POST /session/:sid/url`.
     ///
     /// appium-webdriveragent registers this route both with and without a
     /// session (`FBSessionCommands.m`), and the handler uses the modern
-    /// system `open` path — no Safari detour. We deliberately use the
-    /// sessionless form so a deep link (e.g. `shortcuts://run-shortcut?...`
-    /// for the semantic intents channel) can fire even before a session is
-    /// established. The JSON body is required: current WDA rejects bodyless
-    /// POSTs with a 400, so the URL always rides in `{"url": ...}`.
+    /// system `open` path — no Safari detour. The sessionless form is the one
+    /// the design originally reached for (a deep link such as
+    /// `shortcuts://run-shortcut?...` for the semantic intents channel would
+    /// then fire without establishing a session), but it 404s on WDA 9.15.3
+    /// — hardware-verified — so this takes the session out first. The JSON
+    /// body is required: current WDA rejects bodyless POSTs with a 400, so
+    /// the URL always rides in `{"url": ...}`.
     pub async fn open_url(&mut self, url: &str) -> Result<()> {
         // Session-scoped route: the sessionless `POST /url` the design
         // expected 404s on WDA 9.15.3 (hardware-verified); the W3C
