@@ -70,7 +70,7 @@ and is not a Direct readiness signal.
 | Call | Purpose |
 |---|---|
 | `GET /agent/status` | `{ok, backend, device_state, screen_state, wda, wda_actionable, wda_locked, drivable, released, hint, setup_blocked_on, setup_phase, setup_message, …}` — gate on **`drivable`** |
-| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree). Both shapes carry a read-only `ax_stats` usability block — see **Vision fallback** below. With `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1` on the daemon, rows also carry sparse `actions` (named `perform` affordances), `selected`, and `min`/`max` |
+| `GET /agent/elements` | **Direct/WDA UI as text**: `{"snapshot":"…","elements":[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?},…]}` — prefer this over screenshots. Indexes and snapshot tokens are valid only for this read. Add `?since=<prior snapshot>` to get `{"snapshot":…,"baseline":…,"delta":{added,changed,removed,unchanged}}` instead of the full tree (much cheaper on multi-step flows; unknown baseline falls back to the full tree), plus `app_changed:{from,to}` if the foreground app moved since that baseline. Both shapes carry a read-only `ax_stats` usability block — see **Vision fallback** below. With `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1` on the daemon, rows also carry sparse `actions` (named `perform` affordances), `selected`, and `min`/`max` |
 | `GET /agent/screenshot` | Current phone screen as a device-side PNG; no Mirroring session required |
 | `POST /agent/input` | One action (JSON body, below); requires `X-Phone-Control: 1` |
 | `POST /agent/actions` | One bounded, fail-closed sequence of `action`, `wait_for`, and short `pause` steps; Direct/WDA only; requires `X-Phone-Control: 1` |
@@ -107,6 +107,18 @@ still server-cached, else full `elements`. That replaces the separate
 act-then-`GET /agent/elements` verify pair for routine steps; `delta_error`
 alongside `ok:true` means the action applied but the read failed — verify with
 a normal `GET /agent/elements`.
+
+**`app_changed` means your tap landed in the wrong app.** Any delta response
+(`?return=delta` or `GET /agent/elements?since=`) grows an
+`app_changed:{from,to}` block when the frontmost app is not the one the
+baseline was taken in. The usual cause is a banner notification dropping in
+from the top and swallowing the tap, which opens *its* app — the delta then
+describes a screen you never asked for. **Stop and re-orient when you see it**:
+do not keep issuing steps against the old plan, and never treat the new
+screen's elements as the ones you were aiming at. Recover by sending
+`{"type":"home"}` and re-entering the intended app.
+Its absence is not a guarantee — a tree with no `Application` row reports
+nothing rather than guessing.
 
 After typing into a web form the keyboard covers the page's own submit/next
 buttons — send `{"type":"keyboard"}` to dismiss it before tapping them.

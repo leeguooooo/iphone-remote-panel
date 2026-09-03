@@ -5142,14 +5142,32 @@ fn agent_locator_matches(row: &crate::wda::ElementRow, locator: &AgentElementLoc
             .is_none_or(|value| row.visible.unwrap_or(true) == value)
 }
 
+/// Label of the frontmost app as the flattened tree reports it: the single
+/// `Application` row. Satisfies `wait_for`'s `application` expectation, and
+/// lets an applied action say so when it moved the phone to another app.
+fn active_application(rows: &[crate::wda::ElementRow]) -> Option<String> {
+    rows.iter()
+        .find(|row| row.kind == "Application")
+        .map(|row| row.label.clone())
+}
+
+/// `{from, to}` when an action left the phone in a different app than it
+/// started in, `None` when the frontmost app held still. An unknown app on
+/// either side (no `Application` row) is not a change — the tree simply did
+/// not say — so a missing row never fabricates an alarm.
+fn app_changed_json(
+    before: &[crate::wda::ElementRow],
+    after: &[crate::wda::ElementRow],
+) -> Option<serde_json::Value> {
+    let (from, to) = (active_application(before)?, active_application(after)?);
+    (from != to).then(|| serde_json::json!({ "from": from, "to": to }))
+}
+
 fn agent_expectation_observation(
     rows: &[crate::wda::ElementRow],
     expect: &AgentUiExpectation,
 ) -> (bool, serde_json::Value) {
-    let application = rows
-        .iter()
-        .find(|row| row.kind == "Application")
-        .map(|row| row.label.clone());
+    let application = active_application(rows);
     let application_matches = expect
         .application
         .as_ref()
@@ -6077,14 +6095,21 @@ async fn agent_input(
                         match baseline {
                             Some((baseline_id, baseline_rows)) => {
                                 let delta = diff_element_rows(&baseline_rows, &rows);
-                                serde_json::json!({
+                                let mut body = serde_json::json!({
                                     "ok": true,
                                     "transport": "wda",
                                     "snapshot": snapshot,
                                     "baseline": baseline_id,
                                     "delta": elements_delta_json(&delta, &rows),
-                                })
-                                .to_string()
+                                });
+                                // A banner that drops in front of the tap eats it and opens
+                                // its own app; the delta then describes a screen the caller
+                                // never asked for, and nothing says the tap missed. The
+                                // frontmost app is already in the tree, so say it plainly.
+                                if let Some(changed) = app_changed_json(&baseline_rows, &rows) {
+                                    body["app_changed"] = changed;
+                                }
+                                body.to_string()
                             }
                             None => serde_json::json!({
                                 "ok": true,
@@ -6367,14 +6392,17 @@ async fn agent_elements(
         .and_then(|since| lookup_element_snapshot(&state, since).map(|rows| (since, rows)))
     {
         Some((since, baseline)) => {
-            let delta = diff_element_rows(&baseline, &rows);
-            serde_json::json!({
+            let mut body = serde_json::json!({
                 "screen": screen,
                 "snapshot": snapshot,
                 "baseline": since,
-                "delta": elements_delta_json(&delta, &rows),
+                "delta": elements_delta_json(&diff_element_rows(&baseline, &rows), &rows),
                 "ax_stats": ax_stats,
-            })
+            });
+            if let Some(changed) = app_changed_json(&baseline, &rows) {
+                body["app_changed"] = changed;
+            }
+            body
         }
         None => serde_json::json!({
             "screen": screen,
@@ -8090,6 +8118,48 @@ mod tests {
             placeholder: None,
             ..Default::default()
         }
+    }
+
+    // A banner notification drops in front of a tap, swallows it and opens its
+    // own app (hardware-hit: a chat banner took a tap meant for Settings). The
+    // caller gets a delta for a screen it never asked for, so name the switch.
+    #[test]
+    fn app_changed_json_names_the_app_an_action_switched_to() {
+        let before = vec![
+            delta_row("Application", "设置", 0.0),
+            delta_row("Cell", "通用", 80.0),
+        ];
+        let after = vec![
+            delta_row("Application", "微信", 0.0),
+            delta_row("Cell", "通讯录", 80.0),
+        ];
+        assert_eq!(
+            app_changed_json(&before, &after),
+            Some(serde_json::json!({ "from": "设置", "to": "微信" }))
+        );
+    }
+
+    #[test]
+    fn app_changed_json_is_silent_when_the_app_held_still() {
+        let before = vec![
+            delta_row("Application", "设置", 0.0),
+            delta_row("Cell", "通用", 80.0),
+        ];
+        let after = vec![
+            delta_row("Application", "设置", 0.0),
+            delta_row("Cell", "关于本机", 80.0),
+        ];
+        assert_eq!(app_changed_json(&before, &after), None);
+    }
+
+    // A tree with no `Application` row says nothing about the frontmost app —
+    // that is unknown, not a switch, and must never raise a false alarm.
+    #[test]
+    fn app_changed_json_is_silent_when_the_tree_omits_the_application_row() {
+        let known = vec![delta_row("Application", "设置", 0.0)];
+        let unknown = vec![delta_row("Cell", "通用", 80.0)];
+        assert_eq!(app_changed_json(&known, &unknown), None);
+        assert_eq!(app_changed_json(&unknown, &known), None);
     }
 
     #[test]
