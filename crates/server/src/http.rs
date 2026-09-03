@@ -3510,6 +3510,64 @@ fn slider_normalized_position(value: Option<&str>) -> Option<f64> {
     (position.is_finite() && (0.0..=1.0).contains(&position)).then_some(position)
 }
 
+/// Pick a Stepper's increment or decrement child Button by position.
+///
+/// The child labels are localized (`"Increment"` only exists on an English
+/// device, #57), so on any other locale geometry is the only discriminator
+/// left: the increment half sits on the trailing side of the pair — greater
+/// x, or greater y when the two are stacked. Refuse rather than guess unless
+/// the Stepper has exactly two positioned children.
+///
+/// This mirrors on a right-to-left device; the localized-label path above
+/// still covers the cases where the label is readable.
+async fn stepper_button_by_geometry(
+    w: &mut crate::wda::WdaClient,
+    element_id: &str,
+    action: &str,
+) -> Result<String, SnapshotElementTapError> {
+    let buttons = w
+        .find_elements_from(element_id, "class chain", "**/XCUIElementTypeButton")
+        .await
+        .map_err(SnapshotElementTapError::BeforeDispatch)?;
+    let [first, second] = buttons.as_slice() else {
+        return Err(match buttons.len() {
+            0 | 1 => SnapshotElementTapError::NotFound,
+            _ => SnapshotElementTapError::Ambiguous,
+        });
+    };
+    let mut rects = Vec::with_capacity(2);
+    for button in [first, second] {
+        rects.push(
+            w.element_rect(button)
+                .await
+                .map_err(SnapshotElementTapError::BeforeDispatch)?,
+        );
+    }
+    let increment_is_second = stepper_increment_is_second(&rects[0], &rects[1])
+        .ok_or(SnapshotElementTapError::InvalidTarget)?;
+    let take_second = increment_is_second == (action == "increment");
+    Ok(if take_second {
+        second.clone()
+    } else {
+        first.clone()
+    })
+}
+
+/// Whether the second of a Stepper's two child frames is the increment half.
+/// `None` when the two frames are not separated on either axis, i.e. there is
+/// no trailing side to pick.
+fn stepper_increment_is_second(first: &[f64; 4], second: &[f64; 4]) -> Option<bool> {
+    let center = |rect: &[f64; 4]| (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+    let (fx, fy) = center(first);
+    let (sx, sy) = center(second);
+    if !(fx.is_finite() && fy.is_finite() && sx.is_finite() && sy.is_finite()) {
+        return None;
+    }
+    let (dx, dy) = (sx - fx, sy - fy);
+    let delta = if dx.abs() >= dy.abs() { dx } else { dy };
+    (delta.abs() > 1.0).then_some(delta > 0.0)
+}
+
 /// `{"type":"perform","element":N,"snapshot":"…","action":"…"}` — invoke a
 /// named affordance on a snapshot-bound element through WDA's element-scoped
 /// routes (the caller has already checked the action against
@@ -3651,7 +3709,9 @@ async fn perform_snapshot_element(
             "Stepper" => {
                 // A Stepper has no single WDA primitive; its two child
                 // Buttons carry the affordance. Their labels are localized by
-                // iOS ("Increment"/"Decrement" on English devices).
+                // iOS, so the literal English "Increment"/"Decrement" only
+                // matches on an English device (#57) — try it first, since it
+                // is unambiguous when it hits, then fall back to geometry.
                 let label = if action == "increment" {
                     "Increment"
                 } else {
@@ -3666,8 +3726,8 @@ async fn perform_snapshot_element(
                     .await
                     .map_err(SnapshotElementTapError::BeforeDispatch)?;
                 let button = match buttons.as_slice() {
-                    [] => return Err(SnapshotElementTapError::NotFound),
                     [button] => button.clone(),
+                    [] => stepper_button_by_geometry(w, &element_id, &action).await?,
                     _ => return Err(SnapshotElementTapError::Ambiguous),
                 };
                 w.click_element(&button).await.map_err(after_dispatch)
@@ -8422,6 +8482,33 @@ mod tests {
     // yet has an empty label and no identifier, so locator resolution fails and
     // every one of its own advertised verbs was refused. Adjustable verbs must
     // keep the geometry fallback; verbs with a real target must not get it.
+    // #57: a Stepper's child buttons are labelled in the device locale, so the
+    // literal "Increment"/"Decrement" match finds nothing on a Chinese phone
+    // and the verb was refused outright. Geometry has to carry it: the
+    // trailing half of the pair increments.
+    #[test]
+    fn stepper_increment_is_the_trailing_child() {
+        // Side by side, as a Stepper is normally laid out.
+        let left = [100.0, 200.0, 40.0, 30.0];
+        let right = [140.0, 200.0, 40.0, 30.0];
+        assert_eq!(stepper_increment_is_second(&left, &right), Some(true));
+        assert_eq!(stepper_increment_is_second(&right, &left), Some(false));
+
+        // Stacked: the lower one increments, and the smaller x-jitter between
+        // two vertically separated children must not decide the axis.
+        let top = [100.0, 200.0, 40.0, 30.0];
+        let bottom = [101.0, 230.0, 40.0, 30.0];
+        assert_eq!(stepper_increment_is_second(&top, &bottom), Some(true));
+        assert_eq!(stepper_increment_is_second(&bottom, &top), Some(false));
+
+        // Coincident frames give no trailing side; refuse rather than guess.
+        assert_eq!(stepper_increment_is_second(&left, &left), None);
+        assert_eq!(
+            stepper_increment_is_second(&left, &[f64::NAN, 200.0, 40.0, 30.0]),
+            None
+        );
+    }
+
     #[test]
     fn adjustable_verbs_keep_the_semantic_less_frame_fallback() {
         for verb in ["toggle", "increment", "decrement", "adjust"] {
