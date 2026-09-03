@@ -421,6 +421,11 @@ pub struct AppState {
     /// only ever diffs against its own last read or two, and a miss degrades
     /// gracefully to the full tree.
     pub element_snapshots: Arc<Mutex<ElementSnapshotCache>>,
+    /// Operator/agent "hold" lease: while set and in the future, the idle
+    /// watchdog never releases the phone even with no recent actions — a human
+    /// in the loop (typing a password, approving a prompt) otherwise trips the
+    /// idle window and pays a 60–120s WDA rebuild every time.
+    pub hold_until: Arc<Mutex<Option<Instant>>>,
 }
 
 /// The bounded ring behind [`AppState::element_snapshots`]: recently served
@@ -435,6 +440,18 @@ impl AppState {
     /// forever).
     pub fn touch_activity(&self) {
         *recover(self.last_activity.lock()) = Instant::now();
+    }
+
+    /// Seconds left on the hold lease (0 when none). See `AppState::hold_until`.
+    pub fn hold_remaining_secs(&self) -> u64 {
+        recover(self.hold_until.lock())
+            .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Whether a hold lease is currently keeping the phone.
+    fn held(&self) -> bool {
+        self.hold_remaining_secs() > 0
     }
 
     /// A viewer is actively watching — an MJPEG stream is open or a `/ws`
@@ -597,6 +614,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // capability list.
         .route("/agent/intents", get(agent_intents))
         .route("/agent/intent", post(agent_intent))
+        .route("/agent/hold", post(agent_hold))
         .with_state(state)
 }
 
@@ -1344,6 +1362,7 @@ async fn agent_status(
     let lifecycle = state.wda_lifecycle.current();
     let releasing = lifecycle == WdaLifecycleTransition::Releasing;
     let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
+    let hold_remaining = state.hold_remaining_secs();
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     // Direct mode must not touch any iPhone Mirroring API. The legacy backend
     // keeps the cheap geometry probe for compatibility status.
@@ -1575,7 +1594,7 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
         state.device_udid.is_some(),
         state.managed_wda,
@@ -2422,6 +2441,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if state.viewer_busy() {
                 continue; // someone is watching the live feed
             }
+            if state.held() {
+                continue; // an explicit hold lease keeps the phone
+            }
             if state.wda_control_pending.load(Ordering::Acquire) != 0 {
                 continue; // a real control request outranks idle release
             }
@@ -2432,6 +2454,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             // have resumed while we were awaiting it, so re-check before owning
             // the release transition.
             if state.viewer_busy()
+                || state.held()
                 || state.idle_for() < window
                 || state.wda_control_pending.load(Ordering::Acquire) != 0
             {
@@ -2443,6 +2466,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             // Close the check→CAS race. Once `releasing=true`, request handlers
             // fail fast and cannot start a new device action.
             if state.viewer_busy()
+                || state.held()
                 || state.idle_for() < window
                 || state.wda_control_pending.load(Ordering::Acquire) != 0
             {
@@ -2951,6 +2975,8 @@ enum WdaControlOutcome {
     ElementNotFound,
     AmbiguousElement,
     InvalidElementTarget,
+    /// An `alert` action while no system alert is showing.
+    NoAlert,
     Failed,
 }
 
@@ -3789,7 +3815,10 @@ async fn scroll_snapshot_element(
 #[derive(Debug)]
 enum UniqueLabelTapError {
     NotFound,
-    Ambiguous,
+    /// Several rows match; carries `{"snapshot","matches":[...]}` when the
+    /// daemon resolved them from the flattened tree (label taps), `None` when
+    /// the ambiguity came from WDA's live query (locator taps).
+    Ambiguous(Option<serde_json::Value>),
     InvalidTarget,
     BeforeDispatch(anyhow::Error),
     AfterDispatch(anyhow::Error),
@@ -3803,11 +3832,37 @@ async fn tap_unique_label(
         .elements()
         .await
         .map_err(UniqueLabelTapError::BeforeDispatch)?;
-    let mut matches = rows.iter().filter(|row| row.label == label);
-    let row = matches.next().ok_or(UniqueLabelTapError::NotFound)?;
-    if matches.next().is_some() {
-        return Err(UniqueLabelTapError::Ambiguous);
-    }
+    let matches: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.label == label)
+        .map(|(index, _)| index)
+        .collect();
+    let row = match matches.as_slice() {
+        [] => return Err(UniqueLabelTapError::NotFound),
+        [index] => &rows[*index],
+        _ => {
+            // Hand the agent what it would otherwise re-read: the snapshot
+            // token plus a compact view of every match, so the next call can
+            // be a snapshot-bound tap on the right one.
+            let detail = element_snapshot_id(&rows).ok().map(|snapshot| {
+                serde_json::json!({
+                    "snapshot": snapshot,
+                    "matches": matches.iter().map(|&index| {
+                        let row = &rows[index];
+                        serde_json::json!({
+                            "index": index,
+                            "kind": row.kind,
+                            "rect": row.rect,
+                            "identifier": row.identifier,
+                            "value": row.value,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            });
+            return Err(UniqueLabelTapError::Ambiguous(detail));
+        }
+    };
     let (x, y) = element_center(row).ok_or(UniqueLabelTapError::InvalidTarget)?;
     w.tap_point(x, y)
         .await
@@ -3827,7 +3882,7 @@ async fn tap_unique_locator(
         .filter(|row| agent_locator_matches(row, locator));
     let row = matches.next().ok_or(UniqueLabelTapError::NotFound)?;
     if matches.next().is_some() {
-        return Err(UniqueLabelTapError::Ambiguous);
+        return Err(UniqueLabelTapError::Ambiguous(None));
     }
     let _ = row;
 
@@ -3846,7 +3901,7 @@ async fn tap_unique_locator(
     let element_id = match element_ids.as_slice() {
         [] => return Err(UniqueLabelTapError::NotFound),
         [element_id] => element_id,
-        _ => return Err(UniqueLabelTapError::Ambiguous),
+        _ => return Err(UniqueLabelTapError::Ambiguous(None)),
     };
     w.click_element(element_id).await.map_err(|error| {
         if wda_error_is_missing_element(&error) {
@@ -3906,6 +3961,7 @@ async fn wda_control_with_client(
     w: &mut crate::wda::WdaClient,
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
+    detail: &mut Option<serde_json::Value>,
 ) -> WdaControlOutcome {
     use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -3923,7 +3979,8 @@ async fn wda_control_with_client(
                 Err(UniqueLabelTapError::NotFound) => {
                     return WdaControlOutcome::ElementNotFound;
                 }
-                Err(UniqueLabelTapError::Ambiguous) => {
+                Err(UniqueLabelTapError::Ambiguous(candidates)) => {
+                    *detail = candidates;
                     return WdaControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
@@ -3965,6 +4022,41 @@ async fn wda_control_with_client(
             match snapshot_element_outcome(result, w, "control perform") {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
+            }
+        }
+        // System alerts through WDA's native alert routes. Hardware-hit on
+        // stock Settings: the alert never showed in the flattened tree and an
+        // element click on its button was ACKed without effect — the native
+        // route is the reliable path. `{"type":"alert","button":"…"}` presses a
+        // named button; `{"type":"alert","action":"accept"|"dismiss"}` presses
+        // the default one. Fails closed (`no_alert`) when nothing is showing.
+        "alert" => {
+            let button = v
+                .get("button")
+                .and_then(serde_json::Value::as_str)
+                .filter(|button| !button.is_empty());
+            let action = v.get("action").and_then(serde_json::Value::as_str);
+            let current = match w.alert_summary().await {
+                Ok(current) => current,
+                Err(error) => {
+                    w.invalidate_session();
+                    tracing::warn!("wda alert probe failed before dispatch: {error:#}");
+                    return WdaControlOutcome::NotSent;
+                }
+            };
+            let Some((_, buttons)) = current else {
+                return WdaControlOutcome::NoAlert;
+            };
+            match (button, action) {
+                (Some(name), None) => {
+                    if !buttons.iter().any(|candidate| candidate == name) {
+                        return WdaControlOutcome::ElementNotFound;
+                    }
+                    w.alert_accept(Some(name)).await
+                }
+                (None, Some("accept")) => w.alert_accept(None).await,
+                (None, Some("dismiss")) => w.alert_dismiss().await,
+                _ => return WdaControlOutcome::Unsupported,
             }
         }
         "scroll" if v.get("element").is_some() => {
@@ -4196,9 +4288,39 @@ fn element_not_found_response() -> Response {
     )
 }
 
-fn ambiguous_element_response() -> Response {
+/// `ambiguous_element_label`, optionally carrying the candidates the daemon
+/// already resolved (`{"snapshot","matches":[{index,kind,rect,...}]}`) so the
+/// agent can pick one and send `element`+`snapshot` without another read.
+fn ambiguous_element_response(detail: Option<&serde_json::Value>) -> Response {
+    let Some(detail) = detail else {
+        return element_resolution_response(
+            r#"{"ok":false,"error":"ambiguous_element_label","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements, disambiguate by identifier/kind/state, then send element plus snapshot"}"#,
+        );
+    };
+    let mut body = serde_json::json!({
+        "ok": false,
+        "error": "ambiguous_element_label",
+        "outcome": "not_sent",
+        "retry_safe": true,
+        "hint": "several current rows carry this exact label; pick one of `matches` and send element plus the included snapshot",
+    });
+    if let (Some(object), Some(extra)) = (body.as_object_mut(), detail.as_object()) {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    with_security_headers(
+        Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn no_alert_response() -> Response {
     element_resolution_response(
-        r#"{"ok":false,"error":"ambiguous_element_label","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements, disambiguate by identifier/kind/state, then send element plus snapshot"}"#,
+        r#"{"ok":false,"error":"no_alert","outcome":"not_sent","retry_safe":true,"hint":"no system alert is showing; /agent/elements carries an `alert` block only while one is up"}"#,
     )
 }
 
@@ -4242,6 +4364,7 @@ async fn direct_agent_action(
     w: &mut crate::wda::WdaClient,
     actionable: &std::sync::atomic::AtomicBool,
     value: &serde_json::Value,
+    detail: &mut Option<serde_json::Value>,
 ) -> WdaControlOutcome {
     use std::sync::atomic::Ordering;
 
@@ -4280,7 +4403,8 @@ async fn direct_agent_action(
                 Err(UniqueLabelTapError::NotFound) => {
                     return WdaControlOutcome::ElementNotFound;
                 }
-                Err(UniqueLabelTapError::Ambiguous) => {
+                Err(UniqueLabelTapError::Ambiguous(candidates)) => {
+                    *detail = candidates;
                     return WdaControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
@@ -4315,7 +4439,8 @@ async fn direct_agent_action(
                 Err(UniqueLabelTapError::NotFound) => {
                     return WdaControlOutcome::ElementNotFound;
                 }
-                Err(UniqueLabelTapError::Ambiguous) => {
+                Err(UniqueLabelTapError::Ambiguous(candidates)) => {
+                    *detail = candidates;
                     return WdaControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
@@ -4366,7 +4491,7 @@ async fn direct_agent_action(
     };
 
     let Some(result) = custom_result else {
-        return wda_control_with_client(w, actionable, value).await;
+        return wda_control_with_client(w, actionable, value, detail).await;
     };
     match result {
         Ok(()) => {
@@ -4502,6 +4627,7 @@ async fn direct_control(
     let _priority = state.begin_wda_control();
     let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dispatch_marker = dispatched.clone();
+    let mut detail: Option<serde_json::Value> = None;
     // One deadline covers BOTH mutex acquisition and the WDA action. Re-check
     // lifecycle after acquiring the mutex: a request that sat behind a status
     // probe or previous gesture must never execute after its browser was already
@@ -4515,7 +4641,7 @@ async fn direct_control(
             return None;
         }
         dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
-        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value).await)
+        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail).await)
     })
     .await;
     let outcome = match outcome {
@@ -4564,10 +4690,13 @@ async fn direct_control(
         return element_not_found_response();
     }
     if outcome == WdaControlOutcome::AmbiguousElement {
-        return ambiguous_element_response();
+        return ambiguous_element_response(detail.as_ref());
     }
     if outcome == WdaControlOutcome::InvalidElementTarget {
         return invalid_element_target_response();
+    }
+    if outcome == WdaControlOutcome::NoAlert {
+        return no_alert_response();
     }
     if outcome == WdaControlOutcome::UnsupportedPerformAction {
         return unsupported_perform_action_response();
@@ -5027,6 +5156,23 @@ fn validate_agent_action_value(
                 }
             }
         }
+        "alert" => {
+            let button = action
+                .get("button")
+                .and_then(serde_json::Value::as_str)
+                .filter(|button| !button.is_empty() && button.chars().count() <= 200);
+            let verb = action.get("action").and_then(serde_json::Value::as_str);
+            let valid = match (action.contains_key("button"), action.contains_key("action")) {
+                (true, false) => button.is_some(),
+                (false, true) => matches!(verb, Some("accept" | "dismiss")),
+                _ => false,
+            };
+            if !valid {
+                return invalid(
+                    "alert needs exactly one of button (1-200 chars) or action accept|dismiss",
+                );
+            }
+        }
         _ => return invalid(&format!("has unsupported type {typ:?}")),
     }
     Ok(())
@@ -5401,7 +5547,7 @@ async fn agent_actions(
                 // not be replayed automatically.
                 let outcome = match tokio::time::timeout_at(
                     batch_deadline,
-                    direct_agent_action(&mut w, &state.wda_actionable, action),
+                    direct_agent_action(&mut w, &state.wda_actionable, action, &mut None),
                 )
                 .await
                 {
@@ -5462,6 +5608,12 @@ async fn agent_actions(
                         WdaControlOutcome::AmbiguousElement => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "ambiguous_element_label",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::NoAlert => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "no_alert",
                             "not_sent",
                             true,
                         ),
@@ -6034,7 +6186,9 @@ async fn agent_input(
                 return None;
             }
             dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
-            let outcome = direct_agent_action(&mut client, &state.wda_actionable, &value).await;
+            let mut detail = None;
+            let outcome =
+                direct_agent_action(&mut client, &state.wda_actionable, &value, &mut detail).await;
             // Post-action observation (`?return=delta`), in the SAME lock scope
             // so no other control interleaves between the action and its read.
             // The budget stays under the endpoint deadline with a safety margin
@@ -6057,10 +6211,17 @@ async fn agent_input(
                         .map_err(|error| format!("{error:#}")),
                 );
             }
-            Some((outcome, settled))
+            // A system alert is the one thing the settled tree may not show;
+            // report it alongside so the agent never has to screenshot for it.
+            let alert = if want_delta && outcome == WdaControlOutcome::Applied {
+                probe_alert(&mut client).await
+            } else {
+                None
+            };
+            Some((outcome, settled, alert, detail))
         })
         .await;
-        let (outcome, settled) = match outcome {
+        let (outcome, settled, alert, detail) = match outcome {
             Ok(Some(pair)) => pair,
             Ok(None) => return wda_deadline_response(false),
             Err(_) => {
@@ -6121,6 +6282,7 @@ async fn agent_input(
                         }
                     }
                 };
+                let body = attach_alert(body, alert);
                 with_security_headers(
                     Response::builder()
                         .header(header::CONTENT_TYPE, "application/json")
@@ -6145,8 +6307,9 @@ async fn agent_input(
             WdaControlOutcome::InvalidElementSnapshot => invalid_element_snapshot_response(),
             WdaControlOutcome::StaleElementSnapshot => stale_element_snapshot_response(),
             WdaControlOutcome::ElementNotFound => element_not_found_response(),
-            WdaControlOutcome::AmbiguousElement => ambiguous_element_response(),
+            WdaControlOutcome::AmbiguousElement => ambiguous_element_response(detail.as_ref()),
             WdaControlOutcome::InvalidElementTarget => invalid_element_target_response(),
+            WdaControlOutcome::NoAlert => no_alert_response(),
             WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
         };
     }
@@ -6343,10 +6506,13 @@ async fn agent_elements(
         // Screen size lets callers normalize point-space rects. Failure is
         // non-fatal; the element tree itself is still useful.
         let screen = w.window_size().await.ok();
-        Ok::<_, anyhow::Error>((rows, screen))
+        // Best-effort: a system alert is reported as its own block because the
+        // flattened tree misses or misrepresents it (see WdaClient::alert_summary).
+        let alert = probe_alert(&mut w).await;
+        Ok::<_, anyhow::Error>((rows, screen, alert))
     })
     .await;
-    let (rows, screen) = match result {
+    let (rows, screen, alert) = match result {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!("wda elements failed: {error:#}");
@@ -6385,7 +6551,7 @@ async fn agent_elements(
     // `?since=` with a still-cached baseline answers with a delta instead of
     // the full tree; anything else (no param, evicted, unknown) stays the
     // exact pre-diff response shape (plus the additive `ax_stats` key).
-    let body = match query
+    let mut body = match query
         .since
         .as_deref()
         .filter(|since| !since.is_empty())
@@ -6411,6 +6577,9 @@ async fn agent_elements(
             "ax_stats": ax_stats,
         }),
     };
+    if let (Some(object), Some(alert)) = (body.as_object_mut(), alert_json(alert)) {
+        object.insert("alert".to_string(), alert);
+    }
     match serde_json::to_string(&body) {
         Ok(body) => json_body(StatusCode::OK, body),
         Err(_) => json_body(
@@ -6418,6 +6587,93 @@ async fn agent_elements(
             r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
         ),
     }
+}
+
+/// Best-effort, time-bounded alert probe for read paths. Any failure (no
+/// session yet, relay mid-recovery, slow runner) simply means "no alert
+/// block" — the read it decorates must never be slowed or failed by it.
+async fn probe_alert(w: &mut crate::wda::WdaClient) -> Option<(String, Vec<String>)> {
+    tokio::time::timeout(std::time::Duration::from_millis(1500), w.alert_summary())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+}
+
+/// Sparse `alert` block: `{"text","buttons"}` only while a system alert is up.
+fn alert_json(alert: Option<(String, Vec<String>)>) -> Option<serde_json::Value> {
+    alert.map(|(text, buttons)| serde_json::json!({ "text": text, "buttons": buttons }))
+}
+
+/// Add the sparse `alert` block to an already-serialized JSON object body.
+fn attach_alert(body: String, alert: Option<(String, Vec<String>)>) -> String {
+    let Some(alert) = alert_json(alert) else {
+        return body;
+    };
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("alert".to_string(), alert);
+            }
+            value.to_string()
+        }
+        Err(_) => body,
+    }
+}
+
+/// Maximum hold lease (4 hours) — long enough for any hands-on session, short
+/// enough that a forgotten hold still returns the phone the same day.
+const AGENT_HOLD_MAX_SECS: u64 = 4 * 3600;
+
+/// `POST /agent/hold` `{"secs": N}` — keep the phone for N seconds regardless
+/// of idle time (0 clears). Bearer + mutation header, like every control
+/// endpoint. Returns `{"ok":true,"hold_remaining_secs":N}`.
+async fn agent_hold(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let secs = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("secs").and_then(serde_json::Value::as_u64));
+    let Some(secs) = secs.filter(|secs| *secs <= AGENT_HOLD_MAX_SECS) else {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"ok":false,"error":"invalid_hold","hint":"secs must be an integer from 0 to {AGENT_HOLD_MAX_SECS}"}}"#
+                )))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    };
+    *recover(state.hold_until.lock()) =
+        (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
+    state.touch_activity();
+    with_security_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"ok":true,"hold_remaining_secs":{secs}}}"#
+            )))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -8289,6 +8545,41 @@ mod tests {
             validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dy":80.0})).is_ok()
         );
         assert!(validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5})).is_err());
+    }
+
+    #[test]
+    fn alert_block_is_sparse_and_attaches_to_serialized_bodies() {
+        assert!(alert_json(None).is_none());
+        let block = alert_json(Some((
+            "确认?".to_string(),
+            vec!["继续".to_string(), "取消".to_string()],
+        )))
+        .unwrap();
+        assert_eq!(block["text"], "确认?");
+        assert_eq!(block["buttons"][1], "取消");
+
+        let plain = r#"{"ok":true,"transport":"wda"}"#.to_string();
+        assert_eq!(attach_alert(plain.clone(), None), plain);
+        let with = attach_alert(plain, Some(("t".to_string(), vec![])));
+        let parsed: serde_json::Value = serde_json::from_str(&with).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["alert"]["text"], "t");
+    }
+
+    #[test]
+    fn validate_alert_action_requires_exactly_one_target() {
+        assert!(
+            validate_action(serde_json::json!({"type":"alert","button":"不是 li guo?"})).is_ok()
+        );
+        assert!(validate_action(serde_json::json!({"type":"alert","action":"accept"})).is_ok());
+        assert!(validate_action(serde_json::json!({"type":"alert","action":"dismiss"})).is_ok());
+        assert!(validate_action(serde_json::json!({"type":"alert"})).is_err());
+        assert!(validate_action(serde_json::json!({"type":"alert","button":""})).is_err());
+        assert!(validate_action(serde_json::json!({"type":"alert","action":"explode"})).is_err());
+        assert!(validate_action(
+            serde_json::json!({"type":"alert","button":"OK","action":"accept"})
+        )
+        .is_err());
     }
 
     #[test]

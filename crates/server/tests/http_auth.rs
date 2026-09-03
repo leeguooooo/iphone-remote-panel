@@ -108,6 +108,7 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
         element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::new(),
         )),
+        hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -257,6 +258,7 @@ fn build_state_with_agent_token(
         element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::new(),
         )),
+        hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -1392,6 +1394,70 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
 }
 
 #[test]
+fn agent_elements_surfaces_a_populated_system_alert() {
+    block(async {
+        // A single button plus a live UIAlertController. The flattened tree
+        // handles alerts badly, so the daemon reports it as a first-class
+        // `alert:{text,buttons}` block via WDA's native /alert routes.
+        let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"继续","rect":{"x":10,"y":20,"width":80,"height":44},"children":[]}]}}"#;
+        let (base, server) = mock_wda(5, move |request, _| {
+            if request.starts_with("POST /session ") {
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"sessionId":"SESSION"}}"#.to_string(),
+                ))
+            } else if request.contains("/source?format=json") {
+                Some((std::time::Duration::ZERO, source.to_string()))
+            } else if request.contains("/window/size") {
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"width":390,"height":844}}"#.to_string(),
+                ))
+            } else if request.contains("/alert/text") {
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":"以 li guo 的身份设置媒体与购买项目?"}"#.to_string(),
+                ))
+            } else {
+                assert!(
+                    request.contains("/wda/alert/buttons"),
+                    "unexpected WDA request: {request}"
+                );
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":["继续","不是 li guo?","取消"]}"#.to_string(),
+                ))
+            }
+        });
+        let app = http::router(build_state_with_wda(&base));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/elements")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["alert"]["text"], "以 li guo 的身份设置媒体与购买项目?");
+        assert_eq!(
+            json["alert"]["buttons"],
+            serde_json::json!(["继续", "不是 li guo?", "取消"])
+        );
+        // The element tree is still present alongside the alert block.
+        assert!(json["elements"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()));
+    });
+}
+
+#[test]
 fn direct_browser_control_can_tap_an_accessibility_label() {
     block(async {
         let click_count = Arc::new(AtomicUsize::new(0));
@@ -1544,7 +1610,7 @@ fn indexed_browser_tap_applies_only_when_the_snapshot_still_matches() {
         let observed = action_count.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"更多","rect":{"x":20,"y":40,"width":80,"height":44},"children":[]},{"type":"XCUIElementTypeButton","label":"更多","rect":{"x":20,"y":100,"width":80,"height":44},"children":[]}]}}"#;
         let source = source.replacen("\"label\":\"更多\"", "\"label\":\"菜单\"", 1);
-        let (base, server) = mock_wda(6, move |request, _| {
+        let (base, server) = mock_wda(7, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1565,6 +1631,12 @@ fn indexed_browser_tap_applies_only_when_the_snapshot_still_matches() {
                 Some((
                     std::time::Duration::ZERO,
                     r#"{"value":[{"ELEMENT":"MORE"}]}"#.to_string(),
+                ))
+            } else if request.contains("/alert/text") {
+                // No system alert in this scenario (best-effort probe).
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"error":"no such alert","message":"no alert"}}"#.to_string(),
                 ))
             } else {
                 assert!(
@@ -1639,7 +1711,7 @@ fn indexed_browser_tap_rejects_a_stale_snapshot_without_tapping() {
         let observed_sources = source_count.clone();
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed_actions = action_count.clone();
-        let (base, server) = mock_wda(4, move |request, _| {
+        let (base, server) = mock_wda(5, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1658,6 +1730,11 @@ fn indexed_browser_tap_rejects_a_stale_snapshot_without_tapping() {
                 Some((
                     std::time::Duration::ZERO,
                     r#"{"value":{"width":390,"height":844}}"#.to_string(),
+                ))
+            } else if request.contains("/alert/text") {
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"error":"no such alert","message":"no alert"}}"#.to_string(),
                 ))
             } else {
                 observed_actions.fetch_add(1, Ordering::SeqCst);
