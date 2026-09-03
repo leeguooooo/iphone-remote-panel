@@ -2191,6 +2191,46 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
     let domain = gui_domain();
     let service = format!("{domain}/{WDA_AGENT_LABEL}");
     let was_loaded = launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    // Cold start: the job isn't in the gui domain yet — it was booted out on a
+    // prior stop, or never loaded after login. `launchctl enable`/`kickstart`
+    // both fail on an unknown service with "Could not find service … in domain
+    // for user 501", which used to hit the `enable` early-return below and
+    // leave the daemon wedged `offline`, replaying that same failure on every
+    // reconnect (issue #62). Bootstrap the plist first so the service exists;
+    // RunAtLoad then starts it.
+    if !was_loaded {
+        let bootstrap_job = || {
+            std::process::Command::new("launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&plist_path)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
+        let mut bootstrapped = bootstrap_job();
+        if !bootstrapped && !launchd_job_loaded(&domain, WDA_AGENT_LABEL) {
+            // A persistently-disabled service refuses bootstrap. Now that the
+            // label is known to the domain, clearing the disabled flag and
+            // retrying recovers it.
+            let _ = std::process::Command::new("launchctl")
+                .args(["enable", &service])
+                .status();
+            bootstrapped = bootstrap_job();
+        }
+        if !launchd_job_loaded(&domain, WDA_AGENT_LABEL) {
+            if !bootstrapped && plist_changed {
+                restore_plist(&plist_path, original.as_deref());
+            }
+            return false;
+        }
+        // Loaded now. Force one fresh run: RunAtLoad may have fired and the
+        // runner already exited (ThrottleInterval/KeepAlive can leave it briefly
+        // down right after bootstrap), and kickstart is safe on a loaded job.
+        let _ = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &service])
+            .status();
+        return launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    }
     // A persistently disabled service rejects bootstrap. Enable first and treat
     // failure as authoritative instead of continuing into a misleading start.
     if !std::process::Command::new("launchctl")
