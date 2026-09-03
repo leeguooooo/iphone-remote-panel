@@ -1209,16 +1209,36 @@ impl WdaClient {
 /// WDA's default 15). Unset or unparseable values are simply omitted, so the
 /// default daemon applies no settings at all.
 fn snapshot_settings_from_env() -> Option<serde_json::Map<String, serde_json::Value>> {
+    snapshot_settings(
+        std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH")
+            .ok()
+            .as_deref(),
+        std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`snapshot_settings_from_env`], split out so the opt-in rules
+/// are testable without mutating process-wide env (mirrors
+/// [`crate::macos::front_deadline`]'s split).
+///
+/// A rejected value must be *omitted*, never sent as a degenerate setting: a
+/// `snapshotMaxDepth` of 0 would ask WDA for an empty tree, and a 0s
+/// `customSnapshotTimeout` would fail every snapshot — both are worse than
+/// the unbounded default this is meant to protect against.
+fn snapshot_settings(
+    max_depth: Option<&str>,
+    timeout_s: Option<&str>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut settings = serde_json::Map::new();
-    if let Some(depth) = std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH")
-        .ok()
+    if let Some(depth) = max_depth
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|depth| *depth > 0)
     {
         settings.insert("snapshotMaxDepth".to_string(), depth.into());
     }
-    if let Some(timeout) = std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S")
-        .ok()
+    if let Some(timeout) = timeout_s
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|timeout| timeout.is_finite() && *timeout > 0.0)
     {
@@ -1786,6 +1806,61 @@ mod tests {
         let sent = block(client.named_key("return"));
         server.join().unwrap();
         sent.unwrap();
+    }
+
+    // issue #44: a huge accessibility tree (KakaoTalk) runs the snapshot long
+    // enough that testmanagerd kills the whole runner. These knobs are the
+    // opt-in bound; they were shipped without tests, so pin the opt-in rules.
+    #[test]
+    fn snapshot_settings_are_absent_unless_asked_for() {
+        assert!(snapshot_settings(None, None).is_none());
+    }
+
+    #[test]
+    fn snapshot_settings_carry_each_knob_under_wdas_own_name() {
+        let depth = snapshot_settings(Some("8"), None).expect("depth alone opts in");
+        assert_eq!(depth.get("snapshotMaxDepth"), Some(&serde_json::json!(8)));
+        assert!(depth.get("customSnapshotTimeout").is_none());
+
+        let timeout = snapshot_settings(None, Some("2.5")).expect("timeout alone opts in");
+        assert_eq!(
+            timeout.get("customSnapshotTimeout"),
+            Some(&serde_json::json!(2.5))
+        );
+        assert!(timeout.get("snapshotMaxDepth").is_none());
+
+        let both = snapshot_settings(Some(" 12 "), Some(" 3 ")).expect("both, whitespace trimmed");
+        assert_eq!(both.get("snapshotMaxDepth"), Some(&serde_json::json!(12)));
+        assert_eq!(
+            both.get("customSnapshotTimeout"),
+            Some(&serde_json::json!(3.0))
+        );
+    }
+
+    // A degenerate value must be dropped, not forwarded: depth 0 asks WDA for
+    // an empty tree and a 0s timeout fails every snapshot — each is worse than
+    // the unbounded default these knobs exist to bound.
+    #[test]
+    fn snapshot_settings_reject_degenerate_and_unparseable_values() {
+        for bad in ["0", "-1", "", "  ", "lots", "1e400"] {
+            assert!(
+                snapshot_settings(Some(bad), None).is_none(),
+                "depth {bad:?} must be omitted"
+            );
+        }
+        for bad in ["0", "0.0", "-2.5", "", "nope", "inf", "NaN"] {
+            assert!(
+                snapshot_settings(None, Some(bad)).is_none(),
+                "timeout {bad:?} must be omitted"
+            );
+        }
+        // One bad knob must not suppress the other good one.
+        let only_good = snapshot_settings(Some("0"), Some("4")).expect("valid timeout survives");
+        assert_eq!(only_good.len(), 1);
+        assert_eq!(
+            only_good.get("customSnapshotTimeout"),
+            Some(&serde_json::json!(4.0))
+        );
     }
 
     #[test]

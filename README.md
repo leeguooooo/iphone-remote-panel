@@ -247,7 +247,7 @@ The bundled web and MCP clients add the header automatically.
 | `GET` / `POST` | `/agent/inbox` | GET safely peeks at the legacy Shortcuts result queue. POST requires bearer auth plus the mutation header and appends one result. |
 | `POST` | `/agent/inbox/drain` | Requires bearer auth plus the mutation header; atomically returns and clears the queued results. |
 | `GET` | `/agent/intents` | The curated semantic-intent registry (`~/.iphone-use/intents-registry.json`), served per request. A missing file returns an empty list with a setup hint, never an error; malformed entries are skipped fail-closed. |
-| `POST` | `/agent/intent` | Requires bearer auth and the mutation header. Dispatches one registered verb (`{"name":"battery","args":{}}`) by opening a `shortcuts://run-shortcut` deep link on-device through WDA's sessionless `POST /url`; the bridge shortcut's result arrives on `/agent/inbox`, matched by the returned `id`. First use of each verb needs one interactive permission blessing on the phone, and the Shortcuts app foregrounds during a call. Errors carry the honest `outcome`/`retry_safe` taxonomy; a devicectl fallback is only ever a hint, never auto-dispatched. |
+| `POST` | `/agent/intent` | Requires bearer auth and the mutation header. Dispatches one registered verb (`{"name":"battery","args":{}}`) by opening a `shortcuts://run-shortcut` deep link on-device through WDA's session-scoped `POST /session/:sid/url`; the bridge shortcut's result arrives on `/agent/inbox`, matched by the returned `id`. First use of each verb needs one interactive permission blessing on the phone, and the Shortcuts app foregrounds during a call. Errors carry the honest `outcome`/`retry_safe` taxonomy; a devicectl fallback is only ever a hint, never auto-dispatched. |
 | `GET` | `/agent/screenshot` | Current phone screen as PNG from the on-device path. |
 | `GET` | `/agent/elements` | Flattened WDA accessibility tree plus an ephemeral `snapshot` token. `?since=<snapshot>` answers with a `delta` (`added`/`changed`/`removed`/`unchanged`) against a still-cached prior tree instead of the full list; an unknown baseline falls back to the full tree. Both shapes include a read-only `ax_stats` block (`n`, `n_interactive`, `labeled_frac`, `coverage`, `container_only`, `max_depth`) so clients can judge tree usability before falling back to vision. It also carries a sparse `alert:{text,buttons}` block while a system alert (UIAlertController) is on screen. Missing/busy WDA returns `503`; a failed source retry returns `502`, never a misleading `200` empty tree. |
 
@@ -422,6 +422,22 @@ Curate verbs in `~/.iphone-use/intents-registry.json` (start from
 [`deploy/intents-registry.example.json`](deploy/intents-registry.example.json)).
 First run of each verb needs one interactive permission blessing on the phone,
 and Shortcuts foregrounds during a call.
+
+**The return path needs the phone to reach the daemon** (issue #59). Dispatch
+travels Mac → phone over the WDA relay, but the bridge shortcut answers with a
+`POST /agent/inbox` *from the phone*, so a loopback-only daemon — the hardened
+`PHONE_REMOTE_HOST=127.0.0.1` default — can dispatch a verb and never receive
+its result. **The default stays loopback, which means the intents channel is
+off until you configure one of these:**
+
+| Return path | How | Trade-off |
+|---|---|---|
+| LAN bind | `PHONE_REMOTE_HOST=0.0.0.0` (keep the password *and* `PHONE_REMOTE_AGENT_TOKEN` set) | Simplest. Exposes the daemon's authenticated surface to everything on your LAN — a security-posture decision, not a default. |
+| USB reverse tunnel | Forward a phone-side port back to the Mac's loopback listener | No LAN exposure; more moving parts to keep alive. |
+
+Dispatch-only verbs (fire-and-forget, nothing read back) work on plain loopback.
+Do not set `0.0.0.0` on an untrusted network: WDA's own `8100`/`9100` listeners
+have no authentication of their own.
 
 ## Agent skill
 
