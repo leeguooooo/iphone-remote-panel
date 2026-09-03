@@ -419,7 +419,18 @@ The Direct-native successor is the **semantic intents channel**
 `shortcuts://run-shortcut` deep link on-device through WDA — no Spotlight, no
 clipboard carrier — and the bridge shortcut still answers via `/agent/inbox`.
 Curate verbs in `~/.iphone-use/intents-registry.json` (start from
-[`deploy/intents-registry.example.json`](deploy/intents-registry.example.json)).
+[`deploy/intents-registry.example.json`](deploy/intents-registry.example.json)),
+and generate the matching bridge shortcut instead of building it by hand:
+
+```bash
+python3 deploy/make-bridge-shortcut.py --token "$PHONE_REMOTE_AGENT_TOKEN"
+open "iU Bridge.shortcut"     # accept the import dialog; iCloud syncs it to the phone
+```
+
+The shortcut's name must equal the registry's `bridge.name`, and the bearer
+token is stored inside the shortcut's own request headers — it never travels in
+the deep link. `--self-test` checks the parts of a Shortcuts plist that fail
+silently (variable slots, response JSON, branch balance) without writing files.
 First run of each verb needs one interactive permission blessing on the phone,
 and Shortcuts foregrounds during a call.
 
