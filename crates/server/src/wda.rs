@@ -925,7 +925,12 @@ impl WdaClient {
     /// events. Plain text keeps using [`Self::keys`], which is correct for it.
     pub async fn named_key(&mut self, name: &str) -> Result<()> {
         let value = match name {
-            "return" | "enter" => "\u{E007}",
+            // `send`/`go`/`search` are the same physical Return key an agent
+            // reaches for to submit a chat message ("发送"), a URL bar ("前往"),
+            // or a search field — coordinate-tapping a third-party keyboard's
+            // 发送 glyph ACKs but does not fire, so route them to the real key
+            // event instead (issue #63).
+            "return" | "enter" | "send" | "go" | "search" => "\u{E007}",
             "escape" => "\u{E00C}",
             "space" => "\u{E00D}",
             "tab" => "\u{E004}",
@@ -1698,6 +1703,25 @@ mod tests {
         let sent = block(client.named_key("return"));
         server.join().unwrap();
         sent.unwrap();
+    }
+
+    #[test]
+    fn named_key_send_go_search_alias_the_return_key() {
+        // issue #63: coordinate-tapping a third-party keyboard's 发送 / 前往 key
+        // ACKs but does not submit; `send`/`go`/`search` must map to the real
+        // Return key event (U+E007) so a chat/search actually fires.
+        for name in ["send", "go", "search"] {
+            let (base, server) = mock_wda(1, |request| {
+                assert!(request.contains(r#""type":"key""#), "{request}");
+                assert!(request.contains('\u{E007}'), "{request}");
+                r#"{"value":null}"#.to_string()
+            });
+            let mut client = WdaClient::new(base).unwrap();
+            client.session = Some("SESSION".to_string());
+            let sent = block(client.named_key(name));
+            server.join().unwrap();
+            sent.unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
     }
 
     #[test]

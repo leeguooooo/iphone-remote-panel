@@ -90,7 +90,7 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"tap",
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"tap","element":3,"snapshot":"<same elements response>"}'
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":60}'
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"text","text":"Health"}'
-curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"key","name":"return"}'
+curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"key","name":"return"}'  # return|enter|send|go|search all fire the Return key — use this to submit a chat/search; coordinate-tapping a 3rd-party keyboard's 发送/前往 key ACKs but does NOT send
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"shortcut","name":"home"}'      # home|spotlight
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"longpress","x":0.4,"y":0.6,"duration_ms":700}'
 curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/input" -d '{"type":"keyboard"}'                     # dismiss the on-screen keyboard
@@ -112,6 +112,15 @@ After typing into a web form the keyboard covers the page's own submit/next
 buttons — send `{"type":"keyboard"}` to dismiss it before tapping them.
 `shortcut:"switcher"` is unsupported in Direct/WDA: iOS does not expose an
 App Switcher action that WDA can synthesize. Do not send it and claim success.
+
+`{"type":"back"}` is a left-edge-swipe gesture, not a universal Back button: on
+a screen with no in-app back target it can carry past the edge and **switch
+apps** (e.g. drop you onto the Home screen or another app). Prefer resolving and
+tapping the on-screen back control (`{"type":"tap","label":"…"}` / an element
+tap) when one exists; use `back` only when you know the current screen has an
+edge-swipe-back. For unattended runs, turn on a **Focus mode** first — a banner
+notification dropping from the top will otherwise intercept a tap and open the
+notifying app (hardware-seen: a chat banner hijacked a tap and opened WeChat).
 
 MCP alternative: the repo ships `iphone-use-mcp` (crates/mcp) with the
 day-to-day safe subset: status, reconnect, screenshot, elements, coordinate
