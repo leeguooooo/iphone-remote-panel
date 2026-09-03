@@ -81,6 +81,13 @@ If a stale caller forgets the mutation header, the 403 response names
 `required_header:"X-Phone-Control: 1"` and includes a retry hint. Correct the
 request once; do not repeat the unactionable POST.
 
+**Give your own client at least 40s on `/agent/elements`.** The daemon keeps
+rebuilding a failed source read until its own 35s deadline before answering
+`wda_source_failed` — so a shorter client timeout (`curl -m 25`) cuts the
+connection first and hands you an **empty body**, not JSON. That empty body is
+your timeout, not a daemon fault and not an empty screen: re-read with a longer
+one before concluding anything about the phone.
+
 Actions — coordinates are **normalized [0,1]** over the phone screen
 (`0,0` top-left, `1,1` bottom-right), so they're resolution-independent:
 
