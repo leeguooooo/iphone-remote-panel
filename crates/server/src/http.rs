@@ -3516,6 +3516,47 @@ fn slider_normalized_position(value: Option<&str>) -> Option<f64> {
 /// [`PERFORM_ACTION_NAMES`]). Reuses the whole fail-closed pipeline: snapshot
 /// token check, semantic re-resolution, and the 404 → `NotFound` remap on
 /// every post-resolution route.
+/// Match a semantic-less snapshot row onto its live element by geometry.
+///
+/// A row with an empty label and no identifier cannot be resolved by locator,
+/// but it still has a frame. Enumerate the on-screen elements of that class
+/// and take the one whose frame equals the row's rect; refuse rather than
+/// guess when two of them do.
+async fn resolve_row_by_frame(
+    w: &mut crate::wda::WdaClient,
+    row: &crate::wda::ElementRow,
+    class_chain: &str,
+) -> Result<String, SnapshotElementTapError> {
+    let candidates = w
+        .find_elements("class chain", class_chain)
+        .await
+        .map_err(SnapshotElementTapError::BeforeDispatch)?;
+    let mut matched = None;
+    for candidate in &candidates {
+        if let Ok(rect) = w.element_rect(candidate).await {
+            let close = rect
+                .iter()
+                .zip(row.rect.iter())
+                .all(|(a, b)| (a - b).abs() <= 2.0);
+            if close {
+                if matched.is_some() {
+                    return Err(SnapshotElementTapError::Ambiguous);
+                }
+                matched = Some(candidate.clone());
+            }
+        }
+    }
+    matched.ok_or(SnapshotElementTapError::NotFound)
+}
+
+/// Perform verbs that must survive a semantic-less row.
+///
+/// These are the verbs whose targets are routinely unlabeled controls: a
+/// stock Settings switch, and a stock timer's PickerWheel (empty label, no
+/// identifier — hardware-verified, issue #57). Every other verb still
+/// requires a real locator.
+const PERFORM_VERBS_WITH_FRAME_FALLBACK: &[&str] = &["toggle", "increment", "decrement", "adjust"];
+
 async fn perform_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
@@ -3539,7 +3580,11 @@ async fn perform_snapshot_element(
     // requires the semantic resolution.
     let element_id = match resolve_snapshot_row_element(w, row).await {
         Ok(element_id) => Some(element_id),
-        Err(SnapshotElementTapError::InvalidTarget) if action == "toggle" => None,
+        Err(SnapshotElementTapError::InvalidTarget)
+            if PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&action.as_str()) =>
+        {
+            None
+        }
         Err(error) => return Err(error),
     };
     let after_dispatch = |error: anyhow::Error| {
@@ -3558,26 +3603,7 @@ async fn perform_snapshot_element(
                 // the semantic-less row onto its live element by geometry:
                 // enumerate on-screen Switch elements and pick the one whose
                 // frame equals the row's rect.
-                let candidates = w
-                    .find_elements("class chain", "**/XCUIElementTypeSwitch")
-                    .await
-                    .map_err(SnapshotElementTapError::BeforeDispatch)?;
-                let mut matched = None;
-                for candidate in &candidates {
-                    if let Ok(rect) = w.element_rect(candidate).await {
-                        let close = rect
-                            .iter()
-                            .zip(row.rect.iter())
-                            .all(|(a, b)| (a - b).abs() <= 2.0);
-                        if close {
-                            if matched.is_some() {
-                                return Err(SnapshotElementTapError::Ambiguous);
-                            }
-                            matched = Some(candidate.clone());
-                        }
-                    }
-                }
-                let matched = matched.ok_or(SnapshotElementTapError::NotFound)?;
+                let matched = resolve_row_by_frame(w, row, "**/XCUIElementTypeSwitch").await?;
                 w.click_element(&matched).await.map_err(after_dispatch)
             }
             Some(element_id) => {
@@ -3596,7 +3622,16 @@ async fn perform_snapshot_element(
             }
         };
     }
-    let element_id = element_id.expect("non-toggle actions always resolve or return above");
+    // An adjustable control is as likely to be semantic-less as a switch: the
+    // stock timer's PickerWheel carries `actions:[increment,decrement,adjust]`
+    // and a perfectly finite rect, yet has no label and no identifier, so
+    // locator resolution fails and every one of its own advertised verbs was
+    // refused as `invalid_element_target` (hardware-verified, #57). Fall back
+    // to the same geometry match the switch uses, keyed on the row's kind.
+    let element_id = match element_id {
+        Some(element_id) => element_id,
+        None => resolve_row_by_frame(w, row, &format!("**/XCUIElementType{}", row.kind)).await?,
+    };
     match action.as_str() {
         "increment" | "decrement" => match row.kind.as_str() {
             "PickerWheel" => {
@@ -3605,7 +3640,11 @@ async fn perform_snapshot_element(
                 } else {
                     "previous"
                 };
-                w.pickerwheel_select(&element_id, order, 0.2)
+                // Offset is a fraction of the wheel's height to swipe, not a
+                // notch count: 0.2 moves TWO notches on a stock timer wheel
+                // (hardware-measured 21→23→25 minutes, #57). `increment` means
+                // one notch, so halve it.
+                w.pickerwheel_select(&element_id, order, 0.1)
                     .await
                     .map_err(after_dispatch)
             }
@@ -8379,6 +8418,32 @@ mod tests {
     // A banner notification drops in front of a tap, swallows it and opens its
     // own app (hardware-hit: a chat banner took a tap meant for Settings). The
     // caller gets a delta for a screen it never asked for, so name the switch.
+    // #57: the stock timer's PickerWheel advertises increment/decrement/adjust
+    // yet has an empty label and no identifier, so locator resolution fails and
+    // every one of its own advertised verbs was refused. Adjustable verbs must
+    // keep the geometry fallback; verbs with a real target must not get it.
+    #[test]
+    fn adjustable_verbs_keep_the_semantic_less_frame_fallback() {
+        for verb in ["toggle", "increment", "decrement", "adjust"] {
+            assert!(
+                PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&verb),
+                "{verb} must survive a semantic-less row"
+            );
+        }
+        for verb in [
+            "menu",
+            "double_tap",
+            "two_finger_tap",
+            "scroll",
+            "force_touch",
+        ] {
+            assert!(
+                !PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&verb),
+                "{verb} must still require a real locator"
+            );
+        }
+    }
+
     #[test]
     fn app_changed_json_names_the_app_an_action_switched_to() {
         let before = vec![
