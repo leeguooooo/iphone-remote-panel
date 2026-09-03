@@ -89,6 +89,17 @@ if [ "$WDA_REF" = "$DEFAULT_WDA_REF" ]; then
 else
     WDA_REF_LABEL="custom pin"
 fi
+# Home-screen name of the XCUITest runner app that gets installed on the phone.
+# Upstream leaves it as "WebDriverAgentRunner-Runner", which shows up on the
+# user's device as an unexplained blank-icon app (issue #64). Xcode derives the
+# runner's CFBundleName from the test target's PRODUCT_NAME, so renaming that
+# target — and ONLY that target, in the checked-out project — relabels it.
+# Set to an empty string to keep upstream's name.
+WDA_RUNNER_NAME="${WDA_RUNNER_NAME:-iPhoneUse}"
+case "$WDA_RUNNER_NAME" in
+    ''|*[!A-Za-z0-9_-]*)
+        [ -z "$WDA_RUNNER_NAME" ] || die "WDA_RUNNER_NAME must be ASCII letters, digits, '_' or '-' (got '$WDA_RUNNER_NAME')" ;;
+esac
 WDA_ALLOW_LAN="${WDA_ALLOW_LAN:-$(_existing_wda_env WDA_ALLOW_LAN)}"
 WDA_ALLOW_LAN="${WDA_ALLOW_LAN:-0}"
 WDA_UDID="${WDA_UDID:-${PHONE_REMOTE_UDID:-}}"
@@ -1757,6 +1768,25 @@ else
    Setup will use it, but uninstall will preserve it rather than guessing ownership:
    $WDA_CANONICAL_DIR"
 fi
+# The runner rename applied after the checkout (below) edits the tracked
+# project.pbxproj, which the guard immediately after this would refuse to
+# overwrite on every later run. Restore that one file when the ONLY thing
+# changed in it is our own PRODUCT_NAME swap, so re-runs work while any other
+# local edit is still reported and refused.
+_restore_runner_rename() {
+    _rrn_pbx='WebDriverAgent.xcodeproj/project.pbxproj'
+    [ -n "$WDA_RUNNER_NAME" ] || return 0
+    [ -n "$(git -C "$WDA_DIR" status --porcelain --untracked-files=no -- "$_rrn_pbx" 2>/dev/null)" ] || return 0
+    # Bail out (leave it dirty for the guard to report) if any changed line is
+    # something other than the exact swap we make.
+    if git -C "$WDA_DIR" diff -U0 -- "$_rrn_pbx" 2>/dev/null \
+        | grep -E '^[+-][^+-]' \
+        | grep -qvE '^\+[[:space:]]*PRODUCT_NAME = '"$WDA_RUNNER_NAME"';$|^-[[:space:]]*PRODUCT_NAME = "\$\(TARGET_NAME\)";$'; then
+        return 0
+    fi
+    git -C "$WDA_DIR" checkout -- "$_rrn_pbx" 2>/dev/null || true
+}
+_restore_runner_rename
 if ! WDA_TRACKED_CHANGES="$(git -C "$WDA_DIR" status --porcelain --untracked-files=no 2>/dev/null)"; then
     die "could not inspect tracked changes in $WDA_DIR"
 fi
@@ -1777,6 +1807,40 @@ WDA_COMMIT="$(git -C "$WDA_DIR" rev-parse HEAD 2>/dev/null || true)"
     || die "WDA checkout verification failed: expected $WDA_REF, found ${WDA_COMMIT:-nothing}"
 WDA_COMMIT_SHORT="$(printf '%.12s' "$WDA_COMMIT")"
 ok "Pinned WDA source: $WDA_REF_LABEL $WDA_COMMIT_SHORT at $WDA_DIR"
+
+# Relabel the runner app that lands on the user's home screen (issue #64).
+# Xcode synthesises the runner as "<PRODUCT_NAME>-Runner" from its own template
+# and ignores the test target's Info.plist, so there is no plist lever —
+# hardware-verified: INFOPLIST_KEY_CFBundleDisplayName is NOT injected into the
+# generated .xctrunner. Patch ONLY the Runner target's build configurations,
+# identified by their INFOPLIST_FILE; passing PRODUCT_NAME= on the xcodebuild
+# command line instead would apply to every target and rename WebDriverAgentLib
+# — the build breakage warned about at the build step below. The bundle id and
+# the xcodebuild argv are untouched, so the runner identity checks still hold.
+if [ -n "$WDA_RUNNER_NAME" ]; then
+    if WDA_RUNNER_NAME="$WDA_RUNNER_NAME" python3 - "$WDA_DIR/WebDriverAgent.xcodeproj/project.pbxproj" <<'PY'
+import os, re, sys
+
+path = sys.argv[1]
+name = os.environ["WDA_RUNNER_NAME"]
+source = open(path).read()
+blocks = re.split(r'(?=\t\t[0-9A-F]{24} /\* (?:Debug|Release) \*/ = \{)', source)
+patched = 0
+for index, block in enumerate(blocks):
+    if ('INFOPLIST_FILE = WebDriverAgentRunner/Info.plist;' in block
+            and 'PRODUCT_NAME = "$(TARGET_NAME)";' in block):
+        blocks[index] = block.replace(
+            'PRODUCT_NAME = "$(TARGET_NAME)";', 'PRODUCT_NAME = %s;' % name)
+        patched += 1
+if patched:
+    open(path, 'w').write(''.join(blocks))
+PY
+    then
+        ok "Runner app installs as ${WDA_RUNNER_NAME}-Runner (set WDA_RUNNER_NAME= to keep upstream's name)"
+    else
+        die "could not relabel the WDA runner target in project.pbxproj"
+    fi
+fi
 
 if [ -z "${WDA_UDID:-}" ]; then
     # xcodebuild exposes the classic UDID WDA needs. Never use `head -1`: with
