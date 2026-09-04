@@ -2053,6 +2053,34 @@ fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
     }
 }
 
+/// Name of the retry state `setup-wda.sh` persists across supervisor restarts.
+/// Kept in one place because the daemon must clear exactly this file — and
+/// nothing else — when a caller explicitly asks for the phone.
+const WDA_RETRY_STATE_FILE: &str = "wda-retry-state.v1";
+
+/// Drop the supervisor's persisted retry backoff.
+///
+/// `setup-wda.sh` backs off between rebuild attempts (up to 15 minutes while
+/// the phone is locked) and persists that timer so a launchd restart resumes
+/// it rather than hammering the device. The supervisor cannot tell a launchd
+/// auto-restart from a `kickstart` the daemon issued because an agent asked
+/// for the phone — so an explicit bring-up would otherwise inherit a long
+/// sleep and blow past the daemon's readiness window. An explicit request is
+/// the one signal that outranks the backoff, so clear it here.
+fn clear_wda_retry_backoff(home: &str) {
+    if home.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(home)
+        .join(".iphone-use")
+        .join(WDA_RETRY_STATE_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::warn!("cleared the WDA retry backoff for an explicit bring-up"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!("could not clear the WDA retry backoff: {error}"),
+    }
+}
+
 /// Start or restart the dedicated WDA supervisor without destroying its
 /// persisted signing/path/port policy.
 ///
@@ -2066,6 +2094,9 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
     if !std::path::Path::new(setup_sh).is_file() || !valid_wda_udid(udid) {
         return false;
     }
+    // Both callers mean "bring the phone up now" (the setup endpoint and an
+    // explicit reconnect), so neither should inherit a pending backoff.
+    clear_wda_retry_backoff(home);
     let plist_path = std::path::PathBuf::from(format!(
         "{home}/Library/LaunchAgents/{WDA_AGENT_LABEL}.plist"
     ));
@@ -2129,7 +2160,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
     <dict>
 {env_xml}    </dict>
     <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>30</integer>
+    <key>ThrottleInterval</key><integer>5</integer>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>{log_xml}</string>
     <key>StandardErrorPath</key><string>{log_xml}</string>
@@ -8612,6 +8643,33 @@ mod tests {
     // stayed false and the down-path early-continue meant the watchdog never
     // tried again, so the supervisor kept rebuilding and kept demanding an
     // unlock. Retries must back off, but must never stop coming.
+    // An explicit "bring the phone up now" outranks the supervisor's persisted
+    // backoff, which can otherwise be a 15-minute sleep the restarted script
+    // resumes — well past the daemon's readiness window. Clearing it must hit
+    // exactly one file: deleting anything else in ~/.iphone-use would be worse
+    // than the bug.
+    #[test]
+    fn clearing_the_retry_backoff_removes_only_that_one_file() {
+        let home = std::env::temp_dir().join(format!("iu-backoff-{}", std::process::id()));
+        let dir = home.join(".iphone-use");
+        std::fs::create_dir_all(&dir).expect("temp home");
+        let target = dir.join(WDA_RETRY_STATE_FILE);
+        let bystander = dir.join("wda-setup-status.json");
+        std::fs::write(&target, b"version=1").expect("write target");
+        std::fs::write(&bystander, b"{}").expect("write bystander");
+
+        clear_wda_retry_backoff(home.to_str().expect("utf-8 home"));
+        assert!(!target.exists(), "the backoff state must be gone");
+        assert!(bystander.exists(), "no other state file may be touched");
+
+        // Idempotent: a second call with nothing to remove is not an error.
+        clear_wda_retry_backoff(home.to_str().expect("utf-8 home"));
+        // And an unknown home is a no-op rather than a panic or a stray delete.
+        clear_wda_retry_backoff("");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn release_retry_backoff_grows_and_caps_without_ever_giving_up() {
         let mut failures = 0;

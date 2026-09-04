@@ -114,6 +114,22 @@ connected, trusted, unlocked, and awake:
 ~/.iphone-use/setup-wda.sh status
 ```
 
+Pause managed WDA when you want uninterrupted hands-on use of the phone, then
+resume it before the next agent session:
+
+```bash
+~/.iphone-use/setup-wda.sh pause
+~/.iphone-use/setup-wda.sh resume
+```
+
+`pause` disables the dedicated launchd job and stops only processes whose saved
+PID and command identity still match. `resume` validates that job before loading it
+again. After a lock-screen failure, rebuild attempts back off from 30 seconds to at
+most 15 minutes instead of repeatedly asking for the passcode. Other failures back
+off from 5 seconds to at most 5 minutes. A verified recovery resets either schedule.
+An interactive setup waits at most 5 minutes for unlock and backs off its reminders;
+press `Ctrl-C` to stop sooner and rerun after unlocking.
+
 Then open **`http://<mac-lan-ip>:44321/setup`** for the built-in live connection guide.
 It translates `/agent/status` into the current USB, trust, developer-service, WDA, or
 external-host blocker without changing VPN/proxy settings or running setup for you. Once
@@ -214,6 +230,7 @@ the heaviest users make the product better.
 | `PHONE_REMOTE_WDA_URL` | `http://127.0.0.1:8100` in direct installs | WDA control loopback. WDA itself has no authentication; direct input fails closed when this endpoint is unavailable. |
 | `PHONE_REMOTE_WDA_MJPEG_URL` | `http://127.0.0.1:9100` in direct installs | WDA MJPEG loopback. WDA itself has no authentication; the daemon exposes it to authenticated viewers at `/agent/mjpeg`. |
 | `PHONE_REMOTE_WDA_MANAGED` | on for Direct loopback endpoints | Whether this daemon owns the local WDA supervisor/relay lifecycle. Remote endpoints must be externally managed. |
+| `WDA_RUNNER_ICON` | `auto` | Home-screen icon for the managed WDA runner: `auto` reuses the installed iPhoneUse app icon, `none` keeps WDA's placeholder, and an absolute `.png`/`.icns` path supplies a custom icon. Icon failures only warn; WDA setup continues. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | *(unset — WDA default 50)* | Opt-in bound on WDA's accessibility snapshot depth (`snapshotMaxDepth`), applied once per WDA session. Try `20`–`30` if an app with an enormous tree (e.g. KakaoTalk, issue #44) kills the runner during `/agent/elements`. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` | *(unset — WDA default 15)* | Opt-in bound on WDA's snapshot resolution time in seconds (`customSnapshotTimeout`), so an oversized snapshot fails that one request instead of wedging until testmanagerd kills the runner. |
 | `PHONE_REMOTE_ELEMENTS_AFFORDANCES` | *(unset — off)* | Set `1` to enrich `/agent/elements` rows with sparse action affordances derived from the accessibility traits WDA already sends: `actions` (e.g. `["increment","decrement","adjust"]` on sliders/steppers/picker wheels, `["toggle"]` on switches), `selected` (tab bars/segmented controls), and `min`/`max` (slider/stepper range). Off = byte-identical JSON. |

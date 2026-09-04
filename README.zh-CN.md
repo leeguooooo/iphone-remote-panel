@@ -103,6 +103,20 @@ WDA 设置脚本放到 `~/.iphone-use/setup-wda.sh`。安装器完成不代表�
 ~/.iphone-use/setup-wda.sh status
 ```
 
+暂时不用 agent、想自己操作手机时，先暂停 WDA；下次使用前再恢复：
+
+```bash
+~/.iphone-use/setup-wda.sh pause
+~/.iphone-use/setup-wda.sh resume
+```
+
+`pause` 会禁用 WDA 的 launchd job，只停止 PID 和启动命令都通过校验的进程。
+`resume` 会校验并重新加载这个 job。锁屏导致 WDA 失败后，重建间隔会从 30 秒
+逐步增至 15 分钟，不再紧凑循环催输密码；其他失败按 5 秒到 5 分钟退避。
+WDA 恢复后，两种退避都会清零。
+手动运行 setup 时，锁屏等待最多 5 分钟，提示间隔也会逐步拉长；如需提前退出，
+按 `Ctrl-C`，解锁后再运行。
+
 然后在浏览器打开 **`http://<Mac局域网IP>:44321/setup`**。内置连接向导会把
 `/agent/status` 翻译成当前的 USB、信任、开发者服务、WDA 或外部主机阻塞项；
 它不会自动断开 VPN、修改代理或替你运行设置。设备真正可操作后再进入 **`/phone`**。
@@ -183,6 +197,7 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret \
 | `PHONE_REMOTE_WDA_URL` | Direct 安装为 `http://127.0.0.1:8100` | WDA 控制 loopback。不可达时 Direct 输入失败，不回退到 Mac。 |
 | `PHONE_REMOTE_WDA_MJPEG_URL` | Direct 安装为 `http://127.0.0.1:9100` | WDA MJPEG loopback；daemon 从 `/agent/mjpeg` 代理给已认证客户端。 |
 | `PHONE_REMOTE_WDA_MANAGED` | Direct loopback 默认开启 | daemon 是否负责本地 WDA supervisor/relay 生命周期；远端 endpoint 必须由外部管理。 |
+| `WDA_RUNNER_ICON` | `auto` | WDA runner 的桌面图标。`auto` 使用已安装 iPhoneUse 的图标；`none` 保留 WDA 占位图；也可传入绝对 `.png`/`.icns` 路径。图标处理失败只会警告，不中断 WDA 设置。 |
 | `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | 空闲后释放 WDA。`0` 表示不释放。 |
 | `PHONE_REMOTE_CF_TURN_KEY_ID` / `_API_TOKEN` | — | 仅 legacy mirror/WebRTC 使用。 |
 | `PHONE_REMOTE_TURN_URLS` / `_USERNAME` / `_CREDENTIAL` | — | 仅 legacy mirror/WebRTC 使用。 |
