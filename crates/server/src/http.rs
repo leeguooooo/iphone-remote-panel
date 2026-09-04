@@ -2373,6 +2373,22 @@ fn prepare_idle_wda_probe(state: &AppState) -> bool {
 ///
 /// No-op (and silent) when WDA isn't configured: a pure L3/mirror deployment has
 /// no persistent on-device session to release.
+/// How long WDA must have been down for the next up edge to count as a human
+/// cold start (which earns a fresh activity window) rather than a crash-loop
+/// bounce (which must not reset the idle clock). See issue #66.
+const COLD_START_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Backoff for a release that did not take. Doubles per consecutive failure,
+/// capped, so a supervisor we cannot stop is retried instead of abandoned —
+/// without spinning on it.
+fn release_retry_backoff(failures: &mut u32) -> std::time::Duration {
+    *failures = failures.saturating_add(1);
+    let secs = 30u64
+        .saturating_mul(1u64 << (*failures - 1).min(5))
+        .min(900);
+    std::time::Duration::from_secs(secs)
+}
+
 pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     if state.backend != crate::config::DeviceBackend::Direct
         || !state.managed_wda
@@ -2396,6 +2412,12 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
         let home = std::env::var("HOME").unwrap_or_default();
         let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
         let mut was_up = false;
+        // When the endpoint went down, so an up edge can tell a human cold
+        // start from a crash-loop bounce; and the retry state for a stop that
+        // does not take (issue #66).
+        let mut down_since: Option<std::time::Instant> = None;
+        let mut release_backoff_until: Option<std::time::Instant> = None;
+        let mut release_failures: u32 = 0;
         loop {
             tokio::time::sleep(POLL).await;
             if state.released.load(Ordering::Relaxed) {
@@ -2430,14 +2452,81 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 None => false,
             };
             if !up {
-                was_up = false;
+                // Do NOT skip the release check just because WDA is down. A
+                // down endpoint is usually the supervisor's rebuild loop, and
+                // that loop is what demands "Unlock iPhone to Continue" over
+                // and over. Bailing out here left the one situation the user
+                // most needs the phone back — a crash loop — as the one
+                // situation the watchdog ignored (issue #66).
+                if !was_up {
+                    // Already known-down; remember when it started so the next
+                    // up edge can tell a human cold start from a crash bounce.
+                    down_since.get_or_insert_with(std::time::Instant::now);
+                } else {
+                    was_up = false;
+                    down_since = Some(std::time::Instant::now());
+                }
+                if state.viewer_busy()
+                    || state.held()
+                    || state.idle_for() < window
+                    || state.wda_control_pending.load(Ordering::Acquire) != 0
+                {
+                    continue;
+                }
+                // Nobody has driven the phone for a full window and the device
+                // layer is down anyway: stop the supervisor so it stops
+                // rebuilding (and stops asking the human to unlock).
+                if release_backoff_until.is_some_and(|until| std::time::Instant::now() < until) {
+                    continue;
+                }
+                tracing::info!(
+                    "idle {}s and WDA is down — stopping the supervisor so it stops rebuilding",
+                    state.idle_for().as_secs()
+                );
+                let script = setup_sh.clone();
+                let stopped =
+                    tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+                        .await
+                        .unwrap_or(false);
+                if stopped {
+                    state.wda_actionable.store(false, Ordering::Relaxed);
+                    *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                    state.released.store(true, Ordering::Release);
+                    release_backoff_until = None;
+                    release_failures = 0;
+                    tracing::info!("phone released: supervisor stopped while WDA was already down");
+                } else {
+                    // A failed stop used to be terminal: `released` stayed
+                    // false and the `!up` early-continue meant we never tried
+                    // again. Back off and retry instead of giving up forever.
+                    let backoff = release_retry_backoff(&mut release_failures);
+                    release_backoff_until = Some(std::time::Instant::now() + backoff);
+                    tracing::warn!(
+                        "could not stop the supervisor while idle; retrying in {}s",
+                        backoff.as_secs()
+                    );
+                }
                 continue;
             }
             if !was_up {
                 was_up = true;
-                state.touch_activity();
+                // The up edge grants a fresh activity window so a runner a
+                // human just started is not released out from under them. But
+                // a crash-recovery bounce is also an up edge, and in a crash
+                // loop that reset fired every few minutes and kept the idle
+                // clock permanently at zero — the phone could never go idle no
+                // matter how long it sat untouched (issue #66). Only a long
+                // outage looks like a human cold start.
+                let cold_start = down_since
+                    .map(|since| since.elapsed() >= COLD_START_AFTER)
+                    .unwrap_or(true);
+                down_since = None;
+                if cold_start {
+                    state.touch_activity();
+                }
                 continue;
             }
+            down_since = None;
             if state.viewer_busy() {
                 continue; // someone is watching the live feed
             }
@@ -2459,6 +2548,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 || state.wda_control_pending.load(Ordering::Acquire) != 0
             {
                 continue;
+            }
+            if release_backoff_until.is_some_and(|until| std::time::Instant::now() < until) {
+                continue; // a recent stop did not take; wait out the backoff
             }
             if !state.wda_lifecycle.try_begin_releasing() {
                 continue;
@@ -2494,10 +2586,17 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
                 state.released.store(true, Ordering::Release);
                 was_up = false;
+                release_backoff_until = None;
+                release_failures = 0;
                 tracing::info!("idle release confirmed: supervisor/runner stopped and WDA is down");
             } else {
                 tracing::warn!(
-                    "idle release was not confirmed (processes_stopped={stopped}, endpoint_down={endpoint_down}); keeping device state active"
+                    "idle release was not confirmed (processes_stopped={stopped}, endpoint_down={endpoint_down}); retrying in {}s",
+                    {
+                        let backoff = release_retry_backoff(&mut release_failures);
+                        release_backoff_until = Some(std::time::Instant::now() + backoff);
+                        backoff.as_secs()
+                    }
                 );
             }
             state.wda_lifecycle.finish_releasing();
@@ -8507,6 +8606,43 @@ mod tests {
             stepper_increment_is_second(&left, &[f64::NAN, 200.0, 40.0, 30.0]),
             None
         );
+    }
+
+    // issue #66: a stop that did not take used to be terminal — `released`
+    // stayed false and the down-path early-continue meant the watchdog never
+    // tried again, so the supervisor kept rebuilding and kept demanding an
+    // unlock. Retries must back off, but must never stop coming.
+    #[test]
+    fn release_retry_backoff_grows_and_caps_without_ever_giving_up() {
+        let mut failures = 0;
+        let first = release_retry_backoff(&mut failures);
+        assert_eq!(first, std::time::Duration::from_secs(30));
+
+        let mut previous = first;
+        for _ in 0..4 {
+            let next = release_retry_backoff(&mut failures);
+            assert!(
+                next > previous,
+                "backoff must grow: {next:?} after {previous:?}"
+            );
+            previous = next;
+        }
+        // Capped, and still finite forever after — a supervisor we cannot stop
+        // is retried every 15 minutes, not abandoned.
+        for _ in 0..50 {
+            let capped = release_retry_backoff(&mut failures);
+            assert_eq!(capped, std::time::Duration::from_secs(900));
+        }
+    }
+
+    // The up edge grants a fresh activity window so a runner a human just
+    // started is not released under them; a crash bounce must not, or a crash
+    // loop pins the phone forever.
+    #[test]
+    fn cold_start_grace_is_long_enough_to_exclude_a_crash_bounce() {
+        assert_eq!(COLD_START_AFTER, std::time::Duration::from_secs(600));
+        // Today's observed crash-loop bounces were well under a minute apart.
+        assert!(COLD_START_AFTER > std::time::Duration::from_secs(120));
     }
 
     #[test]
