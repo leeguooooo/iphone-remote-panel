@@ -1241,6 +1241,14 @@ function setupBlockerCopy(blockedOn) {
   }
 }
 
+/* Blockers that clear only when a person does something to the phone or the
+   Mac. `wda` and `account` are excluded on purpose: they are not a single
+   physical gesture, and their copy sends the operator to a log or to Xcode. */
+function actionableSetupBlocker(status) {
+  return new Set(['locked', 'trust', 'usb', 'ddi', 'warp', 'proxy'])
+    .has(status?.setup_blocked_on);
+}
+
 function managedSetupWillRetry(status) {
   const managed = status?.recovery_owner === 'daemon' ||
     status?.managed_wda === true;
@@ -1532,7 +1540,10 @@ async function pollAgentMode() {
         showOverlay('releasing');
       } else if (s.reconnecting === true) {
         stopStills();
-        showOverlay('reconnecting');
+        /* A blocker that needs the operator's hands (unlock, trust, cable,
+           WARP) must not hide behind "正在重新连接": the retry loop cannot
+           clear it on its own, so waiting quietly is exactly wrong. */
+        showOverlay(actionableSetupBlocker(s) ? 'setup-blocked' : 'reconnecting');
       } else if (s.released === true) {
         stopStills();
         showOverlay('released');
