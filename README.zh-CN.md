@@ -93,7 +93,11 @@ WDA 运行期间会占着手机。想自己用手机，先暂停托管的 WDA，
 ~/.iphone-use/setup-wda.sh resume
 ```
 
-daemon 自己也会这么做：`PHONE_REMOTE_IDLE_RELEASE_SECS`（默认 300 秒）内没有 agent 活动、也没有人在看画面，它就停掉 runner。下一次 agent 请求或 `POST /agent/mode {"mode":"agent"}` 会把它拉回来，手机锁了就解一下。
+更省事的是网页控制栏里的 **交还** 按钮（或 `POST /agent/mode {"mode":"human"}`）：daemon 停掉 runner、在 Mac 上打开 iPhone 镜像，状态里 `human_handoff:true`，此时 agent 的输入请求一律 409 `phone_handed_to_human`，不会在你用着的时候把手机抢回去。用完点 **重新连接**（或 `{"mode":"agent"}`）还给 agent。
+
+**人在外面想远程操作手机**：iPhone 镜像只能在这台 Mac 上开，所以远程走"远程进 Mac"这条路——把 Mac 和你的设备都放进 Tailscale，用 macOS 自带的屏幕共享连上来，先点"交还"，再在镜像窗口里操作。浏览器里直接看 WebRTC 画面、点画面控制手机（不经过 Mac 桌面）目前没有做；WDA 那条链路是给 agent 用的，延迟和锁屏要求都不适合人。
+
+daemon 也可以自己做这件事：设置 `PHONE_REMOTE_IDLE_RELEASE_SECS`（比如 `300`），这么久没有 agent 活动、也没有人在看画面，它就停掉 runner。v0.6.3 起默认关闭，runner 常驻，下一次请求不用等重建。无论哪种情况，下一次 agent 请求或 `POST /agent/mode {"mode":"agent"}` 都会把 WDA 拉回来，手机锁了就解一下。
 
 ### 升级
 

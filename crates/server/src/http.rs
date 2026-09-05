@@ -1603,6 +1603,7 @@ async fn agent_status(
     let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
     let hold_remaining = state.hold_remaining_secs();
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    let human_handoff = released && human_handoff_active();
     // Direct mode must not touch any iPhone Mirroring API. The legacy backend
     // keeps the cheap geometry probe for compatibility status.
     #[cfg(target_os = "macos")]
@@ -1772,6 +1773,8 @@ async fn agent_status(
             "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying"
         } else if released && !state.managed_wda {
             "the remote WDA endpoint is externally managed — restart it on the owning host; this daemon will not stop or bootstrap local services"
+        } else if released && human_handoff {
+            "the phone was handed to a human (mode=human) — a person is using it through iPhone Mirroring; POST /agent/mode {mode:agent} takes it back"
         } else if released {
             "direct device service was released after inactivity — reconnect to restart WDA, then keep the phone unlocked and awake"
         } else if !state.managed_wda {
@@ -1845,7 +1848,7 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
@@ -3014,8 +3017,27 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     });
 }
 
-/// `POST /agent/mode` — recover the currently configured backend.
-/// Body: `{"mode":"mirror"}` for Mirror or `{"mode":"agent"}` for Direct.
+/// Whether the phone was last handed to a person via `{"mode":"human"}`.
+/// One daemon process drives one phone, so a process-global flag is exact;
+/// it also spares every `AppState` constructor (main, tests) a new field.
+/// Cleared when an `agent` recovery starts.
+static HUMAN_HANDOFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn human_handoff_active() -> bool {
+    HUMAN_HANDOFF.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Set or clear the hand-off flag directly (tests, and hosts that hand the
+/// phone over by other means).
+pub fn set_human_handoff(active: bool) {
+    HUMAN_HANDOFF.store(active, std::sync::atomic::Ordering::Release);
+}
+
+/// `POST /agent/mode` — recover the currently configured backend, or hand the
+/// phone to a person.
+/// Body: `{"mode":"mirror"}` for Mirror, `{"mode":"agent"}` for Direct, or
+/// `{"mode":"human"}` to stop the managed runner so iPhone Mirroring can take
+/// the phone (see the `human` arm).
 ///
 /// The on-phone XCUITest runner (WDA, the L2 layer) monopolizes the device's
 /// remote session: while it runs, iPhone Mirroring shows "Connection
@@ -3226,6 +3248,11 @@ async fn agent_mode(
             }
             let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
             let udid_env = udid.unwrap_or_default();
+            // Taking the phone back is decided by this request, not by whether
+            // launchd accepts the bring-up a few seconds later — the bootstrap
+            // can outlast a client's timeout, and status must not keep saying
+            // "handed to a human" while the runner is already coming up.
+            HUMAN_HANDOFF.store(false, std::sync::atomic::Ordering::Release);
             // An explicit reconnect is intent, not idleness: restart the clock
             // before the bring-up begins, or a build longer than the idle
             // window ends with the watchdog stopping the very supervisor this
@@ -3265,10 +3292,82 @@ async fn agent_mode(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             )
         }
+        "human" => {
+            // Hand the phone to a person. The on-phone runner monopolizes the
+            // device session (iPhone Mirroring shows "Connection Interrupted"
+            // while it runs), so a human at the Mac — locally or over Screen
+            // Sharing / Tailscale — first needs the runner gone. This is the
+            // same stop the idle watchdog performs, done on request, plus a
+            // best-effort `open -a "iPhone Mirroring"` so the window is there
+            // when they look. `{"mode":"agent"}` takes the phone back.
+            if state.backend != crate::config::DeviceBackend::Direct || !state.managed_wda {
+                return with_security_headers(
+                    Response::builder()
+                        .status(StatusCode::CONFLICT)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"ok":false,"error":"wda_is_externally_managed","hint":"human hand-off stops the daemon-managed local runner; an external or mirror backend has nothing to hand off"}"#,
+                        ))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                );
+            }
+            if !state.wda_lifecycle.try_begin_releasing() {
+                return with_security_headers(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::RETRY_AFTER, "5")
+                        .body(Body::from(
+                            r#"{"ok":false,"error":"lifecycle_busy","hint":"a release or reconnect is in progress — retry in a few seconds"}"#,
+                        ))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                );
+            }
+            let script = setup_sh.clone();
+            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+                .await
+                .unwrap_or(false);
+            if stopped {
+                state
+                    .wda_actionable
+                    .store(false, std::sync::atomic::Ordering::Release);
+                *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                state
+                    .released
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *recover(state.owner.lock()) = None;
+                HUMAN_HANDOFF.store(true, std::sync::atomic::Ordering::Release);
+                tracing::info!("phone handed to a human: managed WDA stopped on request");
+            }
+            state.wda_lifecycle.finish_releasing();
+            #[cfg(target_os = "macos")]
+            let mirroring_opened = stopped
+                && std::process::Command::new("open")
+                    .args(["-a", "iPhone Mirroring"])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+            #[cfg(not(target_os = "macos"))]
+            let mirroring_opened = false;
+            let body = format!(
+                r#"{{"ok":{stopped},"mode":"human","released":{stopped},"mirroring_opened":{mirroring_opened},"hint":"the phone is yours: use iPhone Mirroring on this Mac (locally or over Screen Sharing); POST {{\"mode\":\"agent\"}} hands it back to the agent"}}"#
+            );
+            with_security_headers(
+                Response::builder()
+                    .status(if stopped {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    })
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            )
+        }
         _ => with_security_headers(
             (
                 StatusCode::BAD_REQUEST,
-                r#"body must be {"mode":"mirror"} or {"mode":"agent"}"#,
+                r#"body must be {"mode":"mirror"}, {"mode":"agent"}, or {"mode":"human"}"#,
             )
                 .into_response(),
         ),
@@ -6947,6 +7046,21 @@ async fn agent_input(
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"ok":false,"error":"wda_is_externally_managed","recovery_owner":"external","reconnecting":false,"hint":"restart WDA on the configured endpoint's owning host"}"#,
+                    ))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            );
+        }
+        // A phone handed to a person stays with the person. An agent action
+        // must not silently restart the runner under their fingers (which
+        // would also kill their iPhone Mirroring session); taking it back is
+        // an explicit `POST /agent/mode {"mode":"agent"}`.
+        if human_handoff_active() {
+            return with_security_headers(
+                Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ok":false,"error":"phone_handed_to_human","released":true,"hint":"a person is using the phone through iPhone Mirroring; POST /agent/mode {\"mode\":\"agent\"} to take it back before sending input"}"#,
                     ))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             );

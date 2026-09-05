@@ -852,6 +852,10 @@
     </svg>
     <span class="lbl">流程</span>
   </button>
+  <button id="btnHandoff" class="tbtn" title="交还手机给人：停止 agent 控制并打开 iPhone 镜像" type="button">
+    <svg viewBox="0 0 24 24"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/><path d="M2 12h3M19 12h3"/></svg>
+    <span class="lbl">交还</span>
+  </button>
   <button id="btnLogout" class="tbtn danger" title="退出" type="button">
     <svg viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3"/><path d="M10 17l-5-5 5-5"/><path d="M15 12H5"/></svg>
     <span class="lbl">退出</span>
@@ -3940,6 +3944,37 @@ function updateModeControls() {
 }
 
 document.getElementById('btnLogout').addEventListener('click', () => { location.href = '/logout'; });
+/* Hand the phone to a person: the daemon stops the on-phone runner (which
+   blocks iPhone Mirroring while it runs) and opens iPhone Mirroring on the
+   Mac. The human then drives the phone there — at the Mac, or through Screen
+   Sharing / Tailscale. "重新连接" takes it back for the agent. */
+const btnHandoff = document.getElementById('btnHandoff');
+if (btnHandoff) btnHandoff.addEventListener('click', async () => {
+  if (backendType !== 'direct') { toast('镜像模式下手机本来就在你手里'); return; }
+  if (backendStatus?.recovery_owner === 'external') { toast('WDA 在别的主机上，本机无法交还'); return; }
+  if (!confirm('把手机交还给人？agent 控制会停止，Mac 上会打开 iPhone 镜像。')) return;
+  btnHandoff.disabled = true;
+  try {
+    const r = await fetch('/agent/mode', {
+      method: 'POST', cache: 'no-store', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-Phone-Control': '1' },
+      body: JSON.stringify({ mode: 'human' }),
+    });
+    if (r.status === 401) { location.replace('/login'); return; }
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok || result.ok !== true) {
+      toast(result?.error === 'lifecycle_busy' ? '设备正在切换，稍后再试' : '交还失败，请查看服务日志');
+    } else {
+      toast(result.mirroring_opened ? '已交还，iPhone 镜像已打开' : '已交还；请在 Mac 上打开 iPhone 镜像');
+    }
+    cancelStatusPoll();
+    await pollAgentMode();
+  } catch (_) {
+    toast('交还失败，请稍后再试');
+  } finally {
+    btnHandoff.disabled = false;
+  }
+});
 
 /* ── Stats: RTT from candidate-pair ───────────────────────────── */
 let _candidateTypeLogged = false; /* one-shot: log the active candidate type once per connection */

@@ -2329,6 +2329,60 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
 }
 
 #[test]
+fn human_handoff_is_refused_when_wda_is_not_daemon_managed() {
+    block(async {
+        let app = http::router(build_state(None));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/mode")
+                    .header("x-phone-control", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"human"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("wda_is_externally_managed"), "{text}");
+        assert!(text.contains("hand-off"), "{text}");
+    });
+}
+
+#[test]
+fn status_reports_a_human_handoff_only_while_released() {
+    block(async {
+        let state = build_state(None);
+        let app = http::router(state.clone());
+        // Flag set but the phone is not released: no hand-off is in effect.
+        server::http::set_human_handoff(true);
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/agent/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains(r#""human_handoff":false"#));
+        state
+            .released
+            .store(true, std::sync::atomic::Ordering::Release);
+        let resp = app
+            .oneshot(Request::builder().uri("/agent/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        server::http::set_human_handoff(false);
+        assert!(text.contains(r#""human_handoff":true"#), "{text}");
+        // The "handed to a human" hint needs a daemon-managed runner; this
+        // state is externally managed, so the external hint wins there.
+    });
+}
+
+#[test]
 fn externally_managed_released_wda_is_not_bootstrapped_locally() {
     block(async {
         let state = build_state(None);

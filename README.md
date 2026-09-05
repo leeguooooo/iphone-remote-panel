@@ -120,10 +120,24 @@ resume it before the next agent session:
 ~/.iphone-use/setup-wda.sh resume
 ```
 
-The daemon also does this on its own: after `PHONE_REMOTE_IDLE_RELEASE_SECS` (default
-300 s) without agent activity or a live viewer it stops the runner. The next agent
-request, or `POST /agent/mode {"mode":"agent"}`, brings it back — unlock the phone if
-asked.
+Simpler still is the **交还 (hand off)** button in the web toolbar, or
+`POST /agent/mode {"mode":"human"}`: the daemon stops the runner, opens iPhone Mirroring on
+the Mac, and reports `human_handoff:true`; while that holds, agent input gets
+409 `phone_handed_to_human` instead of restarting the runner under your fingers. Press
+**重新连接** (reconnect), or send `{"mode":"agent"}`, to give the phone back to the agent.
+
+**Operating the phone from somewhere else, as a person:** iPhone Mirroring only runs on
+this Mac, so remote use means reaching the Mac — put the Mac and your device on Tailscale,
+connect with macOS Screen Sharing, press hand off, and drive the Mirroring window. Driving
+the phone from a browser without the Mac desktop (WebRTC video of the phone) is not built;
+the WDA path is for agents — its latency and its unlocked-phone requirement do not suit a
+person.
+
+The daemon can also do this on its own: set `PHONE_REMOTE_IDLE_RELEASE_SECS` (for
+example `300`) and it stops the runner after that long without agent activity or a
+live viewer. Since v0.6.3 this is off by default — the runner stays up, so the next
+request never waits for a rebuild. Either way the next agent request, or
+`POST /agent/mode {"mode":"agent"}`, brings WDA back — unlock the phone if asked.
 
 ### Upgrade
 
