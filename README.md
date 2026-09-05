@@ -132,6 +132,20 @@ The daemon checks GitHub daily and reports `version` / `latest` / `update_availa
 installing. Details of what the installer verifies are under
 [Operations → Upgrades](#upgrades).
 
+**Unattended upgrades** are opt-in and gated on the phone being idle:
+
+```bash
+~/.iphone-use/auto-update.sh enable     # daily at 04:30; `disable` / `status` / `run --dry-run`
+```
+
+Each run resolves the latest release and upgrades only when it is newer *and* nobody
+owns the phone (no `X-Phone-Owner` lease), no hold is active, the daemon is not
+releasing/reconnecting, and no WDA session is up. Otherwise it logs one line to
+`~/Library/Logs/iPhoneUse/auto-update.log` and tries again tomorrow. The upgrade itself is
+`install.sh` with its SHA-256 checks and rollback. `run --force` skips the idle gate;
+`run --reinstall` reinstalls the current release. (`scripts/auto-update.sh` self-installs on
+`enable`; the installer will offer `--auto-update` once the multi-instance work lands.)
+
 ## Drive the phone from the browser
 
 `/phone` renders the on-device MJPEG stream and turns your clicks, drags, long-presses,

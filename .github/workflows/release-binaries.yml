@@ -44,6 +44,7 @@ jobs:
           python3 scripts/test-setup-wda-status.py
           python3 scripts/test-setup-wda-runner-product.py
           python3 scripts/test-setup-wda-asc-signing.py
+          python3 scripts/test-auto-update.py
 
           skill_file_count="$(
             find skills/iphone-use -type f -print | wc -l | tr -d '[:space:]'
