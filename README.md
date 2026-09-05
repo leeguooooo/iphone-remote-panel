@@ -387,6 +387,27 @@ PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
   "$MCP" flow run examples/flows/search-spotlight.json --input 'query=coffee'
 ```
 
+The **official flow registry** ([`leeguooooo/iphone-use-flows`](https://github.com/leeguooooo/iphone-use-flows))
+turns this into a chrome-use-style installable source: reviewed per-app flows,
+grouped by app and category, fetched with checksums and validated before they
+touch disk, then run by id with no model in the loop:
+
+```bash
+"$MCP" flow update                        # mirror the registry into ~/.iphone-use/flows
+"$MCP" flow list --category health        # id · risk · verified · inputs · name
+"$MCP" flow info health/export-all        # metadata and step templates
+PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
+  "$MCP" flow run system/spotlight-search --input query=Health
+"$MCP" flow add my-flow.json --as myapp/daily-check   # your own, survives update
+```
+
+Registry metadata is optional on every flow: `app` (bundle id), `category`,
+`risk` (`read_only` | `navigation` | `side_effect` — the last refuses to run
+without `--confirm`), `locale`, `tags`, and `verified_on` (hardware runs that
+proved the file). Only the official source is supported; files are pure JSON, so
+installing the registry never executes code. MCP clients get the same surface as
+`phone_flow_list`, `phone_flow_info`, `phone_flow_run`, and `phone_flow_update`.
+
 Saved flow v1 is strict JSON containing `version`, `name`, optional `description`,
 optional string `inputs`, and the same guarded `steps` used by `phone_run_steps`.
 `--input KEY=VALUE` resolves values only for the current run and never writes them back

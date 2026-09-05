@@ -2,6 +2,9 @@
   "version": 1,
   "name": "Open Spotlight",
   "description": "Safe navigation example: return home, open Spotlight, and require its text field.",
+  "app": "com.apple.springboard",
+  "category": "system",
+  "risk": "navigation",
   "steps": [
     {
       "kind": "shortcut",

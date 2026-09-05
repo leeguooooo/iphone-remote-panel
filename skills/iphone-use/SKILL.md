@@ -186,6 +186,39 @@ recording that could not persist an action is an incomplete draft and cannot
 run from the browser. A parameterized recording can be downloaded immediately,
 but it cannot run until every required value is filled in.
 
+## Registry first: is there already a flow for this?
+
+Before driving an app step by step, check the **official flow registry** —
+reviewed, deterministic per-app scripts that replay a whole task in one call
+with no model and no screenshots:
+
+```bash
+MCP="$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+"$MCP" flow update                     # once; mirrors github.com/leeguooooo/iphone-use-flows
+"$MCP" flow list [--category health]   # id, risk, verified, inputs, name
+"$MCP" flow info health/export-all     # metadata + step templates
+PHONE_REMOTE_TOKEN="$PHONE_REMOTE_TOKEN" "$MCP" flow run system/spotlight-search --input query=Health
+```
+
+With the bundled MCP server the same surface is `phone_flow_list`,
+`phone_flow_info`, `phone_flow_run`, and `phone_flow_update`. Rules:
+
+- A matching flow beats exploration: one `flow run` costs one call and zero
+  screenshots. Read the result's `completed`/`failed_step`; on a failure read
+  `/agent/elements` and repair that one locator — never replay blindly.
+- `verified: no` (or a `draft` tag) means nobody has proved that file on a real
+  phone yet. Run it, take one checkpoint screenshot afterwards, and if it
+  worked, contribute `verified_on` back.
+- `risk: side_effect` flows (send, publish, pay, delete) refuse to run without
+  `--confirm` / `confirm=true`. Confirm only after the user approved the exact
+  target and inputs; never confirm on your own judgement.
+- Flow labels are locale-specific (`locale` field). A flow recorded under `en`
+  fails closed on a Chinese phone: zero matches, no tap. Pick the variant that
+  matches the device language or record one.
+- Keep your own flows next to the official ones with
+  `flow add <file> --as <app>/<name>`; they survive `flow update`. Only the
+  official source exists — there is no `sources add`.
+
 ## The loop: see → act → verify
 
 1. **See**: when `drivable:true`, use `GET /agent/elements` first — it's text
@@ -418,9 +451,13 @@ every step). That's expensive. **Your job is to never pay that cost twice**:
 
 The research and flow contract live in
 `docs/scripted-flows-research.html`. `phone_run_steps` is the bounded in-memory
-runner for stable segments; the release-matched `iphone-use-mcp` binary can now
-validate and run a user-owned version-1 JSON file without a model. It does not
-yet provide a managed flow store, branching, or repair bundles. The browser
+runner for stable segments; the release-matched `iphone-use-mcp` binary
+validates and runs version-1 JSON without a model, and `flow update/list/info/
+run <app>/<flow>` mirrors the official registry into `~/.iphone-use/flows`
+(see **Registry first** above). A compiled flow that works should end up in the
+registry: add `app`, `category`, `risk`, `locale`, and `verified_on`, then open a
+PR to `leeguooooo/iphone-use-flows`. There is still no branching or repair
+bundle; the runner stops at the first failed step. The browser
 does provide a first reviewed recorder/exporter, runtime string parameters,
 and semantic wait suggestions; it never makes an uncertain batch replay-safe.
 

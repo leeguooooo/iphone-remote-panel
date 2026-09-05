@@ -20,6 +20,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod client;
 mod flow;
+mod registry;
 mod server;
 mod types;
 
@@ -50,20 +51,60 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum FlowCommand {
-    /// Validate a flow file offline without contacting the daemon or phone.
+    /// Validate a flow file or installed registry flow offline (no daemon, no phone).
     Validate {
-        /// JSON flow file to validate.
-        file: PathBuf,
+        /// JSON flow file, or a registry id such as `health/export-all`.
+        target: String,
     },
-    /// Run a validated flow once; never retries an unknown or failed result.
+    /// Run a flow once; never retries an unknown or failed result.
     Run {
-        /// JSON flow file to execute.
-        file: PathBuf,
+        /// JSON flow file, or a registry id such as `health/export-all`.
+        target: String,
         /// Ephemeral flow input in KEY=VALUE form. Repeat for multiple inputs.
         /// Values are used for this run only and are never written to the flow.
         #[arg(long = "input", value_name = "KEY=VALUE")]
         inputs: Vec<String>,
+        /// Required for flows declared `risk: side_effect` (send/publish/pay/delete).
+        #[arg(long)]
+        confirm: bool,
     },
+    /// Mirror the official flow registry into the local store (~/.iphone-use/flows).
+    Update,
+    /// List installed flows.
+    List {
+        /// Only flows in this category (e.g. health, system, finance, im).
+        #[arg(long)]
+        category: Option<String>,
+        /// Only flows for this app directory (e.g. health) or bundle id.
+        #[arg(long)]
+        app: Option<String>,
+        /// Only flows with at least one recorded hardware verification.
+        #[arg(long)]
+        verified: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one flow's metadata, inputs, and step templates.
+    Info {
+        /// Registry id such as `health/export-all`, or a flow file.
+        target: String,
+    },
+    /// Install a local flow file into the store under a registry id (survives `update`).
+    Add {
+        /// JSON flow file to install.
+        file: PathBuf,
+        /// Registry id to install it as, e.g. `myapp/daily-check`.
+        #[arg(long = "as", value_name = "APP/FLOW")]
+        id: String,
+    },
+    /// Remove an installed flow (an official flow returns on the next `update`).
+    Remove {
+        /// Registry id such as `myapp/daily-check`.
+        id: String,
+    },
+    /// Show the official source, any override, and the local store path.
+    Sources,
 }
 
 #[tokio::main]
@@ -82,8 +123,58 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Command::Flow { command }) = cli.command {
         return match command {
-            FlowCommand::Validate { file } => flow::validate_command(&file),
-            FlowCommand::Run { file, inputs } => flow::run_command(&file, &inputs).await,
+            FlowCommand::Validate { target } => flow::validate_command(&target),
+            FlowCommand::Run {
+                target,
+                inputs,
+                confirm,
+            } => flow::run_command(&target, &inputs, confirm).await,
+            FlowCommand::Update => {
+                let report = registry::update().await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            FlowCommand::List {
+                category,
+                app,
+                verified,
+                json,
+            } => {
+                let filter = registry::ListFilter {
+                    category,
+                    app,
+                    verified_only: verified,
+                };
+                let (entries, index) = registry::list(&filter)?;
+                if json {
+                    println!("{}", registry::list_json(&entries, &index));
+                } else {
+                    print!("{}", registry::list_text(&entries, &index));
+                }
+                Ok(())
+            }
+            FlowCommand::Info { target } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&registry::info(&target)?)?
+                );
+                Ok(())
+            }
+            FlowCommand::Add { file, id } => {
+                println!("{}", registry::add(&file, &id)?);
+                Ok(())
+            }
+            FlowCommand::Remove { id } => {
+                println!("{}", registry::remove(&id)?);
+                Ok(())
+            }
+            FlowCommand::Sources => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&registry::sources_json()?)?
+                );
+                Ok(())
+            }
         };
     }
 

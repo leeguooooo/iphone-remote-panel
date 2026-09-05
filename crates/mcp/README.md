@@ -173,6 +173,34 @@ a required named input so a saved file cannot silently retain private content.
 
 See [`examples/flows/open-spotlight.json`](../../examples/flows/open-spotlight.json).
 
+### The official flow registry
+
+[`leeguooooo/iphone-use-flows`](https://github.com/leeguooooo/iphone-use-flows) is the
+single supported source of reviewed per-app flows. The CLI mirrors it into a local
+store and runs flows by id:
+
+```bash
+"$MCP" flow update                      # fetch index.json + every flow, verify sha256, validate, write 0600
+"$MCP" flow list [--category C] [--app A] [--verified] [--json]
+"$MCP" flow info <app>/<flow>           # metadata, inputs, step templates, source, sha256
+PHONE_REMOTE_TOKEN="$TOKEN" "$MCP" flow run <app>/<flow> [--input K=V]... [--confirm]
+"$MCP" flow add <file> --as <app>/<flow> # install your own; kept across updates
+"$MCP" flow remove <app>/<flow>
+"$MCP" flow sources                     # official URL, override, store path
+```
+
+| | |
+|---|---|
+| Store | `$IPHONE_USE_FLOWS_DIR` or `~/.iphone-use/flows` (0700; files 0600; `.index.json` caches validated metadata) |
+| Source override | `IPHONE_USE_FLOWS_SOURCE=<dir or https base>` for development and CI; there is no `sources add` |
+| Flow id | `<app>/<flow>`, lowercase slugs; `flow run`/`validate` also accept a file path |
+| Metadata | optional `app`, `category`, `risk` (`read_only`\|`navigation`\|`side_effect`), `locale`, `tags`, `verified_on[]` |
+| Gate | `risk: side_effect` needs `--confirm` (CLI) or `confirm: true` (MCP); nothing is sent otherwise |
+
+`flow update` aborts on the first checksum or validation failure and leaves the store
+untouched; an official flow that disappears from the index is removed locally, flows
+added with `flow add` are kept, and a local flow may not shadow an official id.
+
 ## Tools exposed
 
 | Tool | Arguments | Description |
@@ -189,9 +217,14 @@ See [`examples/flows/open-spotlight.json`](../../examples/flows/open-spotlight.j
 | `phone_key` | `name` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
 | `phone_shortcut` | `name` | Direct/WDA system shortcut: `home` or `spotlight`; App Switcher is unsupported |
 | `phone_run_steps` | `steps` | Run up to 24 guarded action/wait steps in one MCP call; includes long-press/swipe/drag, strict `tap_locator`, bundle-id `launch_app`, full preflight, one WDA lock, and first-failure stop |
+| `phone_flow_list` | `category?`, `app?`, `verified?` | Installed registry flows with risk/verified/inputs — check this before exploring an app step by step |
+| `phone_flow_info` | `id` | One flow's metadata, inputs, and step templates (never runtime values) |
+| `phone_flow_run` | `id`, `inputs?`, `confirm?` | Run an installed flow once through Direct/WDA; `side_effect` flows require `confirm=true` |
+| `phone_flow_update` | — | Mirror the official registry (checksum + strict validation); network only, phone untouched |
 
 ## Typical session flow
 
+0. `phone_flow_list()` — if a registry flow already does the task, `phone_flow_run(id)` and skip the rest
 1. `phone_status()` — confirm `ok=true` and `drivable=true` (Direct does not use the legacy `phone_target` field)
 2. `phone_elements()` — inspect semantic controls and keep its snapshot token
 3. `phone_tap_element(element, snapshot)` — tap the chosen row; refresh if the snapshot is stale

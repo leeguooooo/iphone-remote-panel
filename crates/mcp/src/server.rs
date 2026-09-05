@@ -273,6 +273,43 @@ fn default_phone_poll_ms() -> u64 {
     250
 }
 
+/// Parameters for [`phone_flow_list`].
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct FlowListParams {
+    /// Only flows in this registry category (e.g. `health`, `system`, `finance`, `im`).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Only flows for this app directory (e.g. `health`) or bundle id.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Only flows with at least one recorded hardware verification.
+    #[serde(default)]
+    pub verified: bool,
+}
+
+/// Parameters for [`phone_flow_info`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FlowInfoParams {
+    /// Registry id such as `health/export-all`.
+    pub id: String,
+}
+
+/// Parameters for [`phone_flow_run`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FlowRunParams {
+    /// Registry id such as `health/export-all` (see phone_flow_list).
+    pub id: String,
+    /// Runtime string inputs declared by the flow. Values are used for this
+    /// run only and never persisted. Never pass passwords, codes, or private
+    /// message content.
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, String>,
+    /// Required for flows declared `risk: side_effect`. Set true only after
+    /// the user confirmed the target and inputs.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 // ---------------------------------------------------------------------------
 // PhoneHandler
 // ---------------------------------------------------------------------------
@@ -582,6 +619,136 @@ impl PhoneHandler {
             Ok(body) => CallToolResult::success(vec![Content::text(body)]),
             Err(e) => {
                 CallToolResult::error(vec![Content::text(format!("reconnect failed: {e:#}"))])
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // phone_flow_list / phone_flow_info / phone_flow_run / phone_flow_update
+    // -----------------------------------------------------------------------
+
+    #[tool(
+        description = "List installed registry flows: reviewed, deterministic per-app \
+        scripts (id like `health/export-all`) that replay a whole task with NO model \
+        and NO screenshots. CHECK THIS FIRST before driving an app step by step: if a \
+        flow matches the task, call phone_flow_run instead of exploring. Each entry \
+        reports name, description, risk (read_only|navigation|side_effect|unknown), \
+        verified (has a recorded hardware run), inputs, app, and category. Empty store: \
+        call phone_flow_update once. Filters are optional."
+    )]
+    async fn phone_flow_list(
+        &self,
+        Parameters(FlowListParams {
+            category,
+            app,
+            verified,
+        }): Parameters<FlowListParams>,
+    ) -> CallToolResult {
+        let filter = crate::registry::ListFilter {
+            category,
+            app,
+            verified_only: verified,
+        };
+        match crate::registry::list(&filter) {
+            Ok((entries, index)) => CallToolResult::success(vec![Content::text(
+                crate::registry::list_json(&entries, &index).to_string(),
+            )]),
+            Err(e) => {
+                CallToolResult::error(vec![Content::text(format!("flow list failed: {e:#}"))])
+            }
+        }
+    }
+
+    #[tool(
+        description = "Show one installed registry flow: metadata, declared inputs, and \
+        its step templates (tap_label/tap_locator/wait_for/... with input placeholders, \
+        never values). Use it to check preconditions (which app, which locale, verified \
+        or not) and the exact side effects before phone_flow_run."
+    )]
+    async fn phone_flow_info(
+        &self,
+        Parameters(FlowInfoParams { id }): Parameters<FlowInfoParams>,
+    ) -> CallToolResult {
+        if !crate::registry::valid_flow_id(&id) {
+            return CallToolResult::error(vec![Content::text(format!(
+                "{id:?} is not a registry id; expected <app>/<flow> lowercase slugs"
+            ))]);
+        }
+        match crate::registry::info(&id) {
+            Ok(detail) => CallToolResult::success(vec![Content::text(detail.to_string())]),
+            Err(e) => {
+                CallToolResult::error(vec![Content::text(format!("flow info failed: {e:#}"))])
+            }
+        }
+    }
+
+    #[tool(
+        description = "Run one installed registry flow exactly once through Direct/WDA: \
+        the daemon validates the whole sequence, holds one control lock, and stops at \
+        the first failed step. The happy path costs one tool call and zero screenshots. \
+        Requires phone_status drivable=true. Pass the flow's declared inputs; a flow \
+        declared risk=side_effect is refused unless confirm=true. The result reports \
+        completed/applied counts and the failed step; retry_safe=false means DO NOT \
+        replay — inspect phone_elements, repair the flow, do not guess. Unverified flows \
+        (verified=false in phone_flow_list) may need a checkpoint screenshot afterwards."
+    )]
+    async fn phone_flow_run(
+        &self,
+        Parameters(FlowRunParams {
+            id,
+            inputs,
+            confirm,
+        }): Parameters<FlowRunParams>,
+    ) -> CallToolResult {
+        if !crate::registry::valid_flow_id(&id) {
+            return CallToolResult::error(vec![Content::text(format!(
+                "{id:?} is not a registry id; expected <app>/<flow> lowercase slugs"
+            ))]);
+        }
+        let path = match crate::registry::resolve_target(&id) {
+            Ok(path) => path,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("{e:#}"))]),
+        };
+        let flow = match crate::flow::load_flow(&path) {
+            Ok(flow) => flow,
+            Err(e) => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "flow {id} failed validation: {e:#}"
+                ))])
+            }
+        };
+        if let Err(e) = crate::flow::check_input_map(&inputs, &flow.inputs) {
+            return CallToolResult::error(vec![Content::text(format!("{e:#}"))]);
+        }
+        match crate::flow::execute_flow(&flow, &inputs, &self.daemon, confirm).await {
+            Ok(body) => {
+                let summary = serde_json::json!({
+                    "flow": id,
+                    "verified": flow.meta.verified(),
+                    "risk": flow.meta.risk_label(),
+                    "result": serde_json::from_str::<serde_json::Value>(&body)
+                        .unwrap_or(serde_json::Value::String(body)),
+                });
+                CallToolResult::success(vec![Content::text(summary.to_string())])
+            }
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "flow {id} did not complete: {e:#}"
+            ))]),
+        }
+    }
+
+    #[tool(description = "Mirror the official iphone-use flow registry \
+        (github.com/leeguooooo/iphone-use-flows) into the local store. Every file is \
+        checksum-verified and strictly validated before it is written; locally added \
+        flows are kept. Call once when phone_flow_list reports an empty store, or to \
+        pick up new flows. Network only; the phone is not touched.")]
+    async fn phone_flow_update(&self) -> CallToolResult {
+        match crate::registry::update().await {
+            Ok(report) => CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&report).unwrap_or_default(),
+            )]),
+            Err(e) => {
+                CallToolResult::error(vec![Content::text(format!("flow update failed: {e:#}"))])
             }
         }
     }

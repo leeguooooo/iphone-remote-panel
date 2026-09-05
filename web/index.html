@@ -3095,6 +3095,13 @@ function flowDocument() {
     description,
     steps: recordedFlowSteps.map(entry => ({ ...entry.step })),
   };
+  if (importedFlowRegistryMeta) {
+    // Preserve registry metadata from an opened file; a fresh recording has
+    // none and gets it when the file is added to the registry.
+    for (const key of FLOW_REGISTRY_META_KEYS) {
+      if (importedFlowRegistryMeta[key] !== undefined) document[key] = importedFlowRegistryMeta[key];
+    }
+  }
   if (recordedFlowInputs.length) {
     document.inputs = Object.fromEntries(recordedFlowInputs.map(input => [
       input.key,
@@ -3397,10 +3404,11 @@ function validateImportedFlowDocument(document) {
   requireFlowKeys(
     document,
     ['version', 'name', 'steps'],
-    ['description', 'inputs'],
+    ['description', 'inputs', ...FLOW_REGISTRY_META_KEYS],
     '流程文件',
   );
   requireFlow(document.version === 1, '只支持 version 1 的流程文件');
+  const registryMeta = validateFlowRegistryMeta(document);
   const name = requireFlowString(document.name, '流程名称', { max: 100 }).trim();
   if (document.description !== undefined && document.description !== null) {
     requireFlowString(document.description, '流程说明', { min: 0, max: 1000, trim: false });
@@ -3461,7 +3469,64 @@ function validateImportedFlowDocument(document) {
     name,
     steps: normalizedSteps,
     inputs: [...inputDefinitions.values()],
+    registryMeta,
   };
+}
+
+// Registry metadata (see crates/mcp/src/registry.rs). The browser only has to
+// preserve it across open → review → download; the CLI is the strict validator.
+const FLOW_REGISTRY_META_KEYS = ['app', 'category', 'risk', 'locale', 'tags', 'verified_on'];
+const FLOW_RISK_VALUES = new Set(['read_only', 'navigation', 'side_effect']);
+let importedFlowRegistryMeta = null;
+
+function validateFlowRegistryMeta(document) {
+  const meta = {};
+  if (document.app !== undefined) {
+    requireFlow(
+      typeof document.app === 'string' && /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(document.app),
+      'app 必须是 bundle id，例如 com.apple.Health',
+    );
+    meta.app = document.app;
+  }
+  if (document.category !== undefined) {
+    requireFlow(
+      typeof document.category === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(document.category),
+      'category 必须是小写 slug，例如 health',
+    );
+    meta.category = document.category;
+  }
+  if (document.risk !== undefined) {
+    requireFlow(FLOW_RISK_VALUES.has(document.risk), 'risk 只能是 read_only、navigation 或 side_effect');
+    meta.risk = document.risk;
+  }
+  if (document.locale !== undefined) {
+    requireFlow(
+      typeof document.locale === 'string' && /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(document.locale),
+      'locale 必须形如 en 或 zh-CN',
+    );
+    meta.locale = document.locale;
+  }
+  if (document.tags !== undefined) {
+    requireFlow(
+      Array.isArray(document.tags) && document.tags.length <= 8
+        && document.tags.every(tag => typeof tag === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(tag))
+        && new Set(document.tags).size === document.tags.length,
+      'tags 必须是不超过 8 个、不重复的小写 slug',
+    );
+    meta.tags = [...document.tags];
+  }
+  if (document.verified_on !== undefined) {
+    requireFlow(
+      Array.isArray(document.verified_on) && document.verified_on.length <= 16
+        && document.verified_on.every(entry => flowPlainObject(entry)
+          && Object.keys(entry).length >= 1
+          && Object.keys(entry).every(key => ['device', 'ios', 'app_version', 'date'].includes(key))
+          && Object.values(entry).every(value => typeof value === 'string' && value.length >= 1 && value.length <= 64)),
+      'verified_on 必须是包含 device/ios/app_version/date 字段的对象列表',
+    );
+    meta.verified_on = document.verified_on.map(entry => ({ ...entry }));
+  }
+  return Object.keys(meta).length ? meta : null;
 }
 
 function setFlowFileStatus(message, tone = '') {
@@ -3472,6 +3537,7 @@ function setFlowFileStatus(message, tone = '') {
 }
 
 function applyImportedFlow(validated, filename) {
+  importedFlowRegistryMeta = validated.registryMeta || null;
   flowEntrySequence = 0;
   recordedFlowSteps = validated.steps.map(step => ({
     id: ++flowEntrySequence,
@@ -3730,6 +3796,7 @@ flowClear.addEventListener('click', () => {
   }
   clearFlowArmedUntil = 0;
   recordedFlowSteps = [];
+  importedFlowRegistryMeta = null;
   recordedFlowInputs = [];
   flowInputValues = new Map();
   flowInputSequence = 0;

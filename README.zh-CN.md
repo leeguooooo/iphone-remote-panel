@@ -305,6 +305,25 @@ PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
   "$MCP" flow run examples/flows/search-spotlight.json --input 'query=咖啡'
 ```
 
+**官方 flow 源**（[`leeguooooo/iphone-use-flows`](https://github.com/leeguooooo/iphone-use-flows)）
+把这件事做成了 chrome-use `site` 那样的可安装源：按 app 和分类组织、审阅过的 flow，
+下载时校验 sha256 并用同一套严格校验器检查后才写入本地，然后按 id 运行，全程不需要模型：
+
+```bash
+"$MCP" flow update                        # 把官方源镜像到 ~/.iphone-use/flows
+"$MCP" flow list --category health        # id · risk · verified · inputs · name
+"$MCP" flow info health/export-all        # 元数据和步骤模板
+PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
+  "$MCP" flow run system/spotlight-search --input query=Health
+"$MCP" flow add my-flow.json --as myapp/daily-check   # 自己的 flow，update 不会删
+```
+
+每个 flow 可选携带 registry 元数据：`app`（bundle id）、`category`、`risk`
+（`read_only` | `navigation` | `side_effect`，最后一种没有 `--confirm` 拒绝运行）、
+`locale`、`tags`、`verified_on`（证明过这份文件的真机记录）。只支持官方这一个源；
+文件是纯 JSON，安装源不会执行任何代码。MCP 侧对应 `phone_flow_list`、
+`phone_flow_info`、`phone_flow_run`、`phone_flow_update`。
+
 flow v1 是严格 JSON：包含 `version`、`name`、可选 `description`、显式 string
 `inputs` 和与 `phone_run_steps` 相同的 guarded `steps`。`--input KEY=VALUE`
 只在本次执行中解析参数，不会把值写回 JSON；流程也绝不会自动重试失败或结果未知的
