@@ -60,6 +60,14 @@ struct FlowDocument {
     /// Hardware runs that proved this exact file. Empty means unverified.
     #[serde(default)]
     verified_on: Vec<FlowVerification>,
+    /// Lowest app version (iOS version for Apple system apps) this flow is
+    /// known to work on. Installed versions below it are `incompatible`.
+    #[serde(default)]
+    app_version_min: Option<String>,
+    /// Harmless example values for the declared inputs, so re-verification
+    /// (and a curious human) can run a parameterized flow unattended.
+    #[serde(default)]
+    example_inputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -135,11 +143,32 @@ pub struct FlowMeta {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_on: Vec<FlowVerification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version_min: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub example_inputs: BTreeMap<String, String>,
 }
 
 impl FlowMeta {
     pub fn verified(&self) -> bool {
         !self.verified_on.is_empty()
+    }
+    /// Highest `app_version` among the recorded verifications.
+    pub fn verified_up_to(&self) -> Option<String> {
+        let mut best: Option<String> = None;
+        for v in self
+            .verified_on
+            .iter()
+            .filter_map(|v| v.app_version.as_deref())
+        {
+            match &best {
+                Some(b)
+                    if crate::compat::compare_versions(v, b)
+                        != Some(std::cmp::Ordering::Greater) => {}
+                _ => best = Some(v.to_string()),
+            }
+        }
+        best
     }
     pub fn risk_label(&self) -> &'static str {
         self.risk.map(FlowRisk::as_str).unwrap_or("unknown")
@@ -233,6 +262,22 @@ fn validate_metadata(document: &FlowDocument) -> Result<()> {
         }
         if !seen.insert(tag) {
             bail!("flow tag {tag:?} is listed more than once");
+        }
+    }
+    if let Some(min) = &document.app_version_min {
+        if !short_printable(min) || crate::compat::compare_versions(min, "0").is_none() {
+            bail!("flow app_version_min {min:?} must be a dotted numeric version such as 27.0 or 8.0.76");
+        }
+    }
+    if document.example_inputs.len() > MAX_INPUTS {
+        bail!("flow example_inputs exceeds the maximum of {MAX_INPUTS}");
+    }
+    for (name, value) in &document.example_inputs {
+        if !document.inputs.contains_key(name) {
+            bail!("flow example_inputs names undefined input {name:?}");
+        }
+        if value.is_empty() || value.chars().count() > 200 || value.chars().any(char::is_control) {
+            bail!("flow example_inputs[{name:?}] must contain 1 to 200 printable characters");
         }
     }
     if document.verified_on.len() > MAX_VERIFICATIONS {
@@ -484,6 +529,8 @@ pub fn parse_flow(bytes: &[u8], origin: &str) -> Result<ValidatedFlow> {
             locale: document.locale,
             tags: document.tags,
             verified_on: document.verified_on,
+            app_version_min: document.app_version_min,
+            example_inputs: document.example_inputs,
         },
         inputs: document.inputs,
         step_templates: document.steps,
@@ -521,14 +568,54 @@ pub fn validate_command(target: &str) -> Result<()> {
 }
 
 /// `flow run <file|id> [--input K=V]... [--confirm]`.
-pub async fn run_command(target: &str, assignments: &[String], confirm: bool) -> Result<()> {
+pub async fn run_command(
+    target: &str,
+    assignments: &[String],
+    confirm: bool,
+    force: bool,
+) -> Result<()> {
     let path = registry::resolve_target(target)?;
     let flow = load_flow(&path)?;
     let inputs = parse_input_assignments(assignments, &flow.inputs)?;
     let daemon = DaemonClient::from_env();
+    let report = compat_gate(&flow, &daemon, force).await?;
     let result = execute_flow(&flow, &inputs, &daemon, confirm).await?;
-    println!("{result}");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("compat".into(), serde_json::to_value(&report)?);
+        if report.compat == crate::compat::Compat::UntestedNewer {
+            object.insert(
+                "hint".into(),
+                serde_json::json!(
+                    "this flow ran on an app version newer than its last verification; if the phone ended where the flow promised, publish an updated verified_on (flow publish / phone_flow_publish)"
+                ),
+            );
+        }
+    }
+    println!("{value}");
     Ok(())
+}
+
+/// Compute the compat verdict and refuse `broken` / `incompatible` flows
+/// unless forced. Never contacts the phone itself.
+pub async fn compat_gate(
+    flow: &ValidatedFlow,
+    daemon: &DaemonClient,
+    force: bool,
+) -> Result<crate::compat::CompatReport> {
+    let installed = crate::compat::installed_apps(daemon).await;
+    let report = crate::compat::compat_for(&flow.meta, installed.as_ref());
+    if report.compat.blocks_run() && !force {
+        bail!(
+            "flow {:?} is {} ({}); no action was sent. Explore the app by hand and publish a fix, \
+             or pass --force / force=true to run it anyway",
+            flow.name(),
+            report.compat.as_str(),
+            report.reason
+        );
+    }
+    Ok(report)
 }
 
 /// Execute one validated flow exactly once. `confirm` is the explicit

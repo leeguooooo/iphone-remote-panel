@@ -512,7 +512,11 @@ pub fn list(filter: &ListFilter) -> Result<(Vec<(String, LocalFlow)>, LocalIndex
 }
 
 /// Human-readable table for the terminal.
-pub fn list_text(entries: &[(String, LocalFlow)], index: &LocalIndex) -> String {
+pub fn list_text(
+    entries: &[(String, LocalFlow)],
+    index: &LocalIndex,
+    installed: Option<&crate::compat::InstalledApps>,
+) -> String {
     let mut out = String::new();
     if entries.is_empty() {
         out.push_str("no installed flows match\n");
@@ -524,8 +528,8 @@ pub fn list_text(entries: &[(String, LocalFlow)], index: &LocalIndex) -> String 
             .unwrap_or(2)
             .max(2);
         out.push_str(&format!(
-            "{:<id_width$}  {:<11}  {:<8}  {:<9}  {}\n",
-            "ID", "RISK", "VERIFIED", "INPUTS", "NAME"
+            "{:<id_width$}  {:<11}  {:<28}  {:<9}  {}\n",
+            "ID", "RISK", "COMPAT", "INPUTS", "NAME"
         ));
         for (id, entry) in entries {
             let inputs = if entry.meta.inputs.is_empty() {
@@ -533,15 +537,29 @@ pub fn list_text(entries: &[(String, LocalFlow)], index: &LocalIndex) -> String 
             } else {
                 entry.meta.inputs.join(",")
             };
+            let compat =
+                crate::compat::compat_label(&crate::compat::compat_for(&entry.meta, installed));
             out.push_str(&format!(
-                "{:<id_width$}  {:<11}  {:<8}  {:<9}  {}\n",
+                "{:<id_width$}  {:<11}  {:<28}  {:<9}  {}\n",
                 id,
                 entry.meta.risk_label(),
-                if entry.meta.verified() { "yes" } else { "no" },
+                compat,
                 inputs,
                 entry.meta.name
             ));
         }
+    }
+    match installed {
+        Some(apps) => out.push_str(&format!(
+            "phone: {} · iOS {} · {} apps known via {}\n",
+            apps.device.as_deref().unwrap_or("?"),
+            apps.ios.as_deref().unwrap_or("?"),
+            apps.apps.len(),
+            apps.source
+        )),
+        None => out.push_str(
+            "phone: app versions unknown (no daemon reachable) — compat shows verified/draft only\n",
+        ),
     }
     if let Some(updated) = &index.updated_at {
         out.push_str(&format!(
@@ -554,18 +572,25 @@ pub fn list_text(entries: &[(String, LocalFlow)], index: &LocalIndex) -> String 
     out
 }
 
-pub fn list_json(entries: &[(String, LocalFlow)], index: &LocalIndex) -> serde_json::Value {
+pub fn list_json(
+    entries: &[(String, LocalFlow)],
+    index: &LocalIndex,
+    installed: Option<&crate::compat::InstalledApps>,
+) -> serde_json::Value {
     serde_json::json!({
         "ok": true,
         "source": index.source,
         "updated_at": index.updated_at,
         "apps": index.apps,
+        "phone": installed.map(|a| serde_json::json!({"device": a.device, "ios": a.ios, "apps_known": a.apps.len(), "source": a.source})),
         "flows": entries.iter().map(|(id, entry)| {
             let mut value = serde_json::to_value(entry).expect("LocalFlow serializes");
             let object = value.as_object_mut().expect("LocalFlow is an object");
             object.insert("id".into(), serde_json::json!(id));
             object.insert("verified".into(), serde_json::json!(entry.meta.verified()));
             object.insert("risk".into(), serde_json::json!(entry.meta.risk_label()));
+            let report = crate::compat::compat_for(&entry.meta, installed);
+            object.insert("compat".into(), serde_json::to_value(&report).expect("CompatReport serializes"));
             value
         }).collect::<Vec<_>>()
     })
@@ -701,7 +726,10 @@ pub fn flows_for_application(index: &LocalIndex, application: &str) -> Vec<(Stri
 /// A compact `registry` block for a `/agent/elements` response: the flows that
 /// fit the foreground app, or a nudge to populate the store. Never fails —
 /// hints must not break an elements read.
-pub fn elements_hint(elements_body: &str) -> Option<serde_json::Value> {
+pub fn elements_hint(
+    elements_body: &str,
+    installed: Option<&crate::compat::InstalledApps>,
+) -> Option<serde_json::Value> {
     let body: serde_json::Value = serde_json::from_str(elements_body).ok()?;
     let application = body
         .get("elements")
@@ -738,17 +766,31 @@ pub fn elements_hint(elements_body: &str) -> Option<serde_json::Value> {
     } else {
         hint["flows"] = serde_json::json!(matches
             .iter()
-            .map(|(id, entry)| serde_json::json!({
-                "id": id,
-                "name": entry.meta.name,
-                "risk": entry.meta.risk_label(),
-                "verified": entry.meta.verified(),
-                "inputs": entry.meta.inputs,
-            }))
+            .map(|(id, entry)| {
+                let report = crate::compat::compat_for(&entry.meta, installed);
+                serde_json::json!({
+                    "id": id,
+                    "name": entry.meta.name,
+                    "risk": entry.meta.risk_label(),
+                    "verified": entry.meta.verified(),
+                    "compat": report.compat.as_str(),
+                    "installed_version": report.installed_version,
+                    "verified_up_to": report.verified_up_to,
+                    "inputs": entry.meta.inputs,
+                })
+            })
             .collect::<Vec<_>>());
-        hint["hint"] = serde_json::json!(
-            "registry flows exist for this app — prefer phone_flow_run over step-by-step exploration when one matches the task"
-        );
+        let any_runnable = matches.iter().any(|(_, e)| {
+            !crate::compat::compat_for(&e.meta, installed)
+                .compat
+                .blocks_run()
+        });
+        hint["hint"] = serde_json::json!(if any_runnable {
+            "registry flows exist for this app — prefer phone_flow_run over step-by-step exploration when one matches the task; \
+             compat=untested-newer means run it, then take one checkpoint screenshot and publish the new verified_on"
+        } else {
+            "registry flows exist for this app but are broken/incompatible on this phone — explore by hand, then publish the fixed flow"
+        });
     }
     Some(hint)
 }
@@ -1025,11 +1067,14 @@ mod tests {
         update().await.unwrap();
 
         let body = r#"{"snapshot":"s","elements":[{"kind":"Application","label":"健康","rect":[0,0,1,1]}]}"#;
-        let hint = elements_hint(body).unwrap();
+        let hint = elements_hint(body, None).unwrap();
         assert_eq!(hint["flows"][0]["id"], "health/open");
         assert_eq!(hint["application"], "健康");
-        let other =
-            elements_hint(r#"{"elements":[{"kind":"Application","label":"Mail"}]}"#).unwrap();
+        let other = elements_hint(
+            r#"{"elements":[{"kind":"Application","label":"Mail"}]}"#,
+            None,
+        )
+        .unwrap();
         assert_eq!(other["flows"].as_array().unwrap().len(), 0);
         assert!(other["hint"]
             .as_str()

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod client;
+mod compat;
 mod contrib;
 mod flow;
 mod registry;
@@ -68,6 +69,15 @@ enum FlowCommand {
         /// Required for flows declared `risk: side_effect` (send/publish/pay/delete).
         #[arg(long)]
         confirm: bool,
+        /// Run even when compat is broken/incompatible for the installed app version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the app versions installed on the phone that compat is computed from.
+    Apps {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
     },
     /// Mirror the official flow registry into the local store (~/.iphone-use/flows).
     Update,
@@ -160,7 +170,36 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 inputs,
                 confirm,
-            } => flow::run_command(&target, &inputs, confirm).await,
+                force,
+            } => flow::run_command(&target, &inputs, confirm, force).await,
+            FlowCommand::Apps { json } => {
+                let daemon = client::DaemonClient::from_env();
+                match compat::installed_apps(&daemon).await {
+                    Some(apps) if json => println!("{}", serde_json::to_string_pretty(&apps)?),
+                    Some(apps) => {
+                        println!(
+                            "{} · iOS {} · {} apps via {}",
+                            apps.device.as_deref().unwrap_or("?"),
+                            apps.ios.as_deref().unwrap_or("?"),
+                            apps.apps.len(),
+                            apps.source
+                        );
+                        for (bundle, app) in &apps.apps {
+                            println!(
+                                "{:<48} {:<12} {}{}",
+                                bundle,
+                                app.version.as_deref().unwrap_or("-"),
+                                app.name.as_deref().unwrap_or(""),
+                                if app.system { "  (system → iOS version)" } else { "" }
+                            );
+                        }
+                    }
+                    None => anyhow::bail!(
+                        "installed app versions unknown: the daemon has no /agent/apps (issue #76) and it is not on loopback for the devicectl fallback"
+                    ),
+                }
+                Ok(())
+            }
             FlowCommand::Update => {
                 let report = registry::update().await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -178,10 +217,17 @@ async fn main() -> anyhow::Result<()> {
                     verified_only: verified,
                 };
                 let (entries, index) = registry::list(&filter)?;
+                let installed = compat::installed_apps(&client::DaemonClient::from_env()).await;
                 if json {
-                    println!("{}", registry::list_json(&entries, &index));
+                    println!(
+                        "{}",
+                        registry::list_json(&entries, &index, installed.as_ref())
+                    );
                 } else {
-                    print!("{}", registry::list_text(&entries, &index));
+                    print!(
+                        "{}",
+                        registry::list_text(&entries, &index, installed.as_ref())
+                    );
                 }
                 Ok(())
             }

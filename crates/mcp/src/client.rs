@@ -181,6 +181,14 @@ impl DaemonClient {
     // -----------------------------------------------------------------------
 
     /// `GET /agent/status` — health / phone-target probe.
+    /// Authenticated GET returning the raw body (2xx only). Used for
+    /// endpoints the typed client does not model yet, e.g. `/agent/apps`.
+    pub async fn get_text(&self, path: &str) -> anyhow::Result<String> {
+        let resp = self.auth(self.client.get(self.url(path))).send().await?;
+        let resp = check_status(resp).await?;
+        Ok(resp.text().await?)
+    }
+
     pub async fn status(&self) -> anyhow::Result<StatusResponse> {
         let req = self.auth(self.client.get(self.url("/agent/status")));
         let resp = req.send().await?;

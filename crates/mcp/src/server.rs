@@ -321,6 +321,9 @@ pub struct FlowRunParams {
     /// the user confirmed the target and inputs.
     #[serde(default)]
     pub confirm: bool,
+    /// Run even when compat is `broken` or `incompatible` for this phone.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Parameters for [`phone_flow_publish`].
@@ -637,7 +640,8 @@ impl PhoneHandler {
             Ok(json) => {
                 // Bring the registry to the agent: which installed flows fit
                 // the app that is on screen right now.
-                let hint = crate::registry::elements_hint(&json);
+                let installed = crate::compat::installed_apps(&self.daemon).await;
+                let hint = crate::registry::elements_hint(&json, installed.as_ref());
                 CallToolResult::success(vec![Content::text(crate::registry::attach_hint(
                     json, "registry", hint,
                 ))])
@@ -762,7 +766,8 @@ impl PhoneHandler {
         and NO screenshots. CHECK THIS FIRST before driving an app step by step: if a \
         flow matches the task, call phone_flow_run instead of exploring. Each entry \
         reports name, description, risk (read_only|navigation|side_effect|unknown), \
-        verified (has a recorded hardware run), inputs, app, and category. Empty store: \
+        verified (has a recorded hardware run), compat against the app version installed on THIS phone \
+        (verified|untested-newer|incompatible|broken|needs-verification|draft|unknown), inputs, app, and category. Empty store: \
         call phone_flow_update once. Filters are optional."
     )]
     async fn phone_flow_list(
@@ -778,9 +783,10 @@ impl PhoneHandler {
             app,
             verified_only: verified,
         };
+        let installed = crate::compat::installed_apps(&self.daemon).await;
         match crate::registry::list(&filter) {
             Ok((entries, index)) => CallToolResult::success(vec![Content::text(
-                crate::registry::list_json(&entries, &index).to_string(),
+                crate::registry::list_json(&entries, &index, installed.as_ref()).to_string(),
             )]),
             Err(e) => {
                 CallToolResult::error(vec![Content::text(format!("flow list failed: {e:#}"))])
@@ -816,7 +822,8 @@ impl PhoneHandler {
         the daemon validates the whole sequence, holds one control lock, and stops at \
         the first failed step. The happy path costs one tool call and zero screenshots. \
         Requires phone_status drivable=true. Pass the flow's declared inputs; a flow \
-        declared risk=side_effect is refused unless confirm=true. The result reports \
+        declared risk=side_effect is refused unless confirm=true; a flow whose compat is broken or \
+        incompatible for the installed app version is refused unless force=true. The result reports \
         completed/applied counts and the failed step; retry_safe=false means DO NOT \
         replay — inspect phone_elements, repair the flow, do not guess. Unverified flows \
         (verified=false in phone_flow_list) may need a checkpoint screenshot afterwards."
@@ -827,6 +834,7 @@ impl PhoneHandler {
             id,
             inputs,
             confirm,
+            force,
         }): Parameters<FlowRunParams>,
     ) -> CallToolResult {
         if !crate::registry::valid_flow_id(&id) {
@@ -849,6 +857,10 @@ impl PhoneHandler {
         if let Err(e) = crate::flow::check_input_map(&inputs, &flow.inputs) {
             return CallToolResult::error(vec![Content::text(format!("{e:#}"))]);
         }
+        let compat = match crate::flow::compat_gate(&flow, &self.daemon, force).await {
+            Ok(report) => report,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("{e:#}"))]),
+        };
         match crate::flow::execute_flow(&flow, &inputs, &self.daemon, confirm).await {
             Ok(body) => {
                 let result = serde_json::from_str::<serde_json::Value>(&body)
@@ -857,9 +869,15 @@ impl PhoneHandler {
                     "flow": id,
                     "verified": flow.meta.verified(),
                     "risk": flow.meta.risk_label(),
+                    "compat": compat,
                     "result": result,
                 });
-                if !flow.meta.verified() {
+                if compat.compat == crate::compat::Compat::UntestedNewer {
+                    summary["hint"] = serde_json::json!(
+                        "the installed app is newer than this flow's last verification — if the phone ended where \
+                         the flow promised, publish an updated verified_on (phone_flow_publish) so others get compat=verified"
+                    );
+                } else if !flow.meta.verified() {
                     summary["hint"] = serde_json::json!(
                         "this flow had no hardware verification yet — if the phone is now where the flow \
                          promised, tell the user and offer to add verified_on via phone_flow_publish"
