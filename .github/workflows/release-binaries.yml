@@ -178,13 +178,14 @@ jobs:
           listing = next(item for item in responses if item.get("id") == 2)
           tools = listing["result"]["tools"]
           names = [tool["name"] for tool in tools]
-          assert len(names) == 12, names
-          assert "phone_run_steps" in names, names
+          assert len(names) == 20, names
+          for required in ("phone_run_steps", "phone_hold", "phone_release_owner", "phone_status"):
+              assert required in names, names
           run_steps = next(
               tool for tool in tools if tool["name"] == "phone_run_steps"
           )
           assert "steps" in run_steps["inputSchema"]["properties"], run_steps
-          print("Bundled MCP exposes 12 tools including phone_run_steps.")
+          print("Bundled MCP exposes 20 tools including phone_run_steps and phone_hold.")
 
           flow = subprocess.run(
               [
