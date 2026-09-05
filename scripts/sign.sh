@@ -133,6 +133,22 @@ for binary in "$DAEMON_BINARY" "$MCP_BINARY"; do
     fi
 done
 
+# ── Signing flags ─────────────────────────────────────────────────────────────
+# Notarization rejects a Developer ID signature without the hardened runtime
+# and a secure timestamp ("The executable does not have the hardened runtime
+# enabled" / "The signature does not include a secure timestamp"). The
+# self-signed local identity is never notarized, and a timestamp request
+# needs network access it may not have, so it keeps the offline flags.
+case "$IDENTITY" in
+    *"Developer ID Application"*)
+        SIGN_FLAGS=(--options runtime --timestamp)
+        echo "Developer ID identity: signing with hardened runtime + secure timestamp"
+        ;;
+    *)
+        SIGN_FLAGS=(--timestamp=none)
+        ;;
+esac
+
 # ── Sign nested binaries first, then the outer bundle ─────────────────────────
 # $MCP_BINARY leads deliberately. $DAEMON_BINARY is the bundle's main
 # executable, so codesign folds bundle validation into signing it and rejects
@@ -144,7 +160,7 @@ for binary in "$MCP_BINARY" "$DAEMON_BINARY"; do
     codesign \
         --force \
         --sign "$IDENTITY" \
-        --timestamp=none \
+        "${SIGN_FLAGS[@]}" \
         "$binary"
 done
 
@@ -152,7 +168,7 @@ echo "Signing bundle: $APP ..."
 codesign \
     --force \
     --sign "$IDENTITY" \
-    --timestamp=none \
+    "${SIGN_FLAGS[@]}" \
     "$APP"
 
 # ── Verify ────────────────────────────────────────────────────────────────────
