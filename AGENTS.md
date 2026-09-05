@@ -18,3 +18,8 @@
 - 多个 worktree 并行时保持各自独立的 `target/` 目录(不要设全局 `CARGO_TARGET_DIR`);
   跨 worktree 的复用靠 sccache,不靠共享 target。
 - 若 `~/.local/bin/heavy-cargo` 不存在(如 CI 或其他机器),回退裸 cargo 即可。
+
+## Shared worktree discipline
+
+Several agent sessions commit from this one checkout. Before every commit:
+`git status` and `git diff --cached --stat`, stage **by file** (`git add <path>`), and never use `git add -A` / `git commit -a`. A file you did not edit that shows as modified belongs to another session — leave it. On 2026-09-05 a `git add` of `scripts/setup-wda.sh` swept another session's half-finished multi-instance rewrite into v0.6.1 and broke the release gate. Attribution: read the `Claude-Session:` trailer, not the author name (all sessions share it).
