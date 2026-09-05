@@ -3756,13 +3756,19 @@ printf '  Signing   : free Apple ID profiles may expire after 7 days; re-run set
 # failures. Interactive setup returned above only after handing off to this job.
 if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
     info "KeepAlive mode: holding while the PID-verified runner and relays stay healthy"
+    KEEPALIVE_EXIT_CAUSE=runner
     while :; do
+        KEEPALIVE_EXIT_CAUSE=runner
         _validate_pid_record "$RUNNER_PID_FILE" "$LEGACY_RUNNER_EXPECTED" runner || break
         RPID="$VALIDATED_PID"
+        KEEPALIVE_EXIT_CAUSE=relay
         _verify_loopback_listener "$RELAY_PID_FILE" "$LEGACY_RELAY_EXPECTED" relay "$WDA_PORT" \
             || break
         _verify_loopback_listener "$MJPEG_RELAY_PID_FILE" "$LEGACY_MJPEG_EXPECTED" mjpeg "$MJPEG_PORT" \
             || break
+        # The runner and both relay processes are alive, so an unreachable WDA
+        # means the path between them broke, not the runner.
+        KEEPALIVE_EXIT_CAUSE=unreachable
         curl -fsS -m 4 "$TARGET_URL/status" >/dev/null 2>&1 || break
         sleep 10
     done
@@ -3770,7 +3776,28 @@ if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
         _prepare_locked_retry
         exit 1
     fi
-    warn "WDA runner/relay went down — exiting so launchd KeepAlive rebuilds it"
+    # Name the cause. "runner/relay went down" was the same sentence for a
+    # dead runner and for the common LAN case where everything is alive but
+    # the phone's Wi-Fi address moved — which cost a session an hour of
+    # reading logs before someone compared the relay's target IP to the
+    # phone's current one.
+    case "$KEEPALIVE_EXIT_CAUSE" in
+        unreachable)
+            if [ "${WDA_ALLOW_LAN:-0}" = "1" ]; then
+                warn "WDA stopped answering while the runner and relays are alive — the phone's Wi-Fi address most likely changed (the relay still points at ${PHONE_IP:-its old address}). Rebuilding; connect the iPhone by USB to make this immune to DHCP changes."
+                _setstatus building "" "WDA unreachable through the LAN relay (the phone's Wi-Fi address may have changed) — rebuilding"
+            else
+                warn "WDA stopped answering while the runner and relays are alive — the USB tunnel dropped; rebuilding"
+                _setstatus building "" "WDA unreachable through the USB relay — rebuilding"
+            fi
+            ;;
+        relay)
+            warn "the WDA relay stopped listening — exiting so launchd KeepAlive rebuilds it"
+            ;;
+        *)
+            warn "the WDA runner exited — exiting so launchd KeepAlive rebuilds it"
+            ;;
+    esac
     _stop_managed_process "$MJPEG_RELAY_PID_FILE" "$LEGACY_MJPEG_EXPECTED" mjpeg || true
     _stop_managed_process "$RELAY_PID_FILE" "$LEGACY_RELAY_EXPECTED" relay || true
     _stop_managed_process "$RUNNER_PID_FILE" "$LEGACY_RUNNER_EXPECTED" runner || true
