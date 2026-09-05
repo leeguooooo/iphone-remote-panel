@@ -2218,6 +2218,10 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin".to_string(),
             ),
         ];
+        // Everything setup-wda.sh reads that the daemon's own environment may
+        // carry. The three ASC keys travel together: the script only signs
+        // with an API key when all of them are present, and refuses to mix a
+        // partial override with a persisted set.
         for key in [
             "WDA_TEAM_ID",
             "WDA_BUNDLE_ID",
@@ -2226,6 +2230,11 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
             "WDA_PORT",
             "MJPEG_PORT",
             "WDA_ALLOW_LAN",
+            "WDA_RUNNER_NAME",
+            "WDA_RUNNER_ICON",
+            "WDA_ASC_KEY_PATH",
+            "WDA_ASC_KEY_ID",
+            "WDA_ASC_ISSUER_ID",
         ] {
             if let Ok(value) = std::env::var(key) {
                 if !value.is_empty() {
@@ -3676,6 +3685,9 @@ async fn tap_snapshot_element(
 /// field's contents directly through WDA's `element/:id/value` instead of the
 /// focus-tap-then-type dance. Clears first so the value REPLACES stale text;
 /// an empty string means "clear the field".
+/// Text inputs that `set_value` may resolve by frame when the row carries no
+/// label and no identifier.
+const TEXT_INPUT_KINDS: [&str; 4] = ["TextField", "SecureTextField", "SearchField", "TextView"];
 async fn set_value_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
@@ -3686,7 +3698,17 @@ async fn set_value_snapshot_element(
         .ok_or(SnapshotElementTapError::Invalid)?
         .to_string();
     let (rows, index) = fetch_snapshot_row(w, value).await?;
-    let element_id = resolve_snapshot_row_element(w, &rows[index]).await?;
+    let row = &rows[index];
+    let element_id = if snapshot_row_locator(row).is_some() {
+        resolve_snapshot_row_element(w, row).await?
+    } else if TEXT_INPUT_KINDS.contains(&row.kind.as_str()) {
+        // A web form's <input> routinely has neither label nor identifier
+        // (hardware-hit inside a bank's WKWebView, issue #70). It still has a
+        // frame; match it the way #57 matches an unlabeled Stepper.
+        resolve_row_by_frame(w, row, &format!("**/XCUIElementType{}", row.kind)).await?
+    } else {
+        return Err(SnapshotElementTapError::InvalidTarget);
+    };
     if text.is_empty() {
         // Clearing IS the requested mutation — report its real outcome.
         return w.clear_element(&element_id).await.map_err(|error| {
@@ -4120,6 +4142,59 @@ fn swipe_travel(d: f64, axis: f64) -> f64 {
     }
 }
 
+/// Element kinds whose rect is a viewport: a swipe inside it moves content.
+const SCROLLABLE_KINDS: [&str; 6] = [
+    "Table",
+    "CollectionView",
+    "ScrollView",
+    "Picker",
+    "PickerWheel",
+    "WebView",
+];
+
+/// The rect of the smallest live scroll container enclosing `row`, if any.
+///
+/// Containers are looked up live rather than in the snapshot because the
+/// flattened tree drops label-less non-interactive nodes — which is exactly
+/// what most tables and scroll views are.
+async fn scroll_container_rect(
+    w: &mut crate::wda::WdaClient,
+    row: &crate::wda::ElementRow,
+) -> Option<[f64; 4]> {
+    let mut candidates = Vec::new();
+    for kind in SCROLLABLE_KINDS {
+        let Ok(ids) = w
+            .find_elements("class chain", &format!("**/XCUIElementType{kind}"))
+            .await
+        else {
+            continue;
+        };
+        for id in ids {
+            if let Ok(rect) = w.element_rect(&id).await {
+                candidates.push(rect);
+            }
+        }
+    }
+    pick_scroll_container(row.rect, &candidates).map(|index| candidates[index])
+}
+
+/// Index of the smallest candidate rect that fully contains `inner` (2pt
+/// tolerance on each edge), so a nested list wins over the page behind it.
+fn pick_scroll_container(inner: [f64; 4], candidates: &[[f64; 4]]) -> Option<usize> {
+    let contains = |outer: &[f64; 4]| {
+        let [ix, iy, iw, ih] = inner;
+        let [ox, oy, ow, oh] = *outer;
+        ox <= ix + 2.0 && oy <= iy + 2.0 && ox + ow >= ix + iw - 2.0 && oy + oh >= iy + ih - 2.0
+    };
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, rect)| rect.iter().all(|v| v.is_finite()) && contains(rect))
+        .filter(|(_, rect)| rect[2] >= 8.0 && rect[3] >= 8.0)
+        .min_by(|(_, a), (_, b)| (a[2] * a[3]).total_cmp(&(b[2] * b[3])))
+        .map(|(index, _)| index)
+}
+
 /// `{"type":"scroll","element":N,"snapshot":"…","dx":…,"dy":…}` — scroll INSIDE
 /// a specific element's rectangle (both gesture endpoints stay within it), so a
 /// list scrolls without the gesture straying into a neighboring scroll view.
@@ -4139,7 +4214,17 @@ async fn scroll_snapshot_element(
         return Err(SnapshotElementTapError::Invalid);
     }
     let (rows, index) = fetch_snapshot_row(w, value).await?;
-    let [x, y, width, height] = rows[index].rect;
+    let row = &rows[index];
+    // A swipe inside a 44pt table row travels at most ~30pt whatever `dy`
+    // says (hardware-hit on a WKWebView <select> menu, issue #70): the row
+    // is the thing that moves, not the viewport. When the target is not
+    // itself a scroll container, swipe inside the smallest live container
+    // that encloses it; fall back to the row's own rect only when none does.
+    let [x, y, width, height] = if SCROLLABLE_KINDS.contains(&row.kind.as_str()) {
+        row.rect
+    } else {
+        scroll_container_rect(w, row).await.unwrap_or(row.rect)
+    };
     // A meaningful in-element gesture needs room for both endpoints.
     if ![x, y, width, height].into_iter().all(f64::is_finite) || width < 8.0 || height < 8.0 {
         return Err(SnapshotElementTapError::InvalidTarget);
@@ -8994,6 +9079,28 @@ mod tests {
         assert!(recover(hold_until.lock()).is_none(), "a refused hold writes no lease");
         lifecycle.finish_releasing();
         assert!(try_take_hold(&lifecycle, &hold_until, 30), "and is accepted once the release is over");
+    }
+
+    // A row's own rect is too small to scroll in; the gesture belongs to the
+    // smallest scroll container that encloses it (issue #70).
+    #[test]
+    fn the_smallest_enclosing_scroll_container_wins() {
+        let row = [20.0, 300.0, 350.0, 44.0];
+        let page = [0.0, 0.0, 390.0, 844.0];
+        let menu = [16.0, 200.0, 358.0, 400.0];
+        let sibling = [16.0, 620.0, 358.0, 200.0]; // does not contain the row
+        assert_eq!(pick_scroll_container(row, &[page, menu, sibling]), Some(1));
+        assert_eq!(pick_scroll_container(row, &[page]), Some(0));
+        assert_eq!(pick_scroll_container(row, &[sibling]), None);
+        assert_eq!(pick_scroll_container(row, &[]), None);
+    }
+
+    #[test]
+    fn a_container_may_hug_the_row_within_two_points_but_not_more() {
+        let row = [20.0, 300.0, 350.0, 44.0];
+        assert_eq!(pick_scroll_container(row, &[[21.0, 301.0, 348.0, 42.0]]), Some(0));
+        assert_eq!(pick_scroll_container(row, &[[24.0, 300.0, 350.0, 44.0]]), None);
+        assert_eq!(pick_scroll_container(row, &[[f64::NAN, 0.0, 400.0, 900.0]]), None);
     }
 
     #[test]
