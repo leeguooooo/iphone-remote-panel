@@ -1460,6 +1460,30 @@ fn flatten_tree(node: &serde_json::Value, depth: u32, out: &mut Vec<ElementRow>)
     flatten_tree_with(node, depth, out, flatten_options_from_env());
 }
 
+/// The label of a node's single labeled Button child, if there is exactly one.
+fn single_labeled_child_button(node: &serde_json::Value) -> Option<String> {
+    let children = node.get("children").and_then(|c| c.as_array())?;
+    let mut found: Option<String> = None;
+    for child in children {
+        let is_button = child.get("type").and_then(|t| t.as_str()) == Some("XCUIElementTypeButton");
+        if !is_button {
+            continue;
+        }
+        let label = child
+            .get("label")
+            .and_then(|l| l.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| child.get("name").and_then(|l| l.as_str()).filter(|s| !s.is_empty()));
+        if let Some(label) = label {
+            if found.is_some() {
+                return None; // two labeled buttons: ambiguous, leave the Cell alone
+            }
+            found = Some(label.to_string());
+        }
+    }
+    found
+}
+
 fn flatten_tree_with(
     node: &serde_json::Value,
     depth: u32,
@@ -1472,13 +1496,26 @@ fn flatten_tree_with(
         .unwrap_or("")
         .trim_start_matches("XCUIElementType")
         .to_string();
-    let label = node
+    let mut label = node
         .get("label")
         .and_then(|l| l.as_str())
         .filter(|s| !s.is_empty())
         .or_else(|| node.get("name").and_then(|l| l.as_str()))
         .unwrap_or("")
         .to_string();
+    // A WKWebView <select> popup lists its options as unlabeled Cells whose
+    // single child Button carries the option text (hardware-verified on a
+    // 200-option <select>, #70: `Cell "" → Button "Country 001" → Image
+    // "已选择"`). The text was in the tree all along, one row below the Cell —
+    // but every consumer keys on the Cell, and an agent reading only Cell
+    // rows saw 27 empty labels and gave up. Lift the child's label onto the
+    // Cell when it is the Cell's only labeled child, so the row an agent taps
+    // is the row that names the option. The child row is still emitted.
+    if label.is_empty() && kind == "Cell" {
+        if let Some(only) = single_labeled_child_button(node) {
+            label = only;
+        }
+    }
     if !label.is_empty() || INTERACTIVE_KINDS.contains(&kind.as_str()) {
         let r = node.get("rect").cloned().unwrap_or_default();
         let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1957,6 +1994,49 @@ mod tests {
         assert!(health.up);
         assert!(!health.actionable);
         assert_eq!(health.locked, Some(true));
+    }
+
+    /// #70: a WKWebView <select> popup's option rows are unlabeled Cells with
+    /// one labeled Button child. The Cell must carry the option text.
+    #[test]
+    fn flatten_lifts_single_child_button_label_onto_unlabeled_cell() {
+        let tree: serde_json::Value = serde_json::from_str(
+            r#"{
+              "type":"XCUIElementTypeApplication","label":"",
+              "rect":{"x":0,"y":0,"width":440,"height":956},
+              "children":[
+                {"type":"XCUIElementTypeCell","label":"",
+                 "rect":{"x":109,"y":102,"width":251,"height":36},
+                 "children":[
+                   {"type":"XCUIElementTypeButton","label":"Country 001",
+                    "rect":{"x":109,"y":102,"width":251,"height":36}},
+                   {"type":"XCUIElementTypeImage","label":"已选择",
+                    "rect":{"x":129,"y":115,"width":12,"height":10}}
+                 ]},
+                {"type":"XCUIElementTypeCell","label":"",
+                 "rect":{"x":109,"y":138,"width":251,"height":36},
+                 "children":[
+                   {"type":"XCUIElementTypeButton","label":"A",
+                    "rect":{"x":109,"y":138,"width":100,"height":36}},
+                   {"type":"XCUIElementTypeButton","label":"B",
+                    "rect":{"x":209,"y":138,"width":100,"height":36}}
+                 ]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        flatten_tree(&tree, 0, &mut rows);
+        let cells: Vec<&ElementRow> = rows.iter().filter(|r| r.kind == "Cell").collect();
+        assert_eq!(cells.len(), 2);
+        // One labeled child → lifted.
+        assert_eq!(cells[0].label, "Country 001");
+        // Two labeled children → ambiguous, left empty.
+        assert_eq!(cells[1].label, "");
+        // The child Button row is still emitted after its Cell.
+        let first_cell = rows.iter().position(|r| r.kind == "Cell").unwrap();
+        assert_eq!(rows[first_cell + 1].kind, "Button");
+        assert_eq!(rows[first_cell + 1].label, "Country 001");
     }
 
     #[test]
