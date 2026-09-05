@@ -37,324 +37,8 @@ umask 077
 # live outside it. Extend deterministically rather than relying on the shell.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 
-# BEGIN instance context. Shared helper contract; keep all three copies aligned.
-# shellcheck disable=SC2034 # Full mapping is shared; each entrypoint consumes a subset.
-_instance_context() {
-    INSTANCE_NAME="${1:-default}"
-    if [ "$INSTANCE_NAME" = wda ] || ! printf '%s\n' "$INSTANCE_NAME" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{0,31}$'; then
-        printf '%s\n' 'Invalid instance name: use 1-32 lowercase letters/digits/hyphens, starting with a letter; wda is reserved.' >&2
-        return 1
-    fi
-    case "$INSTANCE_NAME" in *$'\n'*|*$'\r'*) return 1 ;; esac
-    INSTANCE_STATE_DIR="$HOME/.iphone-use"
-    INSTANCE_DAEMON_LABEL=com.leeguoo.iphone-use
-    INSTANCE_WDA_LABEL=com.leeguoo.iphone-use.wda
-    INSTANCE_APP_DIR="$HOME/Applications"
-    INSTANCE_LOG_DIR="$HOME/Library/Logs/iPhoneUse"
-    INSTANCE_DERIVED_DATA=""
-    if [ "$INSTANCE_NAME" != default ]; then
-        INSTANCE_STATE_DIR="$HOME/.iphone-use/instances/$INSTANCE_NAME"
-        INSTANCE_DAEMON_LABEL="com.leeguoo.iphone-use.$INSTANCE_NAME"
-        INSTANCE_WDA_LABEL="com.leeguoo.iphone-use.wda.$INSTANCE_NAME"
-        INSTANCE_APP_DIR="$INSTANCE_STATE_DIR/runtime"
-        INSTANCE_LOG_DIR="$INSTANCE_STATE_DIR/logs"
-        INSTANCE_DERIVED_DATA="$INSTANCE_STATE_DIR/DerivedData"
-    fi
-    if [ -n "${PHONE_REMOTE_STATE_DIR:-}" ]; then
-        case "$PHONE_REMOTE_STATE_DIR" in
-            /*) ;;
-            *) printf '%s\n' 'State directory override must be absolute.' >&2; return 1 ;;
-        esac
-        case "$PHONE_REMOTE_STATE_DIR" in
-            /|*/./*|*/../*|*/.|*/..|"$HOME"|"$HOME/.iphone-use"|"$HOME/.iphone-use/"*|*$'\n'*|*$'\r'*)
-                printf '%s\n' 'State directory override overlaps a reserved namespace or contains unsafe components.' >&2; return 1 ;;
-        esac
-        case "$HOME/.iphone-use" in
-            "$PHONE_REMOTE_STATE_DIR"/*) printf '%s\n' 'State directory override is an ancestor of the product namespace.' >&2; return 1 ;;
-        esac
-        INSTANCE_STATE_DIR="$PHONE_REMOTE_STATE_DIR"
-        if [ "$INSTANCE_NAME" != default ]; then
-            INSTANCE_APP_DIR="$INSTANCE_STATE_DIR/runtime"
-            INSTANCE_LOG_DIR="$INSTANCE_STATE_DIR/logs"
-            INSTANCE_DERIVED_DATA="$INSTANCE_STATE_DIR/DerivedData"
-        fi
-    fi
-    export PHONE_REMOTE_INSTANCE="$INSTANCE_NAME"
-}
-
-_instance_script_guard() {
-    # Installed named entrypoints never silently fall back to default, even
-    # when invoked by hand without their launchd environment.
-    case "$1" in
-        "$HOME/.iphone-use/instances/"*/setup-wda.sh|"$HOME/.iphone-use/instances/"*/uninstall.sh)
-            [ "$(dirname "$1")" = "$INSTANCE_STATE_DIR" ] || {
-                printf '%s\n' 'Installed script instance does not match PHONE_REMOTE_INSTANCE/--instance.' >&2
-                return 1
-            }
-            ;;
-    esac
-    local marker
-    marker="$(dirname "$1")/instance.json"
-    if [ -f "$marker" ] || [ -L "$marker" ]; then
-        python3 - "$marker" "$INSTANCE_NAME" "$INSTANCE_STATE_DIR" <<'PYMARKER'
-import json, os, pathlib, sys
-p=pathlib.Path(sys.argv[1])
-if p.is_symlink() or p.stat().st_uid != os.getuid(): raise SystemExit('Unsafe instance marker')
-d=json.loads(p.read_text())
-if d != {'schema':'iphone-use-instance-v1','name':sys.argv[2],'state_dir':sys.argv[3]} or str(p.parent.resolve())!=sys.argv[3]:
-    raise SystemExit('Installed script instance/state directory mismatch')
-PYMARKER
-    fi
-
-}
-
-_instance_load_saved_path() {
-    [ "${PHONE_REMOTE_STATE_DIR+x}" != x ] || return 0
-    local plist="$HOME/Library/LaunchAgents/$INSTANCE_DAEMON_LABEL.plist" value
-    [ -e "$plist" ] || return 0
-    [ ! -L "$plist" ] && [ -f "$plist" ] || return 1
-    [ "$(stat -f '%u' "$plist")" = "$(id -u)" ] || return 1
-    value="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:PHONE_REMOTE_STATE_DIR' "$plist" 2>/dev/null || true)"
-    [ -n "$value" ] || return 0
-    export PHONE_REMOTE_STATE_DIR="$value"
-    _instance_context "$INSTANCE_NAME"
-}
-
-_instance_namespace_guard() {
-    local path parent physical owner
-    case "$INSTANCE_STATE_DIR" in
-        /*) ;;
-        *) printf '%s\n' 'State directory must be absolute.' >&2; return 1 ;;
-    esac
-    case "$INSTANCE_STATE_DIR" in
-        /|/Users|/Volumes|/tmp|/private/tmp|"$HOME"|"$HOME/Library"|"$HOME/Applications"|"$HOME/.iphone-use/instances"|*$'\n'*|*$'\r'*)
-            printf '%s\n' 'Refusing broad or malformed state directory.' >&2; return 1 ;;
-    esac
-    for path in "$INSTANCE_STATE_DIR" "$INSTANCE_APP_DIR"; do
-        parent="$path"
-        while [ "$parent" != / ]; do
-            [ ! -L "$parent" ] || { printf 'Refusing symlinked instance namespace: %s\n' "$parent" >&2; return 1; }
-            if [ -e "$parent" ]; then
-                [ -d "$parent" ] || return 1
-                physical="$(cd -P "$parent" && pwd -P)" || return 1
-                [ "$physical" = "$parent" ] || return 1
-            fi
-            parent="$(dirname "$parent")"
-        done
-        parent="$path"
-        while [ ! -e "$parent" ]; do parent="$(dirname "$parent")"; done
-        owner="$(stat -f '%u' "$parent" 2>/dev/null)" || return 1
-        [ "$owner" = "$(id -u)" ] || return 1
-    done
-}
-
-# Resolve only device/port metadata, never another instance's credentials.
-_instance_bindings_data() {
-    python3 - "$HOME" "$INSTANCE_NAME" "$1" "${WDA_UDID:-}" "${WDA_PORT:-}" "${MJPEG_PORT:-}" <<'PYINSTANCE'
-import os, pathlib, plistlib, re, subprocess, sys
-from urllib.parse import urlsplit
-home, name, mode, hint_udid, hint_wda, hint_mjpeg = sys.argv[1:]
-home = pathlib.Path(home)
-root = home / 'Library/LaunchAgents'
-prefix = 'com.leeguoo.iphone-use'
-def error(message):
-    raise SystemExit('Instance configuration: ' + message)
-def labels(n):
-    return (prefix, prefix+'.wda') if n == 'default' else (prefix+'.'+n, prefix+'.wda.'+n)
-def read(label):
-    p = root / (label+'.plist')
-    if not p.exists() and not p.is_symlink(): return {}
-    if p.is_symlink() or not p.is_file() or p.stat().st_uid != os.getuid() or p.stat().st_mode & 0o022: error('unsafe service definition: '+label)
-    try: data = plistlib.loads(p.read_bytes())
-    except Exception: error('unreadable service definition: '+label)
-    if data.get('Label') != label: error('service label mismatch: '+label)
-    env = data.get('EnvironmentVariables', {})
-    if not isinstance(env, dict): error('invalid service environment: '+label)
-    return env
-
-def port(value):
-    if not re.fullmatch(r'[0-9]{1,5}', str(value)) or not 1 <= int(value) <= 65535: error('ports must be integers from 1 to 65535')
-    return int(value)
-def urlport(value):
-    if not value: return None
-    try:
-        u=urlsplit(value)
-        if u.scheme != 'http' or u.hostname not in ('localhost', '127.0.0.1') or u.username or u.password or u.query or u.fragment: return None
-        return port(u.port)
-    except ValueError: error('invalid loopback URL')
-def configured_ports(env, wda):
-    result=set()
-    if env.get('PHONE_REMOTE_PORT'): result.add(port(env['PHONE_REMOTE_PORT']))
-    for key in ('PHONE_REMOTE_WDA_URL','PHONE_REMOTE_WDA_MJPEG_URL'):
-        p=urlport(env.get(key));
-        if p is not None: result.add(p)
-    for key in ('WDA_PORT','MJPEG_PORT'):
-        value=env.get(key) or wda.get(key)
-        if value: result.add(port(value))
-    return result
-
-daemon_label, wda_label = labels(name)
-saved, wda = read(daemon_label), read(wda_label)
-if name != 'default' and mode == 'setup' and not saved: error('install this named daemon before running setup')
-if name != 'default' and (os.environ.get('PHONE_REMOTE_BACKEND') or saved.get('PHONE_REMOTE_BACKEND','direct')) != 'direct': error('named instances require the Direct backend')
-pval=os.environ.get('PHONE_REMOTE_PORT') or saved.get('PHONE_REMOTE_PORT') or ('44321' if name=='default' else '')
-if not pval: error('a new named instance requires --port')
-p=port(pval)
-udid=os.environ.get('PHONE_REMOTE_UDID') or hint_udid or saved.get('PHONE_REMOTE_UDID') or wda.get('WDA_UDID','')
-if udid and not re.fullmatch('[0-9A-Fa-f-]+',udid): error('invalid device UDID')
-if name != 'default' and not udid: error('a new named instance requires --udid')
-ports=[]
-for key, urlkey, hint, default in [('WDA_PORT','PHONE_REMOTE_WDA_URL',hint_wda,8100 if name=='default' else p+1),('MJPEG_PORT','PHONE_REMOTE_WDA_MJPEG_URL',hint_mjpeg,9100 if name=='default' else p+2)]:
-    explicit_url=os.environ.get(urlkey)
-    explicit_port=os.environ.get(key) or hint
-    if explicit_url and name!='default' and urlport(explicit_url) is None: error('named instances require managed loopback WDA URLs')
-    if explicit_url and explicit_port and urlport(explicit_url) != port(explicit_port): error('explicit relay port and URL disagree')
-    value=explicit_port or urlport(explicit_url) or urlport(saved.get(urlkey)) or wda.get(key) or default
-    ports.append(port(value))
-if len({p,*ports}) != 3: error('daemon, WDA, and MJPEG ports must be distinct')
-candidates={p,*ports}
-if name=='default' and ((os.environ.get('PHONE_REMOTE_BACKEND') or saved.get('PHONE_REMOTE_BACKEND'))=='mirror' or any((os.environ.get(k) or saved.get(k)) and urlport(os.environ.get(k) or saved.get(k)) is None for k in ('PHONE_REMOTE_WDA_URL','PHONE_REMOTE_WDA_MJPEG_URL'))): candidates={p}
-others={'default'}
-if root.exists():
-    for path in root.glob(prefix+'.*.plist'):
-        n=path.name[len(prefix)+1:-6]
-        if n!='wda' and re.fullmatch('[a-z][a-z0-9-]{0,31}',n): others.add(n)
-def state_path(n, env, w):
-    default=home/'.iphone-use' if n=='default' else home/'.iphone-use/instances'/n
-    return pathlib.Path(env.get('PHONE_REMOTE_STATE_DIR') or w.get('PHONE_REMOTE_STATE_DIR') or default).resolve()
-ours=pathlib.Path(os.environ.get('PHONE_REMOTE_STATE_DIR') or state_path(name,saved,wda)).resolve()
-if saved and ours!=state_path(name,saved,wda): error('state directory relocation requires removing the old instance first')
-if name!='default' and mode=='install' and saved:
-    data=plistlib.loads((root/(daemon_label+'.plist')).read_bytes())
-    expected=[str(ours/'runtime/iPhoneUse.app/Contents/MacOS/iphone-use'),'serve']
-    if data.get('ProgramArguments') != expected: error('existing daemon definition is not this managed instance')
-our_checkout=pathlib.Path(os.environ.get('WDA_DIR') or wda.get('WDA_DIR') or ours/'WebDriverAgent').resolve()
-for other in others-{name}:
-    a,b=map(read, labels(other))
-    if not a and not b: continue
-    their_state=state_path(other,a,b)
-    base=(home/'.iphone-use').resolve()
-    intentional_nesting=(name=='default' and ours==base and their_state==base/'instances'/other) or (other=='default' and their_state==base and ours==base/'instances'/name)
-    if not intentional_nesting and (ours==their_state or ours in their_state.parents or their_state in ours.parents): error('state directory overlaps instance '+other)
-    their_checkout=pathlib.Path(b.get('WDA_DIR') or a.get('WDA_DIR') or their_state/'WebDriverAgent').resolve()
-    if our_checkout==their_checkout: error('WDA checkout is shared with instance '+other)
-    other_udid=a.get('PHONE_REMOTE_UDID') or b.get('WDA_UDID')
-    if udid and other_udid and udid.upper()==str(other_udid).upper(): error('device is already assigned to instance '+other)
-    if candidates & configured_ports(a,b): error('ports conflict with instance '+other)
-# Existing instance ports are checked again by the installer's PID/listener
-# ownership gate after restart. A new/unassigned occupied port is never adopted.
-old_ports=configured_ports(saved,wda)
-lsof=os.environ.get('IPHONE_USE_LSOF','lsof')
-for candidate in (candidates-old_ports if name!='default' else set()):
-    try: result=subprocess.run([lsof,'-nP','-iTCP:'+str(candidate),'-sTCP:LISTEN','-Fp'],capture_output=True,text=True,timeout=5)
-    except (OSError, subprocess.TimeoutExpired): error('cannot inspect port ownership')
-    if result.stdout.strip(): error('port '+str(candidate)+' is occupied')
-    if result.returncode not in (0,1): error('cannot inspect port ownership')
-print(p); print(udid); print(ports[0]); print(ports[1])
-PYINSTANCE
-}
-
-_instance_bindings() {
-    local values
-    values="$(_instance_bindings_data "$@")" || return 1
-    INSTANCE_BOUND_PORT="$(printf '%s\n' "$values" | sed -n '1p')"
-    INSTANCE_BOUND_UDID="$(printf '%s\n' "$values" | sed -n '2p')"
-    INSTANCE_BOUND_WDA_PORT="$(printf '%s\n' "$values" | sed -n '3p')"
-    INSTANCE_BOUND_MJPEG_PORT="$(printf '%s\n' "$values" | sed -n '4p')"
-    if [ "$INSTANCE_NAME" != default ]; then
-        export PHONE_REMOTE_PORT="$INSTANCE_BOUND_PORT" PHONE_REMOTE_UDID="$INSTANCE_BOUND_UDID"
-        export WDA_UDID="$INSTANCE_BOUND_UDID" WDA_PORT="$INSTANCE_BOUND_WDA_PORT" MJPEG_PORT="$INSTANCE_BOUND_MJPEG_PORT"
-        export PHONE_REMOTE_WDA_URL="http://127.0.0.1:$WDA_PORT"
-        export PHONE_REMOTE_WDA_MJPEG_URL="http://127.0.0.1:$MJPEG_PORT"
-        export PHONE_REMOTE_WDA_MANAGED=true
-    fi
-}
-
-_instance_state_marker() {
-    # The legacy root predates markers. Every new or overridden root needs an
-    # explicit ownership record before scripts may manage its contents.
-    [ "$INSTANCE_NAME" != default ] || [ "$INSTANCE_STATE_DIR" != "$HOME/.iphone-use" ] || return 0
-    python3 - "$INSTANCE_STATE_DIR" "$INSTANCE_NAME" "$1" <<'PYOWNED'
-import json, os, pathlib, tempfile, sys
-root=pathlib.Path(sys.argv[1]); mode=sys.argv[3]
-expected={'schema':'iphone-use-instance-v1','name':sys.argv[2],'state_dir':str(root)}
-p=root/'instance.json'
-if p.exists() or p.is_symlink():
-    if p.is_symlink() or p.stat().st_uid != os.getuid() or p.stat().st_mode & 0o077:
-        raise SystemExit('Unsafe instance ownership marker')
-    if json.loads(p.read_text()) != expected: raise SystemExit('State directory belongs to a different instance')
-elif root.exists() and any(root.iterdir()):
-    raise SystemExit('Nonempty state directory has no matching instance ownership marker')
-elif mode == 'create':
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd,temp=tempfile.mkstemp(prefix='.instance.',dir=root)
-    try:
-        with os.fdopen(fd,'w') as out:
-            json.dump(expected,out); out.flush(); os.fsync(out.fileno())
-        os.replace(temp,p)
-    finally:
-        if os.path.exists(temp): os.unlink(temp)
-PYOWNED
-}
-
-_instance_operation_lock() {
-    # Serialize install/uninstall transactions across instance names. A child
-    # re-execs this one-shot script with fd 9 holding flock; no daemon is added.
-    if [ "${IPHONE_USE_INSTANCE_LOCK_HELD:-0}" = 1 ]; then
-        python3 - "$HOME" <<'PYCHECKLOCK'
-import fcntl, os, pathlib, sys
-path=pathlib.Path(sys.argv[1])/'Library/Caches/iphone-use/instance-operation.lock'
-a=os.fstat(9); b=path.lstat()
-if (a.st_dev,a.st_ino)!=(b.st_dev,b.st_ino) or a.st_uid!=os.getuid(): raise SystemExit('Invalid inherited instance lock')
-fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
-PYCHECKLOCK
-        return $?
-    fi
-    python3 - "$HOME" "$0" ${INSTANCE_OPERATION_ARGS[@]+"${INSTANCE_OPERATION_ARGS[@]}"} <<'PYLOCK'
-import fcntl, os, pathlib, stat, sys
-home,script,*args=sys.argv[1:]
-root=pathlib.Path(home)/'Library/Caches/iphone-use'
-for parent in (root.parent.parent,root.parent,root):
-    if parent.is_symlink(): raise SystemExit('Unsafe instance lock directory')
-root.mkdir(mode=0o700,parents=True,exist_ok=True)
-if root.stat().st_uid != os.getuid(): raise SystemExit('Unowned instance lock directory')
-fd=os.open(root/'instance-operation.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
-s=os.fstat(fd)
-if not stat.S_ISREG(s.st_mode) or s.st_uid!=os.getuid() or s.st_mode & 0o077:
-    raise SystemExit('Unsafe instance operation lock')
-fcntl.flock(fd,fcntl.LOCK_EX)
-os.dup2(fd,9,inheritable=True)
-os.set_inheritable(9,True)
-if fd!=9: os.close(fd)
-os.environ['IPHONE_USE_INSTANCE_LOCK_HELD']='1'
-os.execv('/bin/bash',['/bin/bash',os.path.abspath(script),*args])
-PYLOCK
-    exit $?
-}
-# END instance context.
-
-COMMAND=setup
-INSTANCE_COMMAND_SEEN=0
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --instance)
-            [ "$#" -ge 2 ] || { printf 'ERROR: --instance requires a value\n' >&2; exit 2; }
-            export PHONE_REMOTE_INSTANCE="$2"; shift 2 ;;
-        setup|status|doctor|stop|pause|resume)
-            [ "$INSTANCE_COMMAND_SEEN" = 0 ] || exit 2
-            COMMAND="$1"; INSTANCE_COMMAND_SEEN=1; shift ;;
-        *) printf 'ERROR: unknown setup argument %s\n' "$1" >&2; exit 2 ;;
-    esac
-done
-_instance_context "${PHONE_REMOTE_INSTANCE-default}" || exit 2
-_instance_load_saved_path || exit 2
-_instance_script_guard "$0" || exit 2
-_instance_namespace_guard || exit 2
-if [ "$COMMAND" = setup ] && [ "$INSTANCE_NAME" != default ]; then
-    _instance_state_marker verify || exit 2
-    _instance_bindings setup || exit 2
-fi
-STATE_DIR="$INSTANCE_STATE_DIR"
+STATE_DIR="$HOME/.iphone-use"
+COMMAND="${1:-setup}"
 WDA_CHECKOUT_MARKER="$STATE_DIR/wda-checkout-owner.v1"
 RUN_LOG="$STATE_DIR/wda-runner.log"
 RUNNER_PID_FILE="$STATE_DIR/wda-runner.pid"
@@ -362,12 +46,12 @@ RELAY_PID_FILE="$STATE_DIR/wda-relay.pid"
 WDA_REPO="https://github.com/appium/WebDriverAgent.git"
 DEFAULT_WDA_REF="54f9fc702b5ba40249017a4b9bf48c69b757389b"
 DEFAULT_WDA_REF_TAG="v9.15.3"
-WDA_AGENT_LABEL="$INSTANCE_WDA_LABEL"
+WDA_AGENT_LABEL="com.leeguoo.iphone-use.wda"
 WDA_AGENT_PLIST="$HOME/Library/LaunchAgents/$WDA_AGENT_LABEL.plist"
 WDA_AGENT_LOG="$STATE_DIR/wda-agent.log"
 WDA_RETRY_STATE="$STATE_DIR/wda-retry-state.v1"
 WDA_AGENT_ROLLBACK_PLIST="$STATE_DIR/wda-supervisor.rollback.$$.plist"
-DAEMON_LABEL="$INSTANCE_DAEMON_LABEL"
+DAEMON_LABEL="com.leeguoo.iphone-use"
 DAEMON_PLIST="$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"
 DAEMON_ROLLBACK_PLIST="$STATE_DIR/daemon.rollback.$$.plist"
 UID_NUM="$(id -u)"
@@ -415,7 +99,7 @@ _port_from_daemon_url() {
 # Preserve setup-owned supervisor policy on a plain rerun. Precedence is:
 # explicit environment > existing WDA supervisor > daemon endpoint > default.
 WDA_DIR="${WDA_DIR:-$(_existing_wda_env WDA_DIR)}"
-WDA_DIR="${WDA_DIR:-$STATE_DIR/WebDriverAgent}"
+WDA_DIR="${WDA_DIR:-$HOME/.iphone-use/WebDriverAgent}"
 WDA_PORT="${WDA_PORT:-$(_existing_wda_env WDA_PORT)}"
 WDA_PORT="${WDA_PORT:-$(_port_from_daemon_url PHONE_REMOTE_WDA_URL)}"
 WDA_PORT="${WDA_PORT:-8100}"
@@ -479,13 +163,6 @@ _asc_signing_enabled() {
 
 _prepare_xcodebuild_args() {
     XCODEBUILD_ARGS=("$@")
-    if [ -n "${INSTANCE_DERIVED_DATA:-}" ]; then
-        local is_project=0 arg
-        for arg in "$@"; do [ "$arg" != -project ] || is_project=1; done
-        if [ "$is_project" = 1 ]; then
-            XCODEBUILD_ARGS+=(-derivedDataPath "$INSTANCE_DERIVED_DATA")
-        fi
-    fi
     _asc_signing_enabled || return 0
     # Validate strings only. Never read/copy the private key or echo its values.
     # Spaces in an absolute key path remain within one argv element.
@@ -582,30 +259,6 @@ _restore_wda_icon_app() {
     return 1
 }
 
-# Discard an injected runner that can no longer be launched as-is (no unique
-# .xctestrun to pair with `test-without-building`). Running the normal `test`
-# action over it is not a fallback: `test` regenerates Info.plist from the
-# XCTRunner template on top of a bundle we hand-signed, and the product that
-# survives into the NEXT round then fails validation with "invalid Info.plist
-# (plist or signature have been modified)" — the poisoned carry-over of #75.
-# A missing product is safe: the launch path below rebuilds it pristine.
-# Same containment checks as `_restore_wda_icon_app`; on any doubt, do nothing.
-_discard_injected_runner() {
-    [ "${WDA_RUNNER_ICON_INJECTED:-0}" = "1" ] || return 0
-    case "${WDA_ICON_PRODUCTS_DIR:-}" in
-        /*/Build/Products/*) ;;
-        *) return 1 ;;
-    esac
-    case "${WDA_ICON_APP_PATH:-}" in
-        "$WDA_ICON_PRODUCTS_DIR"/*-Runner.app) ;;
-        *) return 1 ;;
-    esac
-    [ -L "$WDA_ICON_APP_PATH" ] && return 1
-    /bin/rm -rf -- "$WDA_ICON_APP_PATH" 2>/dev/null || return 1
-    WDA_RUNNER_ICON_INJECTED=0
-    return 0
-}
-
 if [ "$COMMAND" = "setup" ]; then
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
@@ -617,7 +270,6 @@ fi
 # script. Preserve the prior copy so a failed upgrade can roll back both the
 # supervisor plist and the exact script it points to.
 SELF_INSTALL="$STATE_DIR/setup-wda.sh"
-SETUP_HINT="$(printf '%q --instance %q' "$SELF_INSTALL" "$INSTANCE_NAME")"
 SELF_INSTALL_ROLLBACK="$STATE_DIR/setup-wda.rollback.$$.sh"
 SELF_INSTALL_REPLACED_THIS_RUN=0
 SELF_INSTALL_HAD_PREVIOUS=0
@@ -1257,14 +909,12 @@ _install_wda_supervisor() {
     fi
 
     for key in \
-        WDA_KEEPALIVE PATH PHONE_REMOTE_INSTANCE PHONE_REMOTE_STATE_DIR WDA_UDID WDA_TEAM_ID WDA_BUNDLE_ID \
+        WDA_KEEPALIVE PATH WDA_UDID WDA_TEAM_ID WDA_BUNDLE_ID \
         WDA_DIR WDA_REF WDA_RUNNER_ICON WDA_PORT MJPEG_PORT WDA_ALLOW_LAN \
         WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID
     do
         case "$key" in
             WDA_KEEPALIVE) value="1" ;;
-            PHONE_REMOTE_INSTANCE) value="$INSTANCE_NAME" ;;
-            PHONE_REMOTE_STATE_DIR) value="${PHONE_REMOTE_STATE_DIR:-}" ;;
             PATH) value="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin" ;;
             WDA_UDID) value="$WDA_UDID" ;;
             WDA_TEAM_ID) value="$TEAM_ID" ;;
@@ -2079,54 +1729,11 @@ _expected_role_valid() {
 # _prepare_xcodebuild_args. Do not replace it with an arbitrary-arguments tail:
 # these signatures authorize signalling the recorded process.
 _runner_signature_valid() {
-    local asc_suffix derived_suffix
+    local asc_suffix
     _safe_expected "$1" || return 1
-    derived_suffix='( -derivedDataPath /[^|[:cntrl:]]+/DerivedData)?'
     asc_suffix=' -authenticationKeyPath /[^|[:cntrl:]]+\.p8 -authenticationKeyID [A-Za-z0-9]+ -authenticationKeyIssuerID [A-Za-z0-9-]+ -allowProvisioningDeviceRegistration'
     printf '%s\n' "$1" | LC_ALL=C grep -Eq \
-        "^(/[^ ]*/)?xcodebuild (-project WebDriverAgent\\.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=[0-9A-Fa-f-]+ -allowProvisioningUpdates DEVELOPMENT_TEAM=[A-Z0-9]{10} PRODUCT_BUNDLE_IDENTIFIER=[A-Za-z0-9.-]+ test$derived_suffix($asc_suffix)?|-destination platform=iOS,id=[0-9A-Fa-f-]+ test-without-building -xctestrun /[^|[:cntrl:]]+/WebDriverAgentRunner_[^ /]+\\.xctestrun( -allowProvisioningUpdates$asc_suffix)?)$"
-}
-
-_instance_command_matches() {
-    local command="$1" role="$2" port
-    if [ "${INSTANCE_NAME:-default}" = default ]; then
-        # Default never uses the named-instance DerivedData shape. When its
-        # saved UDID is available, bind the command to that device too.
-        case "$command" in
-            *"$HOME/.iphone-use/instances/"*|*" -derivedDataPath "*|*" -xctestrun "*"/DerivedData/Build/Products/"*) return 1 ;;
-        esac
-        if [ -n "${WDA_UDID:-}" ]; then
-            case "$role" in
-                runner|legacy-runner)
-                    case "$command" in *" -destination platform=iOS,id=$WDA_UDID "*) ;; *) return 1 ;; esac ;;
-                *)
-                    case "$command" in *"iproxy "*)
-                        case "$command" in *" -u $WDA_UDID") ;; *) return 1 ;; esac ;;
-                    esac ;;
-            esac
-        fi
-        return 0
-    fi
-    [ -n "${WDA_UDID:-}" ] || return 1
-    case "$role" in
-        runner|legacy-runner)
-            case "$command" in *" -destination platform=iOS,id=$WDA_UDID "*) ;; *) return 1 ;; esac
-            case "$command" in
-                *" -xctestrun $INSTANCE_DERIVED_DATA/Build/Products/"*) return 0 ;;
-                *" -derivedDataPath $INSTANCE_DERIVED_DATA "*|*" -derivedDataPath $INSTANCE_DERIVED_DATA") return 0 ;;
-                *) return 1 ;;
-            esac
-            ;;
-        relay|legacy-relay) port="${WDA_PORT:-}" ;;
-        mjpeg|legacy-mjpeg) port="${MJPEG_PORT:-}" ;;
-        *) return 1 ;;
-    esac
-    [ -n "$port" ] || return 1
-    case "$command" in
-        *"iproxy -s 127.0.0.1 $port:"*" -u $WDA_UDID"|*"iproxy $port "*" -u $WDA_UDID") return 0 ;;
-        *"socat TCP-LISTEN:$port,fork,reuseaddr,bind=127.0.0.1 TCP:"*) return 0 ;;
-        *) return 1 ;;
-    esac
+        "^(/[^ ]*/)?xcodebuild (-project WebDriverAgent\\.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=[0-9A-Fa-f-]+ -allowProvisioningUpdates DEVELOPMENT_TEAM=[A-Z0-9]{10} PRODUCT_BUNDLE_IDENTIFIER=[A-Za-z0-9.-]+ test($asc_suffix)?|-destination platform=iOS,id=[0-9A-Fa-f-]+ test-without-building -xctestrun /[^ ]+/WebDriverAgentRunner_[^ /]+\\.xctestrun( -allowProvisioningUpdates$asc_suffix)?)$"
 }
 
 _command_matches_expected() {
@@ -2134,7 +1741,6 @@ _command_matches_expected() {
     local expected="$2"
     local signature rest local_port device_port target_udid team_id bundle_id
     local legacy_argv xctestrun_argv base_command
-    _instance_command_matches "$command" "${expected%%:*}" || return 1
     case "$expected" in
         runner:*)
             signature="${expected#*:}"
@@ -2171,7 +1777,6 @@ _command_matches_expected() {
             # exact equality with the full command, including the key path.
             base_command="${command%% -authenticationKeyPath *}"
             base_command="${base_command% -allowProvisioningUpdates}"
-            base_command="${base_command%% -derivedDataPath *}"
             legacy_argv="xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=$target_udid -allowProvisioningUpdates DEVELOPMENT_TEAM=$team_id PRODUCT_BUNDLE_IDENTIFIER=$bundle_id"
             # A runner started with an injected icon runs `test-without-building
             # -xctestrun <path>` instead of `test`. Both are ours; anything else
@@ -2187,6 +1792,10 @@ _command_matches_expected() {
                 "$legacy_argv test"|*/"$legacy_argv test") return 0 ;;
                 "$xctestrun_argv /"*/WebDriverAgentRunner_*.xctestrun \
                 |*/"$xctestrun_argv /"*/WebDriverAgentRunner_*.xctestrun)
+                    # One path argument, no embedded spaces.
+                    case "${base_command#*-xctestrun }" in
+                        *" "*) return 1 ;;
+                    esac
                     return 0
                     ;;
                 *) return 1 ;;
@@ -2248,7 +1857,7 @@ _legacy_migration_hint() {
    Retry with the exact old values (do not guess):
      WDA_UDID=<old-device-udid> WDA_TEAM_ID=<10-char-team> \\
      WDA_BUNDLE_ID=<old-runner-bundle-id> WDA_DIR=<old-wda-checkout> \\
-       $SETUP_HINT stop
+       $SELF_INSTALL stop
    If the old relay used socat, inspect its numeric PID with both:
      ps -ww -p <pid> -o uid=,lstart=,command=
      lsof -nP -a -p <pid> -iTCP:<8100-or-9100> -sTCP:LISTEN
@@ -2494,7 +2103,7 @@ cmd_pause() {
         return 1
     fi
     ok "WDA paused: supervisor disabled and all PID-verified runner/relay processes stopped"
-    printf '  Resume: %s resume\n' "$SETUP_HINT"
+    printf '  Resume: %s resume\n' "$SELF_INSTALL"
 }
 
 cmd_resume() {
@@ -2538,7 +2147,7 @@ cmd_resume() {
         return 1
     fi
     ok "WDA resume requested; lock-screen failures will retry with quiet backoff"
-    printf '  Status: %s status\n' "$SETUP_HINT"
+    printf '  Status: %s status\n' "$SELF_INSTALL"
     printf '  Log   : %s\n' "$WDA_AGENT_LOG"
 }
 
@@ -2554,7 +2163,7 @@ cmd_status() {
         return 1
     fi
     if [ "$(_job_disabled_state "$WDA_AGENT_LABEL" 2>/dev/null || true)" = "1" ]; then
-        warn "WDA is paused; run $SETUP_HINT resume before the next agent session"
+        warn "WDA is paused; run $SELF_INSTALL resume before the next agent session"
         return 1
     fi
     if ! command -v lsof >/dev/null 2>&1; then
@@ -2889,9 +2498,9 @@ _resolve_xctestrun() {
     count="$(find "$parent" -maxdepth 1 -name '*.xctestrun' 2>/dev/null | wc -l | tr -d ' ')"
     [ "$count" = "1" ] || return 1
     match="$(find "$parent" -maxdepth 1 -name '*.xctestrun' 2>/dev/null | head -1)"
-    # Keep one literal argv element; only PID-record delimiters are forbidden.
+    # The path rides in the PID-identity signature, which is space-delimited.
     case "$match" in
-        *[[:cntrl:]]*|*'|'*) return 1 ;;
+        *[[:space:]]*) return 1 ;;
     esac
     printf '%s\n' "$match"
 }
@@ -3011,16 +2620,7 @@ PY_PRODUCT_PATH
     rm -rf -- "$app" || return 1
     # Deleting the exact poisoned app also discards its .cstemp leftovers;
     # merely unlinking those files would leave missing framework contents.
-    #
-    # The repair rebuild gets its own log. `_run_runner_prebuild` truncates
-    # whatever path it is given, and the caller's `$build_log` is the log of
-    # the build that produced the invalid product in the first place — its
-    # ProcessInfoPlistFile / CodeSign lines are the only evidence of what went
-    # wrong. Every KeepAlive round of #75 destroyed that evidence before anyone
-    # could read it.
-    local repair_log="${build_log%.log}.repair.log"
-    warn "Runner repair: keeping the failed build's log at $build_log; rebuild log at $repair_log"
-    if ! _run_runner_prebuild "$repair_log" || ! _validate_runner_bundle "$app"; then
+    if ! _run_runner_prebuild "$build_log" || ! _validate_runner_bundle "$app"; then
         _setstatus building-fail wda "runner repair failed: $WDA_RUNNER_VALIDATION_ERROR"
         return 1
     fi
@@ -3436,7 +3036,6 @@ _setstatus building "$_BUILD_BLOCKER" "building + launching WDA"
 # ── 4. Build + run WDA (stays running; this is the server) ───────────────────
 # Pitfall: PRODUCT_NAME must NOT be overridden (it renames WebDriverAgentLib
 # and breaks the build) — only PRODUCT_BUNDLE_IDENTIFIER is safe to rebrand.
-_instance_bindings setup || die "Device or port belongs to another instance"
 info "Building + launching WDA on the phone (first build takes a few minutes)"
 _stop_managed_process "$RUNNER_PID_FILE" "$LEGACY_RUNNER_EXPECTED" runner \
     || die "the prior runner PID record does not safely identify a process; refusing to kill anything"
@@ -3454,7 +3053,7 @@ case "$WDA_RUNNER_ICON" in
         ok "Runner icon injection disabled (WDA_RUNNER_ICON=none)"
         ;;
     auto)
-        RUNNER_ICON_SOURCE="$INSTANCE_APP_DIR/iPhoneUse.app/Contents/Resources/AppIcon.icns"
+        RUNNER_ICON_SOURCE="$HOME/Applications/iPhoneUse.app/Contents/Resources/AppIcon.icns"
         if [ ! -f "$RUNNER_ICON_SOURCE" ]; then
             warn "Runner icon source is not installed at $RUNNER_ICON_SOURCE; continuing with WDA's placeholder icon"
             RUNNER_ICON_SOURCE=""
@@ -3481,12 +3080,7 @@ if [ -n "$RUNNER_ICON_SOURCE" ]; then
     if _build_and_inject_runner_icon "$RUNNER_ICON_SOURCE"; then
         WDA_XCTESTRUN="$(_resolve_xctestrun "$WDA_ICON_PRODUCTS_DIR" || true)"
         if [ -z "$WDA_XCTESTRUN" ]; then
-            if _discard_injected_runner; then
-                warn "Could not resolve a unique .xctestrun; discarded the injected runner so the launch rebuilds a pristine one (the custom icon is skipped this round)"
-            else
-                _setstatus building-fail wda "injected runner cannot be launched and could not be discarded"
-                die "could not resolve a unique .xctestrun for the injected runner, and refusing to run the normal test action over a hand-signed bundle"
-            fi
+            warn "Could not resolve a unique .xctestrun; running the normal test action, which will drop the injected icon"
         fi
     fi
 fi
@@ -3875,7 +3469,7 @@ else
         _setstatus supervisor-fail wda "launchd handoff not verified"
         die "WDA launchd job loaded, but its replacement runner was not verified within 120s.
    Check: $WDA_AGENT_LOG
-   Then:  $SETUP_HINT status"
+   Then:  $SELF_INSTALL status"
     fi
     ok "launchd replacement verified: runner identity, both loopback relays, and WDA /status"
 fi
@@ -3954,9 +3548,9 @@ else
 fi
 printf '  Try       : curl -H "Authorization: Bearer %s" http://127.0.0.1:%s/agent/elements\n' \
     "\$PW" "$DAEMON_PORT"
-printf '  Stop      : %s stop\n' "$SETUP_HINT"
-printf '  Pause     : %s pause  (give the phone back without auto-restart)\n' "$SETUP_HINT"
-printf '  Resume    : %s resume\n' "$SETUP_HINT"
+printf '  Stop      : %s stop\n' "$SELF_INSTALL"
+printf '  Pause     : %s pause  (give the phone back without auto-restart)\n' "$SELF_INSTALL"
+printf '  Resume    : %s resume\n' "$SELF_INSTALL"
 printf '  WDA source: %s %s (exact checkout)\n' "$WDA_REF_LABEL" "$WDA_REF"
 printf '  Signing   : free Apple ID profiles may expire after 7 days; re-run setup when needed.\n'
 
