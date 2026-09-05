@@ -186,38 +186,66 @@ recording that could not persist an action is an incomplete draft and cannot
 run from the browser. A parameterized recording can be downloaded immediately,
 but it cannot run until every required value is filled in.
 
-## Registry first: is there already a flow for this?
+## The registry contract: check it, feed it, fix it
 
-Before driving an app step by step, check the **official flow registry** —
-reviewed, deterministic per-app scripts that replay a whole task in one call
-with no model and no screenshots:
+The **official flow registry** ([`leeguooooo/iphone-use-flows`](https://github.com/leeguooooo/iphone-use-flows))
+holds reviewed, deterministic per-app scripts that replay a whole task in one
+call with no model and no screenshots. Every phone task you do has three
+registry obligations. They are not optional politeness; they are how the next
+run of the same task costs one call instead of thirty.
 
 ```bash
 MCP="$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
-"$MCP" flow update                     # once; mirrors github.com/leeguooooo/iphone-use-flows
-"$MCP" flow list [--category health]   # id, risk, verified, inputs, name
+"$MCP" flow update                     # once per machine; mirrors the registry
+"$MCP" flow list [--category health]   # id · risk · verified · inputs · name
 "$MCP" flow info health/export-all     # metadata + step templates
 PHONE_REMOTE_TOKEN="$PHONE_REMOTE_TOKEN" "$MCP" flow run system/spotlight-search --input query=Health
+"$MCP" flow publish my.json --as health/export-all-zh-cn --alias 健康 --note "iPhone 17 Pro Max, iOS 26"
+"$MCP" flow report health/export-all --result @run.json --note "profile button is now '资料'"
 ```
 
-With the bundled MCP server the same surface is `phone_flow_list`,
-`phone_flow_info`, `phone_flow_run`, and `phone_flow_update`. Rules:
+MCP: `phone_flow_list / info / run / update / publish / report`.
 
-- A matching flow beats exploration: one `flow run` costs one call and zero
-  screenshots. Read the result's `completed`/`failed_step`; on a failure read
-  `/agent/elements` and repair that one locator — never replay blindly.
-- `verified: no` (or a `draft` tag) means nobody has proved that file on a real
-  phone yet. Run it, take one checkpoint screenshot afterwards, and if it
-  worked, contribute `verified_on` back.
-- `risk: side_effect` flows (send, publish, pay, delete) refuse to run without
-  `--confirm` / `confirm=true`. Confirm only after the user approved the exact
-  target and inputs; never confirm on your own judgement.
-- Flow labels are locale-specific (`locale` field). A flow recorded under `en`
-  fails closed on a Chinese phone: zero matches, no tap. Pick the variant that
-  matches the device language or record one.
-- Keep your own flows next to the official ones with
-  `flow add <file> --as <app>/<name>`; they survive `flow update`. Only the
-  official source exists — there is no `sources add`.
+**1. Before acting — check.** Call `phone_flow_list` (or `flow list`) before
+driving any app step by step. `phone_elements` already tells you: its
+`registry` block lists the installed flows for the app on screen and says when
+the store is empty (`phone_flow_update` once). A matching flow beats
+exploration every time. Read `verified` and `risk`: `verified: no` means nobody
+has proved the file on a real phone yet — run it, then take one checkpoint
+screenshot. `risk: side_effect` (send/publish/pay/delete) refuses to run without
+`--confirm` / `confirm=true`; confirm only after the user approved the exact
+target and inputs.
+
+**2. After succeeding — feed.** When `phone_run_steps` completes 3+ steps, its
+`registry.hint` reminds you: that sequence is a flow waiting to be saved. Write
+it as v1 JSON (typed text → named `input`, page transitions guarded by
+`wait_for`, `app` / `category` / `risk` / `locale` filled in, `verified_on` with
+device, iOS, date), `flow validate` it, run it once from the file, then **tell
+the user you would like to publish it** and, with their OK, call
+`phone_flow_publish(confirm=true)` / `flow publish`. It forks if needed, adds
+`app.json` for a new app (`aliases` = the app's foreground label in each
+language, e.g. `Health`, `健康`, so `phone_elements` can surface it later),
+rebuilds `index.json`, and opens the PR. Unverified files open as draft PRs.
+Publishing is the default outcome of a successful multi-step task, not an
+extra; skip it only for one-off or private tasks.
+
+**3. On failure — fix.** A flow that stops (`failed_step`, `element_not_found`,
+`missing_present`) is a registry bug until proven otherwise. Read
+`phone_elements` to see where the phone stopped. If the flow is wrong (label
+changed, app updated, locale mismatch), tell the user and, with their OK, call
+`phone_flow_report(id, note, confirm=true)` / `flow report`: the last failure of
+that id is already captured (failed step, redacted daemon result, daemon
+version; screen labels and typed text are stripped). If you can also fix the
+locator, publish the corrected file with a bumped `verified_on` and mention the
+issue. Do not report a phone that was merely locked, offline, or on the wrong
+app. Never replay a failed flow blindly — the first tap may already have acted.
+
+Flow labels are locale-specific (`locale`): an `en` flow fails closed on a
+Chinese phone with zero matches and no tap. Pick the variant that matches the
+device language or record one (`health/export-all-zh-cn`). Keep your own flows
+next to the official ones with `flow add <file> --as <app>/<name>`; they
+survive `flow update`. Only the official source exists — there is no
+`sources add`.
 
 ## The loop: see → act → verify
 
@@ -500,8 +528,13 @@ run a floating global skill update that can separate their versions.
 ## Found a rough edge? File an issue
 
 You are this product's heaviest user — your friction reports are how it
-improves. When something about **iphone-use itself** is broken, confusing, or
-needlessly slow (NOT a task-level failure like a mistyped label):
+improves. Two repositories, two kinds of report:
+
+- A **flow** from the registry failed or is missing → `phone_flow_report` /
+  `flow report` (see **The registry contract**), or for a flow you wish existed,
+  `gh issue create -R leeguooooo/iphone-use-flows -l new-flow -t "flow request: <app> — <task>"`.
+- **iphone-use itself** is broken, confusing, or needlessly slow (NOT a
+  task-level failure like a mistyped label) → the steps below.
 
 1. Tell the user what you hit and that you'd like to file an issue.
 2. With their OK, file it (the `gh` CLI is usually available):

@@ -322,7 +322,9 @@ PHONE_REMOTE_TOKEN="$PHONE_REMOTE_AGENT_TOKEN" \
 （`read_only` | `navigation` | `side_effect`，最后一种没有 `--confirm` 拒绝运行）、
 `locale`、`tags`、`verified_on`（证明过这份文件的真机记录）。只支持官方这一个源；
 文件是纯 JSON，安装源不会执行任何代码。MCP 侧对应 `phone_flow_list`、
-`phone_flow_info`、`phone_flow_run`、`phone_flow_update`。
+`phone_flow_info`、`phone_flow_run`、`phone_flow_update`，以及 `phone_flow_publish`
+（把跑通的 flow 开 PR 进源）和 `phone_flow_report`（给坏掉的 flow 提 issue）；
+`phone_elements` 会直接告诉 agent 当前屏幕上的 app 有哪些已安装 flow，让"先查源"成为最省事的路径。
 
 flow v1 是严格 JSON：包含 `version`、`name`、可选 `description`、显式 string
 `inputs` 和与 `phone_run_steps` 相同的 guarded `steps`。`--input KEY=VALUE`

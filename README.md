@@ -406,7 +406,10 @@ Registry metadata is optional on every flow: `app` (bundle id), `category`,
 without `--confirm`), `locale`, `tags`, and `verified_on` (hardware runs that
 proved the file). Only the official source is supported; files are pure JSON, so
 installing the registry never executes code. MCP clients get the same surface as
-`phone_flow_list`, `phone_flow_info`, `phone_flow_run`, and `phone_flow_update`.
+`phone_flow_list`, `phone_flow_info`, `phone_flow_run`, and `phone_flow_update`, plus
+`phone_flow_publish` (open a PR with a working flow) and `phone_flow_report` (file an issue
+for a broken one); `phone_elements` tells the agent which installed flows fit the app on
+screen, so checking the registry is the path of least resistance.
 
 Saved flow v1 is strict JSON containing `version`, `name`, optional `description`,
 optional string `inputs`, and the same guarded `steps` used by `phone_run_steps`.

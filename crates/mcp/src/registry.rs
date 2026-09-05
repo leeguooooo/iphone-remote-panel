@@ -157,6 +157,11 @@ pub struct AppEntry {
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Foreground `Application` labels (one per locale) that identify this
+    /// app in `/agent/elements`, e.g. `["Health", "健康"]`. Lets the MCP
+    /// surface matching flows the moment the agent looks at the screen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// `.index.json` inside the local store.
@@ -657,6 +662,110 @@ pub fn remove(id: &str) -> Result<serde_json::Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Hints: bring the registry to the agent instead of hoping it looks
+// ---------------------------------------------------------------------------
+
+/// Installed flows whose app matches a foreground application label (via
+/// `app.json` `aliases` / `name`) — locale-aware without the flow knowing.
+pub fn flows_for_application(index: &LocalIndex, application: &str) -> Vec<(String, LocalFlow)> {
+    let wanted = application.trim();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let app_ids: Vec<&str> = index
+        .apps
+        .iter()
+        .filter(|app| {
+            app.aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(wanted))
+                || app
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        })
+        .map(|app| app.id.as_str())
+        .collect();
+    if app_ids.is_empty() {
+        return Vec::new();
+    }
+    index
+        .flows
+        .iter()
+        .filter(|(id, _)| app_ids.contains(&id.split('/').next().unwrap_or("")))
+        .map(|(id, entry)| (id.clone(), entry.clone()))
+        .collect()
+}
+
+/// A compact `registry` block for a `/agent/elements` response: the flows that
+/// fit the foreground app, or a nudge to populate the store. Never fails —
+/// hints must not break an elements read.
+pub fn elements_hint(elements_body: &str) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(elements_body).ok()?;
+    let application = body
+        .get("elements")
+        .and_then(|rows| rows.as_array())
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("kind").and_then(|k| k.as_str()) == Some("Application"))
+        })
+        .and_then(|row| row.get("label").and_then(|l| l.as_str()))
+        .map(str::to_string);
+    let index = match load_index() {
+        Ok(Some(index)) => index,
+        Ok(None) => {
+            return Some(serde_json::json!({
+                "installed": 0,
+                "hint": "no registry flows installed — call phone_flow_update once, then phone_flow_list before driving this app by hand"
+            }))
+        }
+        Err(_) => return None,
+    };
+    let matches = application
+        .as_deref()
+        .map(|app| flows_for_application(&index, app))
+        .unwrap_or_default();
+    let mut hint = serde_json::json!({
+        "installed": index.flows.len(),
+        "application": application,
+    });
+    if matches.is_empty() {
+        hint["flows"] = serde_json::json!([]);
+        hint["hint"] = serde_json::json!(
+            "no installed flow targets this app — if you complete a multi-step task here, save it with phone_flow_publish so the next run costs one call"
+        );
+    } else {
+        hint["flows"] = serde_json::json!(matches
+            .iter()
+            .map(|(id, entry)| serde_json::json!({
+                "id": id,
+                "name": entry.meta.name,
+                "risk": entry.meta.risk_label(),
+                "verified": entry.meta.verified(),
+                "inputs": entry.meta.inputs,
+            }))
+            .collect::<Vec<_>>());
+        hint["hint"] = serde_json::json!(
+            "registry flows exist for this app — prefer phone_flow_run over step-by-step exploration when one matches the task"
+        );
+    }
+    Some(hint)
+}
+
+/// Attach a `registry` block to a JSON body when it parses as an object;
+/// otherwise return the body untouched.
+pub fn attach_hint(body: String, key: &str, hint: Option<serde_json::Value>) -> String {
+    let Some(hint) = hint else { return body };
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(mut value) if value.is_object() => {
+            value[key] = hint;
+            value.to_string()
+        }
+        _ => body,
+    }
+}
+
 pub fn sources_json() -> Result<serde_json::Value> {
     let override_source = std::env::var(SOURCE_ENV)
         .ok()
@@ -898,6 +1007,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("registry id"));
+    }
+
+    #[tokio::test]
+    async fn elements_hint_matches_foreground_app_by_alias() {
+        let _env = setup(&[(
+            "health/open",
+            &flow_json("Open Health", r#""category":"health","#),
+        )]);
+        // Give the app entry aliases through the source index.
+        let source = std::env::var(SOURCE_ENV).unwrap();
+        let index_path = Path::new(&source).join("index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        index["apps"] = serde_json::json!([{"id":"health","name":"Health","aliases":["健康"]}]);
+        fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        update().await.unwrap();
+
+        let body = r#"{"snapshot":"s","elements":[{"kind":"Application","label":"健康","rect":[0,0,1,1]}]}"#;
+        let hint = elements_hint(body).unwrap();
+        assert_eq!(hint["flows"][0]["id"], "health/open");
+        assert_eq!(hint["application"], "健康");
+        let other =
+            elements_hint(r#"{"elements":[{"kind":"Application","label":"Mail"}]}"#).unwrap();
+        assert_eq!(other["flows"].as_array().unwrap().len(), 0);
+        assert!(other["hint"]
+            .as_str()
+            .unwrap()
+            .contains("phone_flow_publish"));
+
+        let attached = attach_hint(body.to_string(), "registry", Some(hint));
+        let value: serde_json::Value = serde_json::from_str(&attached).unwrap();
+        assert_eq!(value["registry"]["installed"], 1);
+        assert_eq!(value["snapshot"], "s");
+        assert_eq!(
+            attach_hint("not json".into(), "registry", Some(serde_json::json!(1))),
+            "not json"
+        );
     }
 
     #[test]

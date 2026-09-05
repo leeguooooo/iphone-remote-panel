@@ -201,6 +201,27 @@ PHONE_REMOTE_TOKEN="$TOKEN" "$MCP" flow run <app>/<flow> [--input K=V]... [--con
 untouched; an official flow that disappears from the index is removed locally, flows
 added with `flow add` are kept, and a local flow may not shadow an official id.
 
+Contributing back is one command each way (both use the user's `gh` login and are
+outward-facing, so the CLI/MCP never run them without being asked):
+
+```bash
+"$MCP" flow publish <file|id> --as <app>/<flow> [--alias Health --alias 健康] [--app-name "Apple Health"] [--note "..."] [--draft]
+"$MCP" flow report  <app>/<flow> [--result @run.json | --result '<json>'] [--note "..."]
+```
+
+`flow publish` forks the registry if needed, adds the file (and `app.json` for a new app,
+with `aliases` = the app's foreground label per language), regenerates `index.json`,
+pushes a branch, and opens a PR (draft when `verified_on` is empty). `flow report` files an
+issue with the failed step template and a redacted daemon result: `text`, `value`, `label`,
+`candidates`, and `elements` fields are stripped so screen content and typed input never
+reach a public issue.
+
+The MCP also brings the registry to the agent: `phone_elements` responses carry a
+`registry` block (installed flows for the app on screen, matched through `app.json`
+`aliases`; or a nudge to run `phone_flow_update`), a `phone_run_steps` success of 3+ steps
+carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` names
+`phone_flow_report` and keeps the failure so the report needs only a note.
+
 ## Tools exposed
 
 | Tool | Arguments | Description |
@@ -221,6 +242,8 @@ added with `flow add` are kept, and a local flow may not shadow an official id.
 | `phone_flow_info` | `id` | One flow's metadata, inputs, and step templates (never runtime values) |
 | `phone_flow_run` | `id`, `inputs?`, `confirm?` | Run an installed flow once through Direct/WDA; `side_effect` flows require `confirm=true` |
 | `phone_flow_update` | — | Mirror the official registry (checksum + strict validation); network only, phone untouched |
+| `phone_flow_publish` | `source`, `id`, `app_name?`, `aliases?`, `note?`, `confirm` | Fork/branch/PR a validated flow into the registry via `gh`; `confirm=true` only after the user agreed |
+| `phone_flow_report` | `id`, `note?`, `confirm` | File a registry issue for a failed flow using the captured last failure (redacted); `confirm=true` only after the user agreed |
 
 ## Typical session flow
 

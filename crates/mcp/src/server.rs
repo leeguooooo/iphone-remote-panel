@@ -310,6 +310,40 @@ pub struct FlowRunParams {
     pub confirm: bool,
 }
 
+/// Parameters for [`phone_flow_publish`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FlowPublishParams {
+    /// Flow file path, or an id installed with `flow add`.
+    pub source: String,
+    /// Registry id to publish as, `<app>/<flow>` lowercase slugs.
+    pub id: String,
+    /// Human app name, used only when the app is new to the registry.
+    #[serde(default)]
+    pub app_name: Option<String>,
+    /// Foreground-app labels per language (e.g. ["Health","健康"]).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// What was verified, where, and anything a reviewer should know.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Must be true; set only after the user agreed to open a public PR.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Parameters for [`phone_flow_report`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FlowReportParams {
+    /// Registry id of the flow that failed.
+    pub id: String,
+    /// One or two sentences: what you expected, what the phone showed.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Must be true; set only after the user agreed to open a public issue.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 // ---------------------------------------------------------------------------
 // PhoneHandler
 // ---------------------------------------------------------------------------
@@ -318,11 +352,28 @@ pub struct FlowRunParams {
 #[derive(Clone)]
 pub struct PhoneHandler {
     daemon: DaemonClient,
+    /// The most recent failed `phone_flow_run`, kept so `phone_flow_report`
+    /// can file an issue with the real failure instead of a retelling.
+    last_flow_failure: std::sync::Arc<std::sync::Mutex<Option<crate::contrib::ReportContext>>>,
 }
 
 impl PhoneHandler {
     pub fn new(daemon: DaemonClient) -> Self {
-        Self { daemon }
+        Self {
+            daemon,
+            last_flow_failure: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn remember_flow_failure(&self, context: crate::contrib::ReportContext) {
+        if let Ok(mut slot) = self.last_flow_failure.lock() {
+            *slot = Some(context);
+        }
+    }
+
+    fn take_flow_failure(&self, id: &str) -> Option<crate::contrib::ReportContext> {
+        let slot = self.last_flow_failure.lock().ok()?;
+        slot.as_ref().filter(|context| context.id == id).cloned()
     }
 }
 
@@ -486,8 +537,28 @@ impl PhoneHandler {
             Ok(request) => request,
             Err(error) => return CallToolResult::error(vec![Content::text(error)]),
         };
+        let step_count = request["steps"].as_array().map_or(0, Vec::len);
         match self.daemon.actions(&request).await {
-            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
+            Ok(body) => {
+                let hint = (step_count >= 3
+                    && serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+                        == Some(true))
+                .then(|| {
+                    serde_json::json!({
+                        "hint": format!(
+                            "{step_count} steps ran deterministically. If this is a task someone will repeat, \
+                             save it as a flow: write these steps to a v1 JSON file (typed text → named input), \
+                             `flow validate`, then phone_flow_publish (with the user's go-ahead) so the next run \
+                             is one phone_flow_run call. Check phone_flow_list first: it may already exist."
+                        )
+                    })
+                });
+                CallToolResult::success(vec![Content::text(crate::registry::attach_hint(
+                    body, "registry", hint,
+                ))])
+            }
             Err(error) => CallToolResult::error(vec![Content::text(format!(
                 "multi-step sequence failed: {error:#}"
             ))]),
@@ -540,7 +611,14 @@ impl PhoneHandler {
     )]
     async fn phone_elements(&self) -> CallToolResult {
         match self.daemon.elements().await {
-            Ok(json) => CallToolResult::success(vec![Content::text(json)]),
+            Ok(json) => {
+                // Bring the registry to the agent: which installed flows fit
+                // the app that is on screen right now.
+                let hint = crate::registry::elements_hint(&json);
+                CallToolResult::success(vec![Content::text(crate::registry::attach_hint(
+                    json, "registry", hint,
+                ))])
+            }
             Err(e) => CallToolResult::error(vec![Content::text(format!(
                 "elements failed (is WDA set up? see docs/wda-setup.html): {e:#}"
             ))]),
@@ -722,18 +800,161 @@ impl PhoneHandler {
         }
         match crate::flow::execute_flow(&flow, &inputs, &self.daemon, confirm).await {
             Ok(body) => {
-                let summary = serde_json::json!({
+                let result = serde_json::from_str::<serde_json::Value>(&body)
+                    .unwrap_or(serde_json::Value::String(body));
+                let mut summary = serde_json::json!({
                     "flow": id,
                     "verified": flow.meta.verified(),
                     "risk": flow.meta.risk_label(),
-                    "result": serde_json::from_str::<serde_json::Value>(&body)
-                        .unwrap_or(serde_json::Value::String(body)),
+                    "result": result,
                 });
+                if !flow.meta.verified() {
+                    summary["hint"] = serde_json::json!(
+                        "this flow had no hardware verification yet — if the phone is now where the flow \
+                         promised, tell the user and offer to add verified_on via phone_flow_publish"
+                    );
+                }
                 CallToolResult::success(vec![Content::text(summary.to_string())])
             }
-            Err(e) => CallToolResult::error(vec![Content::text(format!(
-                "flow {id} did not complete: {e:#}"
-            ))]),
+            Err(e) => {
+                // The daemon's structured result is inside the error chain for
+                // HTTP 4xx/5xx; keep whatever JSON we can find for the report.
+                let text = format!("{e:#}");
+                let result = text.find('{').and_then(|start| {
+                    serde_json::from_str::<serde_json::Value>(&text[start..]).ok()
+                });
+                let status = self
+                    .daemon
+                    .status()
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::to_value(s).ok());
+                self.remember_flow_failure(crate::contrib::ReportContext {
+                    id: id.clone(),
+                    result,
+                    status,
+                    application: None,
+                    note: None,
+                });
+                CallToolResult::error(vec![Content::text(format!(
+                    "flow {id} did not complete: {text}. Next: read phone_elements to see where the phone \
+                     stopped; if the flow itself is wrong (label changed, app updated), call \
+                     phone_flow_report(id=\"{id}\", confirm=true) with the user's go-ahead — the failure \
+                     details are already captured. Do NOT replay the flow blindly."
+                ))])
+            }
+        }
+    }
+
+    #[tool(
+        description = "Contribute a working flow to the official registry: fork if needed, add the \
+        file (+ app.json for a new app), rebuild index.json, push a branch, and open a pull \
+        request via the user's GitHub CLI login. OUTWARD-FACING: requires confirm=true, which \
+        you may set only after the user agreed to publish. Use after a flow you compiled has \
+        run successfully on the phone; put device/iOS/date in the file's verified_on first \
+        (an unverified file opens as a draft PR). `source` is a flow file path or an id you \
+        installed with `flow add`; `aliases` are the foreground-app labels (per language) that \
+        should surface this app's flows from phone_elements."
+    )]
+    async fn phone_flow_publish(
+        &self,
+        Parameters(FlowPublishParams {
+            source,
+            id,
+            app_name,
+            aliases,
+            note,
+            confirm,
+        }): Parameters<FlowPublishParams>,
+    ) -> CallToolResult {
+        if !confirm {
+            return CallToolResult::error(vec![Content::text(
+                "phone_flow_publish opens a public pull request; ask the user, then call again with confirm=true",
+            )]);
+        }
+        let path = match crate::contrib::publish_source(&source) {
+            Ok(path) => path,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("{e:#}"))]),
+        };
+        let options = crate::contrib::PublishOptions {
+            id,
+            app_name,
+            aliases,
+            note,
+            draft: false,
+        };
+        match tokio::task::spawn_blocking(move || crate::contrib::publish(&path, &options)).await {
+            Ok(Ok(report)) => CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&report).unwrap_or_default(),
+            )]),
+            Ok(Err(e)) => {
+                CallToolResult::error(vec![Content::text(format!("publish failed: {e:#}"))])
+            }
+            Err(e) => {
+                CallToolResult::error(vec![Content::text(format!("publish task failed: {e}"))])
+            }
+        }
+    }
+
+    #[tool(
+        description = "File an issue on the official flow registry for an installed flow that \
+        failed (label changed, app updated, wrong locale). Uses the failure captured by the last \
+        phone_flow_run of that id — failed step, redacted daemon result, daemon version — so you \
+        only add a short note. Screen labels, typed text, and element lists are stripped. \
+        OUTWARD-FACING: requires confirm=true after the user agreed. Do not file for a phone \
+        that was simply locked/offline, or for a flow you ran on the wrong app/locale."
+    )]
+    async fn phone_flow_report(
+        &self,
+        Parameters(FlowReportParams { id, note, confirm }): Parameters<FlowReportParams>,
+    ) -> CallToolResult {
+        if !confirm {
+            return CallToolResult::error(vec![Content::text(
+                "phone_flow_report opens a public issue; ask the user, then call again with confirm=true",
+            )]);
+        }
+        if !crate::registry::valid_flow_id(&id) {
+            return CallToolResult::error(vec![Content::text(format!(
+                "{id:?} is not a registry id"
+            ))]);
+        }
+        let mut context =
+            self.take_flow_failure(&id)
+                .unwrap_or_else(|| crate::contrib::ReportContext {
+                    id: id.clone(),
+                    ..Default::default()
+                });
+        if context.result.is_none() && note.as_deref().is_none_or(|n| n.trim().is_empty()) {
+            return CallToolResult::error(vec![Content::text(
+                "no captured failure for this flow in this session — run it first, or pass a note describing what went wrong",
+            )]);
+        }
+        if note.is_some() {
+            context.note = note;
+        }
+        if context.application.is_none() {
+            if let Ok(body) = self.daemon.elements().await {
+                context.application = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v["elements"].as_array().and_then(|rows| {
+                            rows.iter()
+                                .find(|r| r["kind"] == "Application")
+                                .and_then(|r| r["label"].as_str().map(String::from))
+                        })
+                    });
+            }
+        }
+        match tokio::task::spawn_blocking(move || crate::contrib::report(&context)).await {
+            Ok(Ok(outcome)) => CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&outcome).unwrap_or_default(),
+            )]),
+            Ok(Err(e)) => {
+                CallToolResult::error(vec![Content::text(format!("report failed: {e:#}"))])
+            }
+            Err(e) => {
+                CallToolResult::error(vec![Content::text(format!("report task failed: {e}"))])
+            }
         }
     }
 

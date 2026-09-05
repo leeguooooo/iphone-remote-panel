@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod client;
+mod contrib;
 mod flow;
 mod registry;
 mod server;
@@ -105,6 +106,37 @@ enum FlowCommand {
     },
     /// Show the official source, any override, and the local store path.
     Sources,
+    /// Open a pull request adding a validated flow to the official registry (uses `gh`).
+    Publish {
+        /// Flow file, or an id installed with `flow add`.
+        source: String,
+        /// Registry id to publish as, e.g. `health/export-all-zh-cn`.
+        #[arg(long = "as", value_name = "APP/FLOW")]
+        id: String,
+        /// Human app name; only used when the app is new to the registry.
+        #[arg(long)]
+        app_name: Option<String>,
+        /// Foreground-app label per language (repeatable), e.g. --alias Health --alias 健康.
+        #[arg(long = "alias", value_name = "LABEL")]
+        aliases: Vec<String>,
+        /// What you verified and where; goes into the PR body.
+        #[arg(long)]
+        note: Option<String>,
+        /// Open as a draft PR.
+        #[arg(long)]
+        draft: bool,
+    },
+    /// File an issue on the official registry for a flow that failed (uses `gh`).
+    Report {
+        /// Registry id that failed.
+        id: String,
+        /// JSON result printed by the failing `flow run` (inline, or @path to a file).
+        #[arg(long, value_name = "JSON|@FILE")]
+        result: Option<String>,
+        /// What you expected vs what the phone showed.
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +205,56 @@ async fn main() -> anyhow::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&registry::sources_json()?)?
                 );
+                Ok(())
+            }
+            FlowCommand::Publish {
+                source,
+                id,
+                app_name,
+                aliases,
+                note,
+                draft,
+            } => {
+                let path = contrib::publish_source(&source)?;
+                let options = contrib::PublishOptions {
+                    id,
+                    app_name,
+                    aliases,
+                    note,
+                    draft,
+                };
+                let report = tokio::task::spawn_blocking(move || contrib::publish(&path, &options))
+                    .await??;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            FlowCommand::Report { id, result, note } => {
+                let result = match result {
+                    Some(text) if text.starts_with('@') => Some(serde_json::from_slice(
+                        &std::fs::read(&text[1..])
+                            .map_err(|e| anyhow::anyhow!("read {}: {e}", &text[1..]))?,
+                    )?),
+                    Some(text) => Some(serde_json::from_str(&text)?),
+                    None => None,
+                };
+                if result.is_none() && note.as_deref().is_none_or(|n| n.trim().is_empty()) {
+                    anyhow::bail!("pass --result (the failing `flow run` JSON) or --note");
+                }
+                let status = client::DaemonClient::from_env()
+                    .status()
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::to_value(s).ok());
+                let context = contrib::ReportContext {
+                    id,
+                    result,
+                    status,
+                    application: None,
+                    note,
+                };
+                let outcome =
+                    tokio::task::spawn_blocking(move || contrib::report(&context)).await??;
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
                 Ok(())
             }
         };
