@@ -300,8 +300,13 @@ impl PhoneHandler {
     #[tool(
         description = "Capture the current iPhone screen through the configured device \
         backend and return it as an image/png content block. Direct/WDA capture is the \
-        default and does not require iPhone Mirroring. If status is released or offline, \
-        call phone_reconnect once and poll phone_status."
+        default and does not require iPhone Mirroring. Capture only when a current \
+        user-requested task needs phone pixels; do not capture or reconnect for \
+        initialization, health checks, or to keep the phone ready. Idle release is \
+        intentional. If that task cannot proceed because Direct is released/offline, \
+        check phone_status recovery_owner=daemon and hint/setup_blocked_on. Do not \
+        reconnect while releasing/reconnecting or a blocker remains. When appropriate, \
+        call phone_reconnect once, then poll phone_status until drivable=true."
     )]
     async fn phone_screenshot(&self) -> CallToolResult {
         match self.daemon.screenshot().await {
@@ -457,12 +462,18 @@ impl PhoneHandler {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "Query Direct/WDA readiness before acting. The JSON preserves \
+        description = "Read Direct/WDA status without taking control. The JSON preserves \
         backend, target_configured, managed_wda, managed_wda_pending, recovery_owner, \
         device_state, screen_state, wda, wda_actionable, locked, drivable, released, \
         hint, setup_blocked_on, setup_phase, and setup_message. Gate actions on drivable=true, not on \
-        phone_target. If managed Direct is released/offline, follow hint, call \
-        phone_reconnect once, then poll; never switch to Mirroring implicitly."
+        phone_target. For initialization, status/health checks, or no unfinished \
+        user-requested task needing phone access, report the state and stop; do not \
+        reconnect or hold the phone. Idle release is intentional. Only if a current \
+        user-requested phone operation or screen/UI read cannot proceed because \
+        Direct is released/offline, check recovery_owner=daemon and hint/setup_blocked_on. \
+        Do not reconnect while releasing/reconnecting or a blocker remains. When \
+        appropriate, call phone_reconnect once, then poll until drivable=true; never \
+        switch to Mirroring implicitly."
     )]
     async fn phone_status(&self) -> CallToolResult {
         match self.daemon.status().await {
@@ -553,8 +564,14 @@ impl PhoneHandler {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "Reconnect the canonical Direct/WDA device target after \
-        phone_status reports released/offline and recovery_owner=daemon. Call once, \
+        description = "Start/restart on-device automation for the canonical Direct/WDA \
+        target. This occupies the phone and may require the operator to unlock it. \
+        Use only to continue a current user-requested phone operation or screen/UI \
+        read that cannot proceed; never reconnect for initialization, status/health \
+        checks, a completed task, or to keep the phone ready. Idle release is intentional. \
+        Require phone_status released/offline and recovery_owner=daemon; inspect \
+        hint/setup_blocked_on first. Do not reconnect while releasing/reconnecting \
+        or a blocker remains. Once these conditions are met, call once, \
         then poll phone_status until reconnecting=false and drivable=true; while it is \
         reconnecting, report setup_phase/setup_message and obey setup_blocked_on. This tool \
         never accepts a UDID and cannot switch devices or fall back to Mirroring. \
@@ -588,12 +605,19 @@ impl ServerHandler for PhoneHandler {
             ))
             .with_instructions(
                 "Control an iPhone through the daemon's Direct/WDA backend; iPhone \
-                 Mirroring is only an explicit legacy compatibility mode. Start with \
-                 phone_status() and require drivable=true. Prefer phone_elements() \
+                 Mirroring is only an explicit legacy compatibility mode. phone_status() \
+                 is read-only. For initialization, status/health checks, or no unfinished \
+                 user-requested task needing phone access, report the state and stop; \
+                 do not reconnect, hold, or poll screenshots/elements to keep the phone \
+                 ready. Idle release is intentional. Before a current user-requested \
+                 phone operation or screen/UI read, check phone_status() and require \
+                 drivable=true. Prefer phone_elements() \
                  plus phone_tap_element(); phone_tap_label() is safe only when the \
                  exact label is unique. Use phone_screenshot() when pixels matter. \
-                 If Direct reports released/offline, read hint/setup_blocked_on, \
-                 call phone_reconnect() once, and poll status. \
+                 Only if that task cannot proceed because Direct is released/offline, \
+                 check recovery_owner=daemon and hint/setup_blocked_on. Do not reconnect \
+                 while releasing/reconnecting or a blocker remains. When appropriate, \
+                 call phone_reconnect() once, then poll status until drivable=true. \
                  Never fall back to Mirroring implicitly. App Switcher is unsupported.",
             )
     }

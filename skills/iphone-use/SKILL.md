@@ -40,28 +40,45 @@ curl -s -H "$AUTH" "$HOST/agent/status"
 #  "setup_blocked_on":"", ...}
 ```
 
-**Gate on `drivable:true`.** `phone_target` is a legacy Mirroring-window field
-and is not a Direct readiness signal.
+**Status checks do not take control.** For initialization, status/health checks,
+or when no unfinished user-requested task needs phone access, report the state
+and stop. Do not reconnect, take a hold, or poll screenshots/elements to keep
+the phone ready. Idle release is intentional.
 
-- `device_state:"ready"` + `drivable:true` → safe to act.
-- `device_state:"locked"` → ask the operator to unlock the iPhone and keep it awake.
-- `device_state:"released"` or `released:true` → restart Direct/WDA once:
+**Gate phone operations and screen/UI reads on `drivable:true`.** The current
+user-requested task must need that access. `phone_target` is a legacy
+Mirroring-window field and is not a Direct readiness signal.
+
+- `device_state:"ready"` + `drivable:true` → proceed with the requested task.
+- `device_state:"locked"` → ask the operator to unlock the iPhone and keep it
+  awake only if the current task needs phone access.
+- `device_state:"released"` or `released:true` → expected idle state; leave it
+  released unless the current task needs phone access. If that task cannot
+  proceed, check `recovery_owner:"daemon"` and `hint` / `setup_blocked_on`.
+  Once blockers are resolved and no release/reconnect is in progress, restart
+  Direct/WDA once. This starts on-device automation, occupies the phone, and
+  may require the operator to unlock it:
 
   ```bash
   curl -s -H "$AUTH" -H "$MUTATION" -H 'Content-Type: application/json' \
     -X POST "$HOST/agent/mode" -d '{"mode":"agent"}'
   ```
 
-  With the bundled MCP server, call `phone_reconnect` instead. Then poll
-  status; do not retry either path in a tight loop. Neither path accepts a
-  transient UDID.
+  With the bundled MCP server, call `phone_reconnect` instead under the same
+  conditions. Then poll status until `drivable:true`; do not retry either
+  path in a tight loop. Neither path accepts a transient UDID.
+- `device_state:"releasing"` or `releasing:true` → do not reconnect or take a
+  hold during release. Wait for it to finish only if the current task still
+  needs phone access, then reassess status and the recovery conditions above.
 - `reconnecting:true` → first inspect `setup_blocked_on`. If it is non-empty,
   follow the concrete `hint`; do not blindly wait or send another reconnect.
   Otherwise report `setup_phase` / `setup_message`, then wait and poll. A first
   build after an Xcode update can take several minutes. Never send input until
   `drivable:true`.
 - `device_state:"blocked"` or `"offline"` → read `hint` and
-  `setup_blocked_on` (`warp|proxy|usb|trust|ddi|account`) and fix that blocker first.
+  `setup_blocked_on` (`warp|proxy|usb|trust|ddi|account`). For a current task
+  that needs phone access, resolve the blocker first; offline recovery follows
+  the same task, ownership, and lifecycle conditions as released recovery.
 - Never switch to `mode=mirror` as automatic recovery. Mirror is an explicit
   operator-selected compatibility mode.
 
@@ -201,11 +218,18 @@ documented or unit-tested action is not automatically a current-device proof:
   nothing** (same false-success class as switches). Dismiss/answer them with
   `{"type":"alert","button":"<exact button text>"}` or
   `{"type":"alert","action":"accept"|"dismiss"}`.
-- **Human-in-the-loop pauses** (you are about to wait for the operator to type a
-  password, approve a prompt, or fetch a code): send
-  `POST /agent/hold {"secs":600}` first so the idle watchdog does not release
-  the phone and force a 60–120s WDA rebuild while you wait. Send `{"secs":0}`
-  when done. Status reports `hold_remaining_secs`.
+- **Human-in-the-loop pauses** within a current user-requested phone task
+  (waiting for the operator to type a password, approve a prompt, or fetch a
+  code): use a bounded HTTP `POST /agent/hold {"secs":600}` before the pause
+  if the task needs to retain the phone. Clear it with `{"secs":0}` when the
+  pause ends or the task completes/is cancelled. Status reports
+  `hold_remaining_secs`. A hold prevents idle release; it does not start WDA
+  or prove readiness. Do not use or renew it for initialization, health checks,
+  or to keep the phone ready without a task. There is no bundled MCP hold tool.
+  A `503 device_release_in_progress` (with `Retry-After`) means release already
+  started. Only if the current task still needs phone access, wait for release
+  to finish and reassess status; reconnect once under the recovery conditions
+  above, and take another bounded hold only if the task still needs that pause.
 - **Switches & sliders** (hardware-verified, iOS 27): a coordinate tap on a
   Switch is **acknowledged but does not flip it** — a silent false success.
   The only reliable path is `{"type":"perform","element":N,"snapshot":"…",
@@ -231,7 +255,8 @@ documented or unit-tested action is not automatically a current-device proof:
   the on-phone XCUITest runner monopolizes the device's remote session, so
   while Direct is active any Mirroring window may show an interrupted state.
   That is expected. Do not try to repair or open Mirroring. Reconnect Direct
-  with `phone_reconnect` or `POST /agent/mode {"mode":"agent"}`; it needs the
+  only when the current task needs it and the recovery conditions above are
+  met, using `phone_reconnect` or `POST /agent/mode {"mode":"agent"}`; it needs the
   phone unlocked. The target is canonical: change `PHONE_REMOTE_UDID`, rerun
   setup, and restart the daemon to switch devices. Never pass a one-off UDID
   during recovery.
@@ -252,9 +277,13 @@ documented or unit-tested action is not automatically a current-device proof:
   at a loopback port with no listener; start that proxy app or disable only the
   stale entry. `trust` = a one-time "trust the Apple Development cert" tap on
   the phone.
-- **Never retry reconnect blindly.** Send `mode=agent` once, then poll status
-  and follow `hint`/`setup_blocked_on`. Repeated bootstrap requests obscure the
-  real USB, trust, DDI, or VPN blocker.
+- **Reconnect only for a current task that needs phone access.** Status/health
+  checks and initialization leave released/offline devices alone. Check
+  `recovery_owner:"daemon"`, resolve `hint`/`setup_blocked_on`, and wait out any
+  release/reconnect already in progress. Then send `mode=agent` once and poll
+  status until `drivable:true`; stop recovery when the task no longer needs
+  the phone. Repeated bootstrap requests obscure the USB, trust, DDI, or VPN
+  blocker.
 - **Do not batch guesses.** During discovery, keep one action between reads.
   Once a segment is understood, default to `phone_run_steps` or
   `POST /agent/actions` and combine up to 24 steps in one call instead of
