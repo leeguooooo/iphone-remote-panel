@@ -1244,9 +1244,33 @@ function setupBlockerCopy(blockedOn) {
 /* Blockers that clear only when a person does something to the phone or the
    Mac. `wda` and `account` are excluded on purpose: they are not a single
    physical gesture, and their copy sends the operator to a log or to Xcode. */
+const ACTIONABLE_SETUP_BLOCKERS = new Set(
+  ['locked', 'trust', 'usb', 'ddi', 'warp', 'proxy'],
+);
+/* The managed retry loop alternates between building and its backoff, and it
+   publishes the blocker only during the backoff. Reading each poll on its own
+   therefore flipped the overlay between "请解锁 iPhone" and "正在重新连接"
+   every few seconds — the instruction changing under a person who has not
+   done anything yet. Remember the last actionable blocker for as long as the
+   device stays unusable; a drivable phone or a different blocker clears it. */
+let stickySetupBlocker = '';
 function actionableSetupBlocker(status) {
-  return new Set(['locked', 'trust', 'usb', 'ddi', 'warp', 'proxy'])
-    .has(status?.setup_blocked_on);
+  const current = String(status?.setup_blocked_on || '');
+  if (ACTIONABLE_SETUP_BLOCKERS.has(current)) {
+    stickySetupBlocker = current;
+    return true;
+  }
+  /* A blocker we cannot act on, or a drivable device, is authoritative. */
+  if (current || status?.drivable === true) {
+    stickySetupBlocker = '';
+    return false;
+  }
+  return stickySetupBlocker !== '';
+}
+/* The copy must follow the remembered blocker, not the momentarily empty one. */
+function effectiveSetupBlocker(status) {
+  const current = String(status?.setup_blocked_on || '');
+  return ACTIONABLE_SETUP_BLOCKERS.has(current) ? current : stickySetupBlocker;
 }
 
 function managedSetupWillRetry(status) {
@@ -1366,7 +1390,7 @@ function showOverlay(kind) {
     ));
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'setup-blocked') {
-    const [title, detail] = setupBlockerCopy(backendStatus?.setup_blocked_on);
+    const [title, detail] = setupBlockerCopy(effectiveSetupBlocker(backendStatus));
     setTextIfChanged(olTitle, title);
     setTextIfChanged(olSub, detail);
     offlineOverlay.classList.add('disconnected');
