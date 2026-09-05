@@ -3764,6 +3764,20 @@ enum SnapshotElementTapError {
     AfterDispatch(anyhow::Error),
 }
 
+/// Did this failure happen before any byte reached WDA? A TCP connect error
+/// (refused / unreachable) means the request was never delivered, so the
+/// action cannot have executed. Hardware-seen tonight (#66/#75 KeepAlive
+/// rounds restart the 8100 socat relay): a `set_value` and a `force_press`
+/// both hit "tcp connect error: Connection refused" and were reported as
+/// `outcome_unknown` / `retry_safe:false` — which forbids the one thing that
+/// was actually safe, retrying. Only a *connect* failure qualifies; anything
+/// after the request was sent (timeout, reset mid-body) stays unknown.
+fn error_never_reached_wda(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect))
+}
+
 /// Map a finished snapshot-bound element action onto the control outcome
 /// grammar shared by every dispatcher: `Err(outcome)` is a terminal outcome the
 /// caller returns as-is, `Ok(result)` feeds the dispatcher's normal
@@ -3785,6 +3799,10 @@ fn snapshot_element_outcome(
         Err(SnapshotElementTapError::BeforeDispatch(error)) => {
             w.invalidate_session();
             tracing::warn!("wda {context} failed before dispatch: {error:#}");
+            Err(WdaControlOutcome::NotSent)
+        }
+        Err(SnapshotElementTapError::AfterDispatch(error)) if error_never_reached_wda(&error) => {
+            tracing::warn!("{context}: not sent, WDA unreachable: {error:#}");
             Err(WdaControlOutcome::NotSent)
         }
         Err(SnapshotElementTapError::AfterDispatch(error)) => Ok(Err(error)),
@@ -4496,6 +4514,55 @@ fn pick_scroll_container(inner: [f64; 4], candidates: &[[f64; 4]]) -> Option<usi
         .map(|(index, _)| index)
 }
 
+/// Swipe endpoints for an element-scoped scroll: START on the target row,
+/// travel inside the (container ∩ screen) region.
+///
+/// iOS decides who owns a drag by where the finger lands, not where it ends:
+/// a drag that starts on a row inside a popup menu scrolls the menu even if
+/// it leaves the menu's bounds; a drag that starts outside the popup is a
+/// tap-outside and dismisses it. Centring the gesture on the container did
+/// exactly that on a WKWebView <select> (hardware, #70): the popup's own
+/// CollectionView is taller than the screen, its centre sits below the
+/// visible menu, and the "scroll" closed the menu and scrolled the page
+/// underneath instead. Anchoring the start point on the row keeps the touch
+/// where the agent pointed; the container only bounds how far it travels.
+/// Direction convention unchanged: positive dy starts low and ends high.
+fn element_swipe_endpoints(
+    row: [f64; 4],
+    container: [f64; 4],
+    screen: Option<(f64, f64)>,
+    dx: f64,
+    dy: f64,
+) -> (f64, f64, f64, f64) {
+    let [cx0, cy0, cw, ch] = container;
+    let (mut left, mut top, mut right, mut bottom) = (cx0, cy0, cx0 + cw, cy0 + ch);
+    if let Some((sw, sh)) = screen {
+        left = left.max(0.0);
+        top = top.max(0.0);
+        right = right.min(sw);
+        bottom = bottom.min(sh);
+    }
+    // Degenerate clip (container fully off-screen): fall back to the row.
+    if right - left < 8.0 || bottom - top < 8.0 {
+        left = row[0];
+        top = row[1];
+        right = row[0] + row[2];
+        bottom = row[1] + row[3];
+    }
+    let clamp_x = |v: f64| v.clamp(left + 2.0, (right - 2.0).max(left + 2.0));
+    let clamp_y = |v: f64| v.clamp(top + 2.0, (bottom - 2.0).max(top + 2.0));
+    let rx = clamp_x(row[0] + row[2] / 2.0);
+    let ry = clamp_y(row[1] + row[3] / 2.0);
+    let tx = swipe_travel(dx, right - left);
+    let ty = swipe_travel(dy, bottom - top);
+    // Start on the row; end `travel` away, opposite to the content direction.
+    let x1 = rx;
+    let x2 = clamp_x(rx - tx);
+    let y1 = ry;
+    let y2 = clamp_y(ry - ty);
+    (x1, y1, x2, y2)
+}
+
 /// `{"type":"scroll","element":N,"snapshot":"…","dx":…,"dy":…}` — scroll INSIDE
 /// a specific element's rectangle (both gesture endpoints stay within it), so a
 /// list scrolls without the gesture straying into a neighboring scroll view.
@@ -4547,17 +4614,11 @@ async fn scroll_snapshot_element(
     if ![x, y, width, height].into_iter().all(f64::is_finite) || width < 8.0 || height < 8.0 {
         return Err(SnapshotElementTapError::InvalidTarget);
     }
-    let cx = x + width / 2.0;
-    let cy = y + height / 2.0;
-    let tx = swipe_travel(dx, width);
-    let ty = swipe_travel(dy, height);
-    // Same direction convention as full-screen scroll: positive dy starts low
-    // and ends high (content moves down). Endpoints are inset 2pt so the touch
-    // cannot land on the element's border.
-    let x1 = (cx + tx / 2.0).clamp(x + 2.0, x + width - 2.0);
-    let x2 = (cx - tx / 2.0).clamp(x + 2.0, x + width - 2.0);
-    let y1 = (cy + ty / 2.0).clamp(y + 2.0, y + height - 2.0);
-    let y2 = (cy - ty / 2.0).clamp(y + 2.0, y + height - 2.0);
+    // Clip the swipe region to the screen: a container can extend past it
+    // (a WKWebView <select> popup's CollectionView is 957pt tall from y=92),
+    // and a gesture centred on such a rect starts below the fold.
+    let screen = w.window_size().await.ok();
+    let (x1, y1, x2, y2) = element_swipe_endpoints(row.rect, [x, y, width, height], screen, dx, dy);
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
     w.swipe(x1, y1, x2, y2, duration)
@@ -4938,6 +4999,16 @@ async fn wda_control_with_client(
         Ok(()) => {
             actionable.store(true, Ordering::Relaxed);
             WdaControlOutcome::Applied
+        }
+        Err(e) if error_never_reached_wda(&e) => {
+            // The relay refused the connection: nothing was delivered, so this
+            // is a clean not-sent, and retrying is exactly right once the
+            // relay is back. Still mark the read path unactionable so status
+            // reflects the outage.
+            actionable.store(false, Ordering::Relaxed);
+            w.invalidate_session();
+            tracing::warn!("wda control ({typ}): not sent, WDA unreachable: {e:#}");
+            WdaControlOutcome::NotSent
         }
         Err(e) => {
             // A WDA call that should have worked failed. Direct callers fail
@@ -9465,6 +9536,53 @@ mod tests {
         assert_eq!(pick_scroll_container(row, &[page]), Some(0));
         assert_eq!(pick_scroll_container(row, &[sibling]), None);
         assert_eq!(pick_scroll_container(row, &[]), None);
+    }
+
+    /// #70 ③ on hardware: an element scroll on a <select> popup Cell closed the
+    /// popup and scrolled the page. The popup's CollectionView ran from y=92
+    /// to y=1049 on a 956pt screen, so the old centre-based gesture started
+    /// at y≈570 — below the visible menu (92..487) — i.e. outside the popup.
+    #[test]
+    /// A refused TCP connect never reached WDA; a response-level failure may
+    /// have. The classifier must tell them apart, and only the first is
+    /// "not sent".
+    #[test]
+    fn connect_refused_is_never_reached_but_http_errors_are_not() {
+        let refused = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:9/never")
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap_err();
+        assert!(error_never_reached_wda(&refused), "{refused:#}");
+        // Wrapped with context, still detected through the chain.
+        let wrapped = refused.context("POST element/value");
+        assert!(error_never_reached_wda(&wrapped));
+        // A plain error that is not a connect failure must not be reclassified.
+        assert!(!error_never_reached_wda(&anyhow::anyhow!("HTTP status 400 Bad Request")));
+    }
+
+    fn element_swipe_starts_on_the_row_and_stays_on_screen() {
+        let row = [109.0, 245.0, 251.0, 36.0];
+        let popup_list = [62.0, 92.0, 316.0, 957.0];
+        let (x1, y1, x2, y2) = element_swipe_endpoints(row, popup_list, Some((440.0, 956.0)), 0.0, 300.0);
+        // Starts on the row itself (inside the visible menu), never at the
+        // container's off-screen centre.
+        assert!((x1 - 234.5).abs() < 1.0 && (y1 - 263.0).abs() < 1.0, "start on row: {x1},{y1}");
+        // Travels upward (positive dy → content moves down), stays inside the
+        // clipped region and on screen.
+        assert!(y2 < y1, "moves up: {y2} < {y1}");
+        assert!(y2 >= 94.0 && y2 <= 954.0, "on screen: {y2}");
+        assert_eq!(x2, x1);
+        // Negative dy travels downward but never past the screen bottom.
+        let (_, _, _, y_down) = element_swipe_endpoints(row, popup_list, Some((440.0, 956.0)), 0.0, -300.0);
+        assert!(y_down > y1 && y_down <= 954.0, "down within screen: {y_down}");
+        // No screen size known: still starts on the row.
+        let (_, y_ns, _, _) = element_swipe_endpoints(row, popup_list, None, 0.0, 300.0);
+        assert!((y_ns - 263.0).abs() < 1.0);
     }
 
     #[test]
