@@ -2744,7 +2744,18 @@ if not (isinstance(products, str) and isinstance(xctestrun, str)):
     raise SystemExit(1)
 if not products.startswith("/") or "/Build/Products/" not in products:
     raise SystemExit(1)
-if not xctestrun.startswith(products + "/") or not xctestrun.endswith(".xctestrun"):
+# xcodebuild writes the .xctestrun beside the configuration directory, not
+# inside it: .../Build/Products/X.xctestrun next to .../Build/Products/Debug-iphoneos.
+# `_resolve_xctestrun` looks in that parent, so accept either location and
+# keep both inside the same Build/Products tree.
+import posixpath
+parent = posixpath.dirname(products.rstrip("/"))
+if not xctestrun.endswith(".xctestrun"):
+    raise SystemExit(1)
+if not (xctestrun.startswith(products.rstrip("/") + "/")
+        or xctestrun.startswith(parent + "/")):
+    raise SystemExit(1)
+if "/Build/Products/" not in xctestrun:
     raise SystemExit(1)
 print(products)
 print(xctestrun)

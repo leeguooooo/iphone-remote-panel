@@ -21,7 +21,9 @@ class RunnerCacheTests(unittest.TestCase):
         self.products = self.root / 'DerivedData' / 'Build' / 'Products' / 'Debug-iphoneos'
         self.products.mkdir(parents=True)
         (self.products / 'iPhoneUse-Runner.app').mkdir()
-        self.xctestrun = self.products / 'WebDriverAgentRunner_iphoneos.xctestrun'
+        # xcodebuild writes the .xctestrun beside the configuration directory,
+        # not inside it — the shape that made the first cache never hit.
+        self.xctestrun = self.products.parent / 'WebDriverAgentRunner_iphoneos26.5-arm64.xctestrun'
         self.xctestrun.write_text('plist')
         self.icon = self.root / 'AppIcon.icns'
         self.icon.write_bytes(b'icns')
@@ -89,6 +91,23 @@ class RunnerCacheTests(unittest.TestCase):
         code, out = self.run_bash(self.write_body() + '_runner_cache_drop\n' + self.read_body())
         self.assertEqual(out[-1], 'miss', out)
         self.assertFalse((self.state / 'wda-runner-product.json').exists())
+
+    def test_xctestrun_inside_the_configuration_dir_is_also_accepted(self):
+        inside = self.products / 'WebDriverAgentRunner_iphoneos.xctestrun'
+        inside.write_text('plist')
+        body = (f'WDA_ICON_PRODUCTS_DIR="{self.products}"\nWDA_XCTESTRUN="{inside}"\n'
+                '_runner_cache_write || exit 9\n') + self.read_body()
+        code, out = self.run_bash(body)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out[-1].startswith('hit 1 '), out)
+
+    def test_xctestrun_outside_the_products_tree_is_rejected(self):
+        stray = self.root / 'stray.xctestrun'
+        stray.write_text('plist')
+        body = (f'WDA_ICON_PRODUCTS_DIR="{self.products}"\nWDA_XCTESTRUN="{stray}"\n'
+                '_runner_cache_write || exit 9\n') + self.read_body()
+        code, out = self.run_bash(body)
+        self.assertEqual(out[-1], 'miss', out)
 
     def test_record_outside_build_products_is_ignored(self):
         bogus = self.state / 'wda-runner-product.json'
