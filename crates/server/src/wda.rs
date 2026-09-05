@@ -1103,6 +1103,29 @@ impl WdaClient {
         }
     }
 
+    /// An element's current `value` attribute (`GET .../element/:id/attribute/value`):
+    /// a picker wheel's selected option, a slider's percent, a field's text.
+    /// `None` when WDA reports no value.
+    pub async fn element_value(&mut self, element_id: &str) -> Result<Option<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .get(format!(
+                "{}/session/{}/element/{}/attribute/value",
+                self.base, sid, element_id
+            ))
+            .send()
+            .await
+            .context("GET element/attribute/value")?;
+        let value = ensure_wda_success(response, "GET element/attribute/value").await?;
+        Ok(match value {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        })
+    }
+
     /// The system alert (`UIAlertController`) currently on screen, through
     /// WDA's native alert routes: `(text, button names)`; `None` when no alert
     /// is up. Alerts are the one UI layer the flattened `/source` tree handles

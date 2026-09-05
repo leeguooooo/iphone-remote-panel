@@ -3463,6 +3463,10 @@ enum WdaControlOutcome {
     ElementNotFound,
     AmbiguousElement,
     InvalidElementTarget,
+    /// Wrong-shaped value for the action; nothing was sent.
+    InvalidValue(&'static str),
+    /// Dispatched and acknowledged, but the element did not change.
+    NoEffect(&'static str),
     /// An `alert` action while no system alert is showing.
     NoAlert,
     Failed,
@@ -3750,6 +3754,12 @@ enum SnapshotElementTapError {
     /// The row was resolved fresh but cannot carry this action (no semantic
     /// locator where one is required, or a degenerate rectangle).
     InvalidTarget,
+    /// The request carried a value of the wrong shape for this action (a JSON
+    /// number where a string is required, a slider position outside 0..1).
+    InvalidValue(&'static str),
+    /// WDA acknowledged the action but the element did not change (a picker
+    /// wheel given a value that matches none of its options).
+    NoEffect(&'static str),
     BeforeDispatch(anyhow::Error),
     AfterDispatch(anyhow::Error),
 }
@@ -3770,6 +3780,8 @@ fn snapshot_element_outcome(
         Err(SnapshotElementTapError::NotFound) => Err(WdaControlOutcome::ElementNotFound),
         Err(SnapshotElementTapError::Ambiguous) => Err(WdaControlOutcome::AmbiguousElement),
         Err(SnapshotElementTapError::InvalidTarget) => Err(WdaControlOutcome::InvalidElementTarget),
+        Err(SnapshotElementTapError::InvalidValue(hint)) => Err(WdaControlOutcome::InvalidValue(hint)),
+        Err(SnapshotElementTapError::NoEffect(hint)) => Err(WdaControlOutcome::NoEffect(hint)),
         Err(SnapshotElementTapError::BeforeDispatch(error)) => {
             w.invalidate_session();
             tracing::warn!("wda {context} failed before dispatch: {error:#}");
@@ -3998,6 +4010,29 @@ fn perform_action_kind_permitted(action: &str, row: &crate::wda::ElementRow) -> 
         }
         _ => true,
     }
+}
+
+/// The value an `adjust` sends to WDA, checked for shape before anything is
+/// dispatched: it must be a JSON string (a picker option's text, or a slider
+/// position), and a slider position must be a normalized 0..1 number — WDA
+/// would silently clamp anything else on-device.
+fn adjust_target(kind: &str, value: Option<&serde_json::Value>) -> Result<String, SnapshotElementTapError> {
+    let Some(target) = value.and_then(serde_json::Value::as_str) else {
+        return Err(SnapshotElementTapError::InvalidValue(
+            "adjust needs \"value\" as a JSON string: a picker option's text, or a slider position such as \"0.5\"",
+        ));
+    };
+    if kind == "Slider"
+        && !target
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|position| position.is_finite() && (0.0..=1.0).contains(&position))
+    {
+        return Err(SnapshotElementTapError::InvalidValue(
+            "a Slider adjust value is a normalized position from \"0\" to \"1\"",
+        ));
+    }
+    Ok(target.to_string())
 }
 
 /// Parse a slider row's current `value` into WDA's normalized 0..1 position.
@@ -4257,23 +4292,23 @@ async fn perform_snapshot_element(
             _ => Err(SnapshotElementTapError::InvalidTarget),
         },
         "adjust" => {
-            let target = value
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(SnapshotElementTapError::Invalid)?;
-            if row.kind == "Slider"
-                && !target
-                    .trim()
-                    .parse::<f64>()
-                    .is_ok_and(|position| position.is_finite() && (0.0..=1.0).contains(&position))
-            {
-                // A slider adjust is a normalized 0..1 position by contract;
-                // anything else would silently clamp on-device.
-                return Err(SnapshotElementTapError::InvalidTarget);
-            }
-            w.adjust_element_value(&element_id, target)
+            let target = adjust_target(&row.kind, value.get("value"))?;
+            w.adjust_element_value(&element_id, &target)
                 .await
-                .map_err(after_dispatch)
+                .map_err(after_dispatch)?;
+            if row.kind == "PickerWheel" {
+                // WDA answers 200 to a picker value that matches no option and
+                // leaves the wheel where it was (hardware-hit on the Clock
+                // timer, #57). Read the wheel back so a miss is reported as one.
+                if let Ok(Some(now)) = w.element_value(&element_id).await {
+                    if now.trim() != target.trim() {
+                        return Err(SnapshotElementTapError::NoEffect(
+                            "WDA acknowledged the value but the picker did not move; the value must match one of the wheel's options exactly (read the row's value and try the option text as shown)",
+                        ));
+                    }
+                }
+            }
+            Ok(())
         }
         "menu" => {
             // The element-scoped secondary-action surface on iOS IS the
@@ -5042,6 +5077,20 @@ fn no_alert_response() -> Response {
     )
 }
 
+/// A terminal control outcome with a hint: `{ok:false,error,outcome,retry_safe:true,hint}`.
+fn hinted_control_response(status: StatusCode, error: &str, outcome: &str, hint: &str) -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"ok": false, "error": error, "outcome": outcome, "retry_safe": true, "hint": hint})
+                    .to_string(),
+            ))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
 fn invalid_element_target_response() -> Response {
     element_resolution_response(
         r#"{"ok":false,"error":"invalid_element_target","outcome":"not_sent","retry_safe":true,"hint":"the matched element has no finite positive-size hit target; refresh /agent/elements and choose another locator"}"#,
@@ -5801,7 +5850,7 @@ fn validate_agent_action_value(
                         .as_str()
                         .is_some_and(|value| !value.is_empty() && value.chars().count() <= 500)
                     {
-                        return invalid("perform adjust value must contain 1 to 500 characters");
+                        return invalid("perform adjust value must be a JSON string of 1 to 500 characters: a picker option's text, or a slider position such as \"0.5\"");
                     }
                 }
                 Some(_) => return invalid("perform value is only accepted with action adjust"),
@@ -6345,6 +6394,18 @@ async fn agent_actions(
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "invalid_element_target",
                             "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::InvalidValue(_) => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "invalid_value",
+                            "not_sent",
+                            true,
+                        ),
+                        WdaControlOutcome::NoEffect(_) => (
+                            StatusCode::CONFLICT,
+                            "adjust_no_effect",
+                            "no_effect",
                             true,
                         ),
                         WdaControlOutcome::Failed => {
@@ -7040,6 +7101,12 @@ async fn agent_input(
             WdaControlOutcome::ElementNotFound => element_not_found_response(),
             WdaControlOutcome::AmbiguousElement => ambiguous_element_response(detail.as_ref()),
             WdaControlOutcome::InvalidElementTarget => invalid_element_target_response(),
+            WdaControlOutcome::InvalidValue(hint) => hinted_control_response(
+                StatusCode::UNPROCESSABLE_ENTITY, "invalid_value", "not_sent", hint,
+            ),
+            WdaControlOutcome::NoEffect(hint) => hinted_control_response(
+                StatusCode::CONFLICT, "adjust_no_effect", "no_effect", hint,
+            ),
             WdaControlOutcome::NoAlert => no_alert_response(),
             WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
         };
@@ -9466,6 +9533,22 @@ mod tests {
         assert!(!rect_mostly_on_screen([20.0, 950.0, 400.0, 30.0], 440.0, 956.0), "6 of 30pt showing");
         assert!(!rect_mostly_on_screen([f64::NAN, 0.0, 10.0, 10.0], 440.0, 956.0));
         assert!(!rect_mostly_on_screen([0.0, 0.0, 0.0, 10.0], 440.0, 956.0));
+    }
+
+    // Issue #57: a JSON number for adjust used to surface as
+    // invalid_element_snapshot — the wrong diagnosis entirely.
+    #[test]
+    fn adjust_values_are_checked_for_shape_before_dispatch() {
+        let number = serde_json::json!(5);
+        let text = serde_json::json!("5");
+        let half = serde_json::json!("0.5");
+        let big = serde_json::json!("1.5");
+        assert!(matches!(adjust_target("PickerWheel", Some(&number)), Err(SnapshotElementTapError::InvalidValue(_))));
+        assert!(matches!(adjust_target("PickerWheel", None), Err(SnapshotElementTapError::InvalidValue(_))));
+        assert_eq!(adjust_target("PickerWheel", Some(&text)).unwrap(), "5");
+        assert_eq!(adjust_target("Slider", Some(&half)).unwrap(), "0.5");
+        assert!(matches!(adjust_target("Slider", Some(&big)), Err(SnapshotElementTapError::InvalidValue(_))));
+        assert!(matches!(adjust_target("Slider", Some(&text)), Err(SnapshotElementTapError::InvalidValue(_))), "5 is not a 0..1 position");
     }
 
     #[test]
