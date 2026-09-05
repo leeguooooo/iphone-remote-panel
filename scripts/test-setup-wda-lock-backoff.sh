@@ -75,6 +75,34 @@ run_retry locked >"$TMP_ROOT/locked-first.out"
 assert_delay_near 30
 grep -q 'lock screen blocked WDA' "$TMP_ROOT/locked-first.out" \
     || fail_test "first lock transition was not reported"
+# A locked phone is its own blocker. Publishing `wda` here made the daemon
+# hint and the web client tell the operator to read logs and re-run setup for
+# a state that clears by unlocking the phone — and that setup already retries.
+# The retry fixture runs read-only `doctor`, where _setstatus is inert, so
+# drive the recorder directly with a capturing stub.
+(
+    awk '
+        /^_record_keepalive_failure\(\)/ { copying=1 }
+        copying { print }
+        copying && /^}/ { exit }
+    ' "$SETUP" > "$TMP_ROOT/record-failure.sh"
+    awk '
+        /^_exponential_retry_delay\(\)/ { copying=1 }
+        copying { print }
+        copying && /^}/ { exit }
+    ' "$SETUP" > "$TMP_ROOT/blocker-delay.sh"
+    STATE_DIR="$TMP_ROOT/blocker-state"
+    mkdir -p "$STATE_DIR"
+    WDA_RETRY_STATE="$STATE_DIR/wda-retry-state.v1"
+    KEEPALIVE_FAILURE_KIND=locked
+    warn() { :; }
+    _setstatus() { printf '%s %s\n' "$1" "$2" > "$TMP_ROOT/blocker.out"; }
+    . "$TMP_ROOT/blocker-delay.sh"
+    . "$TMP_ROOT/record-failure.sh"
+    _record_keepalive_failure
+)
+[ "$(cut -d' ' -f2 "$TMP_ROOT/blocker.out" 2>/dev/null)" = "locked" ] \
+    || fail_test "lock backoff did not publish the 'locked' blocker"
 run_retry locked >"$TMP_ROOT/locked-second.out"
 [ "$(retry_field '3s/^attempt=//p')" = "2" ] \
     || fail_test "lock retry attempt did not increment"

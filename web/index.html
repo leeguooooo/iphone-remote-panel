@@ -1232,6 +1232,8 @@ function setupBlockerCopy(blockedOn) {
       return ['等待设备信任', '请在 iPhone 上信任开发者证书；完成后会自动继续'];
     case 'ddi':
       return ['开发者服务未就绪', '请保持 USB、解锁和亮屏；设备准备完成后会自动继续'];
+    case 'locked':
+      return ['请解锁 iPhone', '手机锁屏挡住了设备服务；解锁并保持亮屏，稍候会自动重试'];
     case 'wda':
       return ['设备服务启动失败', '请保持 USB、解锁和亮屏，然后重新运行下方设置命令'];
     default:
@@ -1242,7 +1244,7 @@ function setupBlockerCopy(blockedOn) {
 function managedSetupWillRetry(status) {
   const managed = status?.recovery_owner === 'daemon' ||
     status?.managed_wda === true;
-  return managed && new Set(['warp', 'proxy', 'usb', 'trust', 'ddi'])
+  return managed && new Set(['warp', 'proxy', 'usb', 'trust', 'ddi', 'locked'])
     .has(status?.setup_blocked_on);
 }
 
@@ -1304,6 +1306,9 @@ function updateSetupHelp(kind) {
 
 function directUnavailableKind(status) {
   if (status?.wda_locked === true) return 'locked';
+  /* WDA is down during a rebuild, so the probe cannot read the lock state;
+     setup's own `locked` blocker is then the only lock signal there is. */
+  if (status?.setup_blocked_on === 'locked') return 'locked';
   if (status?.setup_blocked_on) return 'setup-blocked';
   if (
     status?.recovery_owner === 'unconfigured' ||

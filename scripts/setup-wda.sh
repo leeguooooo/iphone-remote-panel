@@ -417,7 +417,12 @@ _record_keepalive_failure() {
         && chmod 600 "$tmp" \
         && mv -f "$tmp" "$WDA_RETRY_STATE"; then
         if [ "$KEEPALIVE_FAILURE_KIND" = "locked" ]; then
-            _setstatus lock-backoff wda "lock screen blocked WDA; next quiet retry in ${delay}s"
+            # `locked` is its own blocker: the phone is fine, the build is
+            # fine, and the retry is already scheduled. Reporting `wda` here
+            # made both the daemon hint and the web client tell the operator
+            # to read logs and re-run setup for a state that clears by
+            # unlocking the phone.
+            _setstatus lock-backoff locked "lock screen blocked WDA; next quiet retry in ${delay}s"
             if [ "$previous_kind" != "locked" ]; then
                 warn "iPhone lock screen blocked WDA; retries are now quiet and back off from 30s to 15min"
             fi

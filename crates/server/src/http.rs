@@ -2006,6 +2006,9 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
         "account" => Some(
             "Xcode has no usable signed-in Apple account or WDA provisioning profile — open Xcode → Settings → Accounts, sign in and select the development team, then poll status; the managed service retries automatically",
         ),
+        "locked" => Some(
+            "the iPhone is locked — unlock it and keep it awake; the managed service is already retrying on its own backoff, so do not send another reconnect request",
+        ),
         "wda" => Some(
             "WebDriverAgent failed to start — inspect ~/.iphone-use/wda-agent.log and run setup-wda.sh doctor before retrying",
         ),
@@ -2027,7 +2030,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
     }
     if !matches!(
         status.blocked_on.as_str(),
-        "" | "warp" | "proxy" | "usb" | "trust" | "ddi" | "account" | "wda"
+        "" | "warp" | "proxy" | "usb" | "trust" | "ddi" | "account" | "locked" | "wda"
     ) {
         return None;
     }
@@ -10446,7 +10449,7 @@ mod tests {
 
     #[test]
     fn setup_status_accepts_every_setup_script_blocker() {
-        for blocker in ["warp", "proxy", "usb", "trust", "ddi", "account", "wda"] {
+        for blocker in ["warp", "proxy", "usb", "trust", "ddi", "account", "locked", "wda"] {
             let payload = format!(r#"{{"blocked_on":"{blocker}","ts":1000}}"#);
             assert_eq!(parse_setup_blocked_on(&payload, 1100), blocker);
             assert!(
@@ -10464,6 +10467,13 @@ mod tests {
         assert!(setup_blocker_hint("account")
             .unwrap()
             .contains("Settings → Accounts"));
+        // A locked phone clears by unlocking it, and setup is already
+        // retrying — it must not read as a failed build to inspect.
+        let locked = setup_blocker_hint("locked").unwrap();
+        assert!(locked.contains("unlock"), "{locked}");
+        assert!(locked.contains("retrying"), "{locked}");
+        assert!(!locked.contains("wda-agent.log"), "{locked}");
+        assert!(!locked.contains("doctor"), "{locked}");
     }
 
     #[test]
