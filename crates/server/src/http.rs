@@ -1775,7 +1775,13 @@ async fn agent_status(
             // "cannot act" that made a severed session look like interference.
             wda_death_hint(wda_died_reason)
         } else {
-            "WDA is reachable but cannot act — restart the direct device service; direct control is fail-closed and will not inject into the Mac"
+            // Reachable but the last read/action failed, with no death reason
+            // and no lock: a `/source` read that timed out on a heavy page, or
+            // an app that stalled. This is transient by construction — the next
+            // probe decides — so the hint must say "retry", not "restart".
+            // Telling an agent to restart the service here sent it down a
+            // recovery path for a condition that clears itself (#74).
+            "WDA is reachable but the last read or action did not complete (usually a /source read that timed out on a heavy page, or a stalled app) — retry the read; the next health probe decides whether this clears or becomes offline"
         }
     } else if !drivable {
         match mirror_state {
@@ -1803,7 +1809,13 @@ async fn agent_status(
     } else if wda_locked == "true" {
         "locked"
     } else if wda {
-        "blocked"
+        // NOT "blocked". A blocker is something a human has to clear, and
+        // `blocked` above always comes with a named `setup_blocked_on`
+        // (warp|proxy|usb|trust|ddi|account). This branch has no blocker at
+        // all — WDA answers, the last read just failed. An agent that saw
+        // `blocked` here went looking for `setup_blocked_on`, found it empty,
+        // and had nothing left to do but guess (#74).
+        "degraded"
     } else {
         "offline"
     };
@@ -7243,9 +7255,15 @@ async fn agent_elements(
         }
         Err(_) => {
             mark_wda_read_path_unactionable(&state);
+            // `retry_after_secs` so the caller waits instead of hammering a
+            // page that is already too heavy to serialize — without it the
+            // only signal was `transitioning:true`, which says "this may
+            // clear" but not when to look again (#74).
             return json_body(
                 StatusCode::GATEWAY_TIMEOUT,
-                r#"{"elements":[],"error":"wda_source_timeout","transitioning":true}"#.to_string(),
+                format!(
+                    r#"{{"elements":[],"error":"wda_source_timeout","transitioning":true,"retry_after_secs":{WDA_SOURCE_TIMEOUT_RETRY_AFTER_SECS},"hint":"the accessibility tree took too long to serialize (heavy page or stalled app); wait retry_after_secs and read again, or bring a lighter screen to the foreground first"}}"#
+                ),
             );
         }
     };
@@ -7443,6 +7461,12 @@ struct AgentElementsQuery {
 /// Keep reachability and lock knowledge intact: a WebView transition can make
 /// `/source` fail while WDA itself remains reachable. The next bounded status
 /// probe decides whether the runner is down; until then, actions fail closed.
+/// How long a caller should wait before re-reading after a `/source` timeout.
+///
+/// Long enough that a retry is not just a second timeout on the same heavy
+/// page, short enough that a transient stall does not stall the agent.
+const WDA_SOURCE_TIMEOUT_RETRY_AFTER_SECS: u64 = 3;
+
 fn mark_wda_read_path_unactionable(state: &AppState) {
     state
         .wda_actionable

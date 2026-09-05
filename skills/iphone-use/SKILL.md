@@ -79,6 +79,13 @@ Mirroring-window field and is not a Direct readiness signal.
   `setup_blocked_on` (`warp|proxy|usb|trust|ddi|account`). For a current task
   that needs phone access, resolve the blocker first; offline recovery follows
   the same task, ownership, and lifecycle conditions as released recovery.
+- `device_state:"degraded"` → **not** a blocker; do not go looking for
+  `setup_blocked_on`, it is empty by definition here. WDA answers, but the last
+  read or action did not complete — usually a `/source` read that timed out on
+  a heavy page, or a stalled app. Wait the `retry_after_secs` from the failing
+  response (3s) and read again. The next health probe decides whether this
+  clears back to `ready` or drops to `offline`; do not restart the service for
+  it.
 - Never switch to `mode=mirror` as automatic recovery. Mirror is an explicit
   operator-selected compatibility mode.
 
