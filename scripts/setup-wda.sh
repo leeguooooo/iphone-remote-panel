@@ -2664,6 +2664,108 @@ print(paths.pop())
 }
 # END runner product validation.
 
+# BEGIN runner product cache.
+# One successful bring-up records the launchable, icon-injected runner product
+# (its products dir + .xctestrun) so the next reconnect installs it as-is with
+# `test-without-building` instead of building twice. Before this, every
+# KeepAlive round ran build-for-testing, found the previous round's injected
+# product "invalid" (the incremental build re-emplaces Info.plist without
+# re-signing), deleted it, rebuilt, and injected the icon again — 20-40s of
+# xcodebuild per reconnect that the phone never needed.
+#
+# The record is keyed on everything that changes the product: WDA commit,
+# bundle id, team, target device, and the icon source + its mtime. Any
+# mismatch, a missing file, or a product that no longer validates falls
+# through to the normal build. A launch that fails on a cached product drops
+# the record so the following round rebuilds from scratch.
+WDA_RUNNER_CACHE="$STATE_DIR/wda-runner-product.json"
+WDA_RUNNER_FROM_CACHE=0
+
+_runner_cache_key() {
+    local icon_mtime=0
+    if [ -n "${RUNNER_ICON_SOURCE:-}" ] && [ -f "$RUNNER_ICON_SOURCE" ]; then
+        icon_mtime="$(stat -f %m "$RUNNER_ICON_SOURCE" 2>/dev/null || echo 0)"
+    fi
+    printf 'v1|%s|%s|%s|%s|%s|%s' "${WDA_COMMIT:-}" "${WDA_BUNDLE_ID:-}" "${TEAM_ID:-}" \
+        "${WDA_UDID:-}" "${RUNNER_ICON_SOURCE:-}" "$icon_mtime"
+}
+
+_runner_cache_drop() {
+    if [ -L "$WDA_RUNNER_CACHE" ]; then
+        warn "refusing to remove a symlinked runner cache record: $WDA_RUNNER_CACHE"
+        return 1
+    fi
+    rm -f "$WDA_RUNNER_CACHE"
+}
+
+# Record the product that just served. Atomic write; a symlinked path is
+# never followed.
+_runner_cache_write() {
+    [ -n "${WDA_ICON_PRODUCTS_DIR:-}" ] && [ -n "${WDA_XCTESTRUN:-}" ] || return 1
+    if [ -L "$WDA_RUNNER_CACHE" ]; then
+        warn "refusing to write a symlinked runner cache record: $WDA_RUNNER_CACHE"
+        return 1
+    fi
+    python3 - "$WDA_RUNNER_CACHE" "$(_runner_cache_key)" "$WDA_ICON_PRODUCTS_DIR" "$WDA_XCTESTRUN" <<'PY_CACHE'
+import json, os, sys, tempfile, time
+path, key, products, xctestrun = sys.argv[1:]
+record = {"schema_version": 1, "key": key, "products_dir": products,
+          "xctestrun": xctestrun, "recorded_at": int(time.time())}
+fd, tmp = tempfile.mkstemp(prefix=".wda-runner-product.", dir=os.path.dirname(path))
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(record, handle)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY_CACHE
+}
+
+# Reuse the recorded product when it still matches and still validates.
+# On success sets WDA_ICON_PRODUCTS_DIR + WDA_XCTESTRUN and returns 0.
+_runner_cache_read() {
+    local products xctestrun app
+    [ -f "$WDA_RUNNER_CACHE" ] && [ ! -L "$WDA_RUNNER_CACHE" ] || return 1
+    products="$(python3 - "$WDA_RUNNER_CACHE" "$(_runner_cache_key)" <<'PY_CACHE'
+import json, sys
+path, key = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        record = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if record.get("schema_version") != 1 or record.get("key") != key:
+    raise SystemExit(1)
+products, xctestrun = record.get("products_dir"), record.get("xctestrun")
+if not (isinstance(products, str) and isinstance(xctestrun, str)):
+    raise SystemExit(1)
+if not products.startswith("/") or "/Build/Products/" not in products:
+    raise SystemExit(1)
+if not xctestrun.startswith(products + "/") or not xctestrun.endswith(".xctestrun"):
+    raise SystemExit(1)
+print(products)
+print(xctestrun)
+PY_CACHE
+)" || return 1
+    xctestrun="${products#*$'\n'}"
+    products="${products%%$'\n'*}"
+    [ -d "$products" ] && [ -f "$xctestrun" ] || return 1
+    app="$products/${WDA_RUNNER_NAME:-WebDriverAgentRunner}-Runner.app"
+    [ -d "$app" ] && [ ! -L "$app" ] || return 1
+    _validate_runner_bundle "$app" || return 1
+    WDA_ICON_PRODUCTS_DIR="$products"
+    WDA_XCTESTRUN="$xctestrun"
+    WDA_ICON_APP_PATH="$app"
+    WDA_RUNNER_FROM_CACHE=1
+    return 0
+}
+# A launch timeout on a cached product is usually the phone (locked, asleep,
+# unplugged), not the product. Only evict when the runner log names an
+# install/launch failure of the product itself.
+_runner_log_shows_product_failure() {
+    grep -Eiq '0xe8008001|Failed to install|MIInstaller|could not launch|not launchable|code signature|invalid signature|provisioning profile' \
+        "${1:-/dev/null}" 2>/dev/null
+}
+# END runner product cache.
+
 _build_and_inject_runner_icon() {
     local source="$1"
     local extension icon_png iconset assets_catalog compiled partial_plist
@@ -3076,11 +3178,19 @@ case "$WDA_RUNNER_ICON" in
         ;;
 esac
 WDA_XCTESTRUN=""
-if [ -n "$RUNNER_ICON_SOURCE" ]; then
+if [ -n "$RUNNER_ICON_SOURCE" ] && [ "${WDA_RUNNER_REBUILD:-0}" != "1" ] && _runner_cache_read; then
+    ok "Reusing the runner product from the last bring-up (no rebuild; WDA_RUNNER_REBUILD=1 forces one)"
+    _setstatus building "${_BUILD_BLOCKER:-}" "reusing the verified runner product from the last bring-up"
+elif [ -n "$RUNNER_ICON_SOURCE" ]; then
     if _build_and_inject_runner_icon "$RUNNER_ICON_SOURCE"; then
         WDA_XCTESTRUN="$(_resolve_xctestrun "$WDA_ICON_PRODUCTS_DIR" || true)"
         if [ -z "$WDA_XCTESTRUN" ]; then
-            warn "Could not resolve a unique .xctestrun; running the normal test action, which will drop the injected icon"
+            if _discard_injected_runner; then
+                warn "Could not resolve a unique .xctestrun; discarded the injected runner so the launch rebuilds a pristine one (the custom icon is skipped this round)"
+            else
+                _setstatus building-fail wda "injected runner cannot be launched and could not be discarded"
+                die "could not resolve a unique .xctestrun for the injected runner, and refusing to run the normal test action over a hand-signed bundle"
+            fi
         fi
     fi
 fi
@@ -3126,6 +3236,10 @@ BUILD_STARTED_AT="$(date +%s)"
 while [ -z "$PHONE_URL" ]; do
     TRIES=$((TRIES+1))
     if [ $TRIES -gt 120 ]; then
+        if [ "$WDA_RUNNER_FROM_CACHE" = "1" ] && _runner_log_shows_product_failure "$RUN_LOG"; then
+            _runner_cache_drop || true
+            warn "the cached runner product failed to install or launch; the next round rebuilds it"
+        fi
         _setstatus building-fail wda "WDA did not report its server URL before the startup timeout"
         die "timed out waiting for WDA to start — check $RUN_LOG"
     fi
@@ -3158,6 +3272,10 @@ while [ -z "$PHONE_URL" ]; do
             _setstatus building-fail wda "phone is locked and the WDA runner exited"
             die "the phone is locked and xcodebuild exited. Unlock it, then rerun setup."
         fi
+        if [ "$WDA_RUNNER_FROM_CACHE" = "1" ]; then
+            _runner_cache_drop || true
+            warn "the cached runner product exited before serving; the next round rebuilds it"
+        fi
         _setstatus building-fail wda "WDA runner exited before reporting its server URL"
         die "the PID-verified WDA runner exited before reporting its server URL — check $RUN_LOG"
     fi
@@ -3182,6 +3300,12 @@ case "$PHONE_URL" in
     *) die "WDA reported an unexpected server URL '$PHONE_URL' (plain http:// expected)" ;;
 esac
 ok "WDA serving at $PHONE_URL"
+if [ -n "${WDA_XCTESTRUN:-}" ]; then
+    if [ "$WDA_RUNNER_FROM_CACHE" != "1" ]; then
+        _runner_cache_write && ok "Recorded the runner product; the next reconnect installs it without rebuilding" \
+            || warn "could not record the runner product for reuse; the next reconnect rebuilds"
+    fi
+fi
 if [ "$WDA_RUNNER_ICON_INJECTED" = "1" ]; then
     if [ ! -f "$WDA_ICON_APP_PATH/Assets.car" ] \
         || [ ! -f "$WDA_ICON_APP_PATH/AppIcon60x60@2x.png" ] \
