@@ -15,6 +15,9 @@
 # Env overrides:
 #   WDA_UDID=...        target device UDID (default: first xcodebuild iOS device)
 #   WDA_TEAM_ID=...     Apple dev team (default: Xcode's last-selected team)
+#   WDA_ASC_KEY_PATH=... absolute .p8 path; with both IDs, use ASC API key signing
+#   WDA_ASC_KEY_ID=...  App Store Connect key ID (all three WDA_ASC_* required)
+#   WDA_ASC_ISSUER_ID=... App Store Connect issuer ID
 #   WDA_BUNDLE_ID=...   runner bundle id (default: derived from validated Team ID)
 #   WDA_DIR=...         WDA checkout    (default: ~/.iphone-use/WebDriverAgent)
 #   WDA_REF=...         exact upstream commit (default: pinned v9.15.3 commit)
@@ -23,7 +26,7 @@
 #   MJPEG_PORT=...      video relay port (default: 9100)
 #   WDA_ALLOW_LAN=1     permit unauthenticated WDA over LAN (unsafe; default off)
 #
-# Requirements: Xcode (with an Apple ID signed in: Xcode → Settings → Accounts),
+# Requirements: Xcode (an Apple ID in Settings → Accounts, or WDA_ASC_* signing),
 # the iPhone paired + Developer Mode on, and `iproxy` for the default USB relay.
 # `socat` is accepted only with the explicit WDA_ALLOW_LAN=1 escape hatch.
 set -eu
@@ -64,12 +67,18 @@ WDA_ICON_BACKUP_PATH=""
 WDA_ICON_MUTATION_ACTIVE=0
 WDA_RUNNER_ICON_INJECTED=0
 WDA_ICON_BUILD_LOCKED=0
+WDA_RUNNER_REPAIR_ATTEMPTED=0
+WDA_RUNNER_VALIDATION_ERROR=""
 KEEPALIVE_ATTEMPT_ACTIVE=0
 KEEPALIVE_FAILURE_KIND="generic"
 KEEPALIVE_LOCK_RETRY=0
 INTERACTIVE_LOCK_STARTED_AT=0
 INTERACTIVE_LOCK_NOTICE_AT=0
 INTERACTIVE_LOCK_NOTICE_ATTEMPT=0
+STATUS_RUN_ID=""
+STATUS_OWNER_PID=""
+STATUS_OWNER_START=""
+STATUS_HEARTBEAT_PID=""
 
 _existing_wda_env() {
     [ -f "$WDA_AGENT_PLIST" ] || { printf ''; return; }
@@ -99,6 +108,13 @@ MJPEG_PORT="${MJPEG_PORT:-$(_port_from_daemon_url PHONE_REMOTE_WDA_MJPEG_URL)}"
 MJPEG_PORT="${MJPEG_PORT:-9100}"
 WDA_BUNDLE_ID="${WDA_BUNDLE_ID:-$(_existing_wda_env WDA_BUNDLE_ID)}"
 WDA_TEAM_ID="${WDA_TEAM_ID:-$(_existing_wda_env WDA_TEAM_ID)}"
+# Restore the saved trio only when no ASC override was supplied. A partial
+# explicit override must not silently combine with a different saved key.
+if [ "${WDA_ASC_KEY_PATH+x}${WDA_ASC_KEY_ID+x}${WDA_ASC_ISSUER_ID+x}" = "" ]; then
+    WDA_ASC_KEY_PATH="$(_existing_wda_env WDA_ASC_KEY_PATH)"
+    WDA_ASC_KEY_ID="$(_existing_wda_env WDA_ASC_KEY_ID)"
+    WDA_ASC_ISSUER_ID="$(_existing_wda_env WDA_ASC_ISSUER_ID)"
+fi
 WDA_REF="${WDA_REF:-$(_existing_wda_env WDA_REF)}"
 WDA_REF="${WDA_REF:-$DEFAULT_WDA_REF}"
 if [ "$WDA_REF" = "$DEFAULT_WDA_REF" ]; then
@@ -138,6 +154,65 @@ info() { printf '%s\n' "${BOLD}== $*${RST}"; }
 ok()   { printf '%s\n' "${GRN}✓${RST} $*"; }
 warn() { printf '%s\n' "${YLW}⚠${RST}  $*"; }
 die()  { printf '%s\n' "${RED}✗ $*${RST}" >&2; exit 1; }
+
+# BEGIN ASC signing helpers.
+_asc_signing_enabled() {
+    [ -n "${WDA_ASC_KEY_PATH:-}" ] && [ -n "${WDA_ASC_KEY_ID:-}" ] \
+        && [ -n "${WDA_ASC_ISSUER_ID:-}" ]
+}
+
+_prepare_xcodebuild_args() {
+    XCODEBUILD_ARGS=("$@")
+    _asc_signing_enabled || return 0
+    # Validate strings only. Never read/copy the private key or echo its values.
+    # Spaces in an absolute key path remain within one argv element.
+    if ! printf '%s\n' "$WDA_ASC_KEY_PATH" | LC_ALL=C grep -Eq '^/[^|[:cntrl:]]+\.p8$' \
+        || ! printf '%s\n' "$WDA_ASC_KEY_ID" | LC_ALL=C grep -Eq '^[A-Za-z0-9]+$' \
+        || ! printf '%s\n' "$WDA_ASC_ISSUER_ID" | LC_ALL=C grep -Eq '^[A-Za-z0-9-]+$' \
+        || ! _safe_expected "$WDA_ASC_KEY_PATH$WDA_ASC_KEY_ID$WDA_ASC_ISSUER_ID"; then
+        printf '%s\n' 'Invalid WDA_ASC_* configuration: use an absolute .p8 path and valid key/issuer IDs.' >&2
+        return 1
+    fi
+    local argument has_updates=0
+    for argument in "$@"; do
+        [ "$argument" != "-allowProvisioningUpdates" ] || has_updates=1
+    done
+    if [ "$has_updates" = "0" ]; then
+        XCODEBUILD_ARGS+=(-allowProvisioningUpdates)
+    fi
+    XCODEBUILD_ARGS+=(-authenticationKeyPath "$WDA_ASC_KEY_PATH"
+        -authenticationKeyID "$WDA_ASC_KEY_ID"
+        -authenticationKeyIssuerID "$WDA_ASC_ISSUER_ID"
+        -allowProvisioningDeviceRegistration)
+}
+
+_wda_xcodebuild() {
+    _prepare_xcodebuild_args "$@" || return 1
+    "$XCODEBUILD_BIN" "${XCODEBUILD_ARGS[@]}"
+}
+
+_prepare_runner_args() {
+    if [ -n "${WDA_XCTESTRUN:-}" ]; then
+        _prepare_xcodebuild_args -destination "platform=iOS,id=$WDA_UDID" \
+            test-without-building -xctestrun "$WDA_XCTESTRUN" || return 1
+    else
+        _prepare_xcodebuild_args -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner -destination "platform=iOS,id=$WDA_UDID" \
+            -allowProvisioningUpdates DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_ID" test || return 1
+    fi
+    RUNNER_ARGV=("${XCODEBUILD_ARGS[@]}")
+    RUNNER_ARGS="${RUNNER_ARGV[*]}"
+}
+
+_report_missing_xcode_account() {
+    _setstatus signing-fail account "sign in to an Apple account in Xcode, or configure WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID for API key signing"
+    die "Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,
+   sign in and select the development team, or configure WDA_ASC_KEY_PATH,
+   WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID for App Store Connect API key signing,
+   then rerun."
+}
+# END ASC signing helpers.
 
 _cleanup_wda_icon_work_dir() {
     [ -n "${WDA_ICON_WORK_DIR:-}" ] || return 0
@@ -396,15 +471,172 @@ _interactive_lock_wait_tick() {
 }
 
 STATUS_FILE="$STATE_DIR/wda-setup-status.json"
-# Structured progress the daemon surfaces via /agent/status.blocked_on, so a
-# caller (or POST /agent/mode) knows WHY a setup is stuck instead of polling blind.
-# $1=phase  $2=blocked_on(empty=ok)  $3=human message
+# BEGIN setup status protocol (also exercised without device access by tests).
+# One owner per setup attempt. All writers, including EXIT and the heartbeat,
+# compare run_id under the same lock before atomically replacing the JSON file.
+_status_publish() {
+    local mode="$1"; shift
+    [ -n "${STATUS_RUN_ID:-}" ] || return 0
+    local -a invoke=(python3)
+    # The watcher must be a direct child of the setup shell, so it can detect
+    # parent death without following/reaping unrelated processes.
+    [ "$mode" != "watch" ] || invoke=(exec python3)
+    "${invoke[@]}" - "$STATUS_FILE" "$mode" "$STATUS_RUN_ID" \
+        "$STATUS_OWNER_PID" "$STATUS_OWNER_START" "$@" <<'PY_STATUS'
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+path = Path(sys.argv[1])
+mode, run_id, pid_text, owner_start = sys.argv[2:6]
+owner_pid = int(pid_text)
+arguments = sys.argv[6:]
+
+def owner_alive():
+    try:
+        output = subprocess.check_output(
+            ["ps", "-p", pid_text, "-o", "lstart="], text=True,
+            env={**os.environ, "LC_ALL": "C"}, timeout=2,
+        )
+        return output.strip() == owner_start
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+def publish(operation):
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path) + ".lock", flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("unsafe setup status lock")
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError("setup status lock timed out")
+                time.sleep(0.02)
+        if path.is_symlink():
+            raise OSError("refusing symlinked setup status")
+        try:
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (FileNotFoundError, ValueError):
+            data = {}
+        now = int(time.time())
+        if operation == "begin":
+            blocker = data.get("blocked_on", "")
+            data = {
+                "schema_version": 1, "run_id": run_id,
+                "owner_pid": owner_pid, "owner_start": owner_start,
+                "phase": "starting", "phase_started_at": now,
+                "blocked_on": blocker if blocker in {"warp", "proxy", "usb", "trust", "ddi", "wda"} else "",
+                "message": "starting setup", "active": True, "terminal": False,
+            }
+        elif data.get("run_id") != run_id:
+            return False  # a new attempt owns the shared file now
+        elif operation == "phase":
+            phase, blocked, message = arguments
+            if phase != data.get("phase"):
+                data["phase_started_at"] = now
+            terminal = phase == "ready" or phase.endswith("-fail") or phase == "lock-backoff"
+            data.update(phase=phase, blocked_on=blocked, message=message,
+                        active=not terminal, terminal=terminal)
+        elif operation == "heartbeat":
+            if not data.get("active") or data.get("terminal"):
+                return False
+        elif operation in {"finish", "abandoned"}:
+            if operation == "abandoned" and data.get("terminal"):
+                return False
+            code = int(arguments[0]) if operation == "finish" else 137
+            previous = str(data.get("phase", "starting"))
+            if operation == "abandoned":
+                phase = "interrupted"
+            elif code == 130:
+                phase = "stopped"
+            elif code:
+                phase = previous if previous.endswith("-fail") else previous + "-fail"
+            else:
+                phase = "ready" if previous == "ready" else "completed"
+            data.update(phase=phase, last_phase=previous, active=False,
+                        terminal=True, exit_code=code, ended_at=now)
+            # Keep the last blocker/message as diagnostics, even on failure.
+        data.update(ts=now, heartbeat_ts=now)
+        temporary_fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+        try:
+            with os.fdopen(temporary_fd, "w") as output:
+                json.dump(data, output, separators=(",", ":"))
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return True
+    finally:
+        os.close(fd)
+
+if mode == "watch":
+    # No subprocess is spawned on each one-second parent check. The expensive
+    # identity recheck and heartbeat happen only once per 15 seconds.
+    next_heartbeat = time.monotonic() + 15
+    while True:
+        if os.getppid() != owner_pid:
+            publish("abandoned")
+            break
+        if time.monotonic() >= next_heartbeat:
+            if not owner_alive():
+                publish("abandoned")
+                break
+            if not publish("heartbeat"):
+                break
+            next_heartbeat = time.monotonic() + 15
+        time.sleep(1)
+else:
+    publish(mode)
+PY_STATUS
+}
+
+_status_begin_run() {
+    [ "$COMMAND" = "setup" ] || return 0
+    STATUS_OWNER_PID="$$"
+    STATUS_OWNER_START="$(LC_ALL=C ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$STATUS_OWNER_START" ] || return 1
+    STATUS_RUN_ID="$$-$(date +%s)-$RANDOM$RANDOM"
+    _status_publish begin || return 1
+    _status_publish watch >/dev/null 2>&1 &
+    STATUS_HEARTBEAT_PID=$!
+}
+
+_status_finish_run() {
+    local code="$1"
+    [ -n "${STATUS_RUN_ID:-}" ] || return 0
+    _status_publish finish "$code" || true
+    # Only signal an unreaped job belonging to this shell, never a reused PID.
+    if [ -n "${STATUS_HEARTBEAT_PID:-}" ] \
+        && jobs -pr | grep -Fxq "$STATUS_HEARTBEAT_PID"; then
+        kill "$STATUS_HEARTBEAT_PID" 2>/dev/null || true
+    fi
+    [ -z "${STATUS_HEARTBEAT_PID:-}" ] || wait "$STATUS_HEARTBEAT_PID" 2>/dev/null || true
+    STATUS_HEARTBEAT_PID=""
+}
+
+# $1=phase  $2=blocked_on(empty=ok)  $3=human message.
 _setstatus() {
     [ "$COMMAND" = "setup" ] || return 0
-    printf '{"phase":"%s","blocked_on":"%s","message":"%s","ts":%s}\n' \
-        "$1" "${2:-}" "$(printf '%s' "${3:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$(date +%s)" \
-        > "$STATUS_FILE" 2>/dev/null || true
+    _status_publish phase "$1" "${2:-}" "${3:-}" 2>/dev/null || true
 }
+# END setup status protocol.
 
 _xml_escape() {
     printf '%s' "$1" \
@@ -678,7 +910,8 @@ _install_wda_supervisor() {
 
     for key in \
         WDA_KEEPALIVE PATH WDA_UDID WDA_TEAM_ID WDA_BUNDLE_ID \
-        WDA_DIR WDA_REF WDA_RUNNER_ICON WDA_PORT MJPEG_PORT WDA_ALLOW_LAN
+        WDA_DIR WDA_REF WDA_RUNNER_ICON WDA_PORT MJPEG_PORT WDA_ALLOW_LAN \
+        WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID
     do
         case "$key" in
             WDA_KEEPALIVE) value="1" ;;
@@ -692,6 +925,10 @@ _install_wda_supervisor() {
             WDA_PORT) value="$WDA_PORT" ;;
             MJPEG_PORT) value="$MJPEG_PORT" ;;
             WDA_ALLOW_LAN) value="${WDA_ALLOW_LAN:-}" ;;
+            WDA_ASC_KEY_PATH|WDA_ASC_KEY_ID|WDA_ASC_ISSUER_ID)
+                _asc_signing_enabled || continue
+                value="${!key}"
+                ;;
         esac
         [ -n "$value" ] || continue
         escaped="$(_xml_escape "$value")"
@@ -1245,6 +1482,7 @@ _cleanup_on_exit() {
         _record_keepalive_failure || cleanup_failed=1
     fi
     [ "$cleanup_failed" = "0" ] || status=1
+    _status_finish_run "$status"
     trap - EXIT
     exit "$status"
 }
@@ -1487,17 +1725,26 @@ _expected_role_valid() {
     esac
 }
 
+# The optional ASC suffix must be complete and in the order emitted by
+# _prepare_xcodebuild_args. Do not replace it with an arbitrary-arguments tail:
+# these signatures authorize signalling the recorded process.
+_runner_signature_valid() {
+    local asc_suffix
+    _safe_expected "$1" || return 1
+    asc_suffix=' -authenticationKeyPath /[^|[:cntrl:]]+\.p8 -authenticationKeyID [A-Za-z0-9]+ -authenticationKeyIssuerID [A-Za-z0-9-]+ -allowProvisioningDeviceRegistration'
+    printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+        "^(/[^ ]*/)?xcodebuild (-project WebDriverAgent\\.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=[0-9A-Fa-f-]+ -allowProvisioningUpdates DEVELOPMENT_TEAM=[A-Z0-9]{10} PRODUCT_BUNDLE_IDENTIFIER=[A-Za-z0-9.-]+ test($asc_suffix)?|-destination platform=iOS,id=[0-9A-Fa-f-]+ test-without-building -xctestrun /[^ ]+/WebDriverAgentRunner_[^ /]+\\.xctestrun( -allowProvisioningUpdates$asc_suffix)?)$"
+}
+
 _command_matches_expected() {
     local command="$1"
     local expected="$2"
     local signature rest local_port device_port target_udid team_id bundle_id
-    local legacy_argv xctestrun_argv
+    local legacy_argv xctestrun_argv base_command
     case "$expected" in
         runner:*)
             signature="${expected#*:}"
-            printf '%s\n' "$signature" | LC_ALL=C grep -Eq \
-                '^(/[^ ]*/)?xcodebuild (-project WebDriverAgent\.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=[0-9A-Fa-f-]+ -allowProvisioningUpdates DEVELOPMENT_TEAM=[A-Z0-9]{10} PRODUCT_BUNDLE_IDENTIFIER=[A-Za-z0-9.-]+ test|-destination platform=iOS,id=[0-9A-Fa-f-]+ test-without-building -xctestrun /[^ ]+/WebDriverAgentRunner_[^ /]+\.xctestrun)$' \
-                || return 1
+            _runner_signature_valid "$signature" || return 1
             [ "$command" = "$signature" ]
             ;;
         relay:*|mjpeg:*)
@@ -1524,6 +1771,12 @@ _command_matches_expected() {
             esac
             _valid_team_id "$team_id" || return 1
             _valid_bundle_id "$bundle_id" || return 1
+            _runner_signature_valid "$command" || return 1
+            # Strip only the complete, validated suffix before checking the
+            # legacy UDID/team/bundle contract. New PID records still require
+            # exact equality with the full command, including the key path.
+            base_command="${command%% -authenticationKeyPath *}"
+            base_command="${base_command% -allowProvisioningUpdates}"
             legacy_argv="xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=$target_udid -allowProvisioningUpdates DEVELOPMENT_TEAM=$team_id PRODUCT_BUNDLE_IDENTIFIER=$bundle_id"
             # A runner started with an injected icon runs `test-without-building
             # -xctestrun <path>` instead of `test`. Both are ours; anything else
@@ -1535,12 +1788,12 @@ _command_matches_expected() {
             # matching just one would leave `pause`/`stop` unable to recognise
             # (and therefore unable to stop) the other.
             xctestrun_argv="xcodebuild -destination platform=iOS,id=$target_udid test-without-building -xctestrun"
-            case "$command" in
+            case "$base_command" in
                 "$legacy_argv test"|*/"$legacy_argv test") return 0 ;;
                 "$xctestrun_argv /"*/WebDriverAgentRunner_*.xctestrun \
                 |*/"$xctestrun_argv /"*/WebDriverAgentRunner_*.xctestrun)
                     # One path argument, no embedded spaces.
-                    case "${command#*-xctestrun }" in
+                    case "${base_command#*-xctestrun }" in
                         *" "*) return 1 ;;
                     esac
                     return 0
@@ -1964,6 +2217,7 @@ if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
     _wait_for_keepalive_retry
     KEEPALIVE_ATTEMPT_ACTIVE=1
 fi
+_status_begin_run || die "could not initialize the setup status owner"
 
 # A manual setup temporarily owns the lifecycle so an already-running KeepAlive
 # job cannot race its build or relays. A successful run installs and bootstraps
@@ -2251,6 +2505,165 @@ _resolve_xctestrun() {
     printf '%s\n' "$match"
 }
 
+# BEGIN runner product validation.
+_validate_runner_bundle() {
+    local app="$1" detail
+    if ! detail="$(python3 - "$app" <<'PY_RUNNER'
+import os
+from pathlib import Path
+import plistlib
+import sys
+
+app = Path(sys.argv[1])
+def fail(message):
+    print(message)
+    raise SystemExit(1)
+
+if app.is_symlink() or not app.is_dir():
+    fail("runner is missing or symlinked")
+for directory, dirs, files in os.walk(app, followlinks=False):
+    for name in dirs + files:
+        if name.endswith('.cstemp'):
+            fail("signing temporary file found (possible interrupted signing): "
+                 + str((Path(directory) / name).relative_to(app)))
+tests = list((app / 'PlugIns').glob('*.xctest'))
+if not tests:
+    fail("runner contains no PlugIns/*.xctest bundle")
+bundles = [app]
+for directory, dirs, _files in os.walk(app, followlinks=False):
+    for name in dirs:
+        if name.endswith(('.framework', '.xctest')):
+            bundles.append(Path(directory) / name)
+for bundle in bundles:
+    relative = str(bundle.relative_to(app))
+    info_path = bundle / 'Info.plist'
+    if not info_path.is_file():
+        fail(relative + '/Info.plist is missing')
+    try:
+        with info_path.open('rb') as stream:
+            info = plistlib.load(stream)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        fail(relative + '/Info.plist is invalid')
+    executable = info.get('CFBundleExecutable') if isinstance(info, dict) else None
+    if (not isinstance(executable, str) or not executable or '/' in executable
+            or executable in {'.', '..'}):
+        fail(relative + ': invalid CFBundleExecutable')
+    binary = bundle / executable
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        fail(relative + '/' + executable + ' is missing or not executable')
+PY_RUNNER
+    )"; then
+        WDA_RUNNER_VALIDATION_ERROR="$detail"
+        return 1
+    fi
+    if ! detail="$(codesign --verify --deep --strict "$app" 2>&1)"; then
+        WDA_RUNNER_VALIDATION_ERROR="runner signature verification failed: $detail"
+        return 1
+    fi
+    WDA_RUNNER_VALIDATION_ERROR=""
+}
+
+_run_runner_prebuild() {
+    local build_log="$1"
+    _setstatus building "${_BUILD_BLOCKER:-}" "building WDA runner product"
+    : > "$build_log"
+    if ! (
+        cd "$WDA_DIR" || exit 1
+        _wda_xcodebuild -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination "platform=iOS,id=$WDA_UDID" \
+            -allowProvisioningUpdates \
+            DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_ID" \
+            build-for-testing
+    ) >>"$build_log" 2>&1; then
+        if grep -Eiq 'Unlock iPhone to Continue|device is locked|deviceprep.*Code=-3|Code=-3.*deviceprep' "$build_log"; then
+            WDA_ICON_BUILD_LOCKED=1
+        fi
+        WDA_RUNNER_VALIDATION_ERROR="build-for-testing failed (log: $build_log)"
+        return 1
+    fi
+}
+
+_repair_runner_if_invalid() {
+    local products="$1" app="$2" build_log="$3" reason
+    if _validate_runner_bundle "$app"; then
+        return 0
+    fi
+    reason="$WDA_RUNNER_VALIDATION_ERROR"
+    warn "Runner product invalid: $reason"
+    _setstatus building "${_BUILD_BLOCKER:-}" "runner product invalid: $reason; rebuilding once"
+    if [ "${WDA_RUNNER_REPAIR_ATTEMPTED:-0}" = "1" ]; then
+        _setstatus building-fail wda "runner still invalid after one repair: $reason"
+        return 1
+    fi
+    # Only the current target's app, at the build-settings-derived products
+    # path, may be discarded. Never clean all DerivedData or follow an app link.
+    case "$products" in /*/Build/Products/*) ;; *) return 1 ;; esac
+    if [ "$app" != "$products/${WDA_RUNNER_NAME:-WebDriverAgentRunner}-Runner.app" ] \
+        || [ -L "$app" ]; then
+        WDA_RUNNER_VALIDATION_ERROR="refusing to remove an unowned runner product"
+        return 1
+    fi
+    if ! python3 - "$products" "$app" <<'PY_PRODUCT_PATH'
+from pathlib import Path
+import sys
+products, app = map(Path, sys.argv[1:])
+if (not products.is_absolute() or '/Build/Products/' not in str(products.resolve())
+        or app.is_symlink() or app.parent.resolve() != products.resolve()):
+    raise SystemExit(1)
+PY_PRODUCT_PATH
+    then
+        WDA_RUNNER_VALIDATION_ERROR="refusing to remove a runner outside canonical build products"
+        return 1
+    fi
+    WDA_RUNNER_REPAIR_ATTEMPTED=1
+    rm -rf -- "$app" || return 1
+    # Deleting the exact poisoned app also discards its .cstemp leftovers;
+    # merely unlinking those files would leave missing framework contents.
+    if ! _run_runner_prebuild "$build_log" || ! _validate_runner_bundle "$app"; then
+        _setstatus building-fail wda "runner repair failed: $WDA_RUNNER_VALIDATION_ERROR"
+        return 1
+    fi
+    WDA_RUNNER_ICON_INJECTED=0
+    WDA_XCTESTRUN=""
+    _setstatus building "${_BUILD_BLOCKER:-}" "runner product rebuilt and verified"
+}
+
+_ensure_launchable_runner() {
+    local products="${WDA_ICON_PRODUCTS_DIR:-}" settings app build_log
+    build_log="$STATE_DIR/wda-runner-product-build.log"
+    if [ -z "$products" ]; then
+        _setstatus building "${_BUILD_BLOCKER:-}" "resolving runner product before launch"
+        settings="$(
+            cd "$WDA_DIR" || exit 1
+            _wda_xcodebuild -project WebDriverAgent.xcodeproj \
+                -scheme WebDriverAgentRunner \
+                -destination "platform=iOS,id=$WDA_UDID" \
+                -allowProvisioningUpdates \
+                DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_ID" \
+                -showBuildSettings -json 2>>"$build_log"
+        )" || { WDA_RUNNER_VALIDATION_ERROR="could not resolve runner build settings"; return 1; }
+        products="$(printf '%s' "$settings" | python3 -c '
+import json,sys
+records=json.load(sys.stdin)
+paths={r.get("buildSettings",{}).get("BUILT_PRODUCTS_DIR") for r in records if r.get("target")=="WebDriverAgentRunner"}
+paths.discard(None)
+if len(paths)!=1: raise SystemExit(1)
+print(paths.pop())
+')" || { WDA_RUNNER_VALIDATION_ERROR="ambiguous runner products directory"; return 1; }
+    fi
+    case "$products" in
+        /*/Build/Products/*) ;;
+        *) WDA_RUNNER_VALIDATION_ERROR="unexpected runner products path"; return 1 ;;
+    esac
+    app="$products/${WDA_RUNNER_NAME:-WebDriverAgentRunner}-Runner.app"
+    if [ ! -e "$app" ] && [ ! -L "$app" ]; then
+        _run_runner_prebuild "$build_log" || return 1
+    fi
+    _repair_runner_if_invalid "$products" "$app" "$build_log"
+}
+# END runner product validation.
+
 _build_and_inject_runner_icon() {
     local source="$1"
     local extension icon_png iconset assets_catalog compiled partial_plist
@@ -2357,9 +2770,10 @@ JSON
     # (hardware-verified: installd rejects it with 0xe8008001).
     build_log="$STATE_DIR/wda-runner-icon-build.log"
     info "Prebuilding WDA so the runner icon can be injected before installation"
+    _setstatus building "${_BUILD_BLOCKER:-}" "prebuilding WDA for runner icon injection"
     if ! (
         cd "$WDA_DIR" || exit 1
-        "$XCODEBUILD_BIN" -project WebDriverAgent.xcodeproj \
+        _wda_xcodebuild -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
             -destination "platform=iOS,id=$WDA_UDID" \
             -allowProvisioningUpdates \
@@ -2380,9 +2794,10 @@ JSON
     fi
 
     build_settings="$WDA_ICON_WORK_DIR/build-settings.json"
+    _setstatus building "${_BUILD_BLOCKER:-}" "resolving WDA build settings"
     if ! (
         cd "$WDA_DIR" || exit 1
-        "$XCODEBUILD_BIN" -project WebDriverAgent.xcodeproj \
+        _wda_xcodebuild -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
             -destination "platform=iOS,id=$WDA_UDID" \
             -allowProvisioningUpdates \
@@ -2428,27 +2843,9 @@ PY
         _runner_icon_fail "the expected built runner is missing: $runner_product" || true
         return 1
     fi
-    # A cycle that fell back to the plain `test` action leaves the built runner
-    # with an Info.plist newer than its signature, so this check would refuse
-    # every later injection and the icon could never come back — a one-way
-    # latch into "no icon". Rebuild the product once and re-check instead.
-    if ! codesign --verify --deep --strict "$WDA_ICON_APP_PATH" 2>>"$build_log"; then
-        warn "Rebuilding the runner: a previous run left its signature inconsistent"
-        rm -rf "$WDA_ICON_APP_PATH"
-        if ! (
-            cd "$WDA_DIR" || exit 1
-            "$XCODEBUILD_BIN" -project WebDriverAgent.xcodeproj \
-                -scheme WebDriverAgentRunner \
-                -destination "platform=iOS,id=$WDA_UDID" \
-                -allowProvisioningUpdates \
-                DEVELOPMENT_TEAM="$TEAM_ID" \
-                PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_ID" \
-                build-for-testing
-        ) >>"$build_log" 2>&1 \
-            || ! codesign --verify --deep --strict "$WDA_ICON_APP_PATH" 2>>"$build_log"; then
-            _runner_icon_fail "the rebuilt runner still has an invalid signature" || true
-            return 1
-        fi
+    if ! _repair_runner_if_invalid "$products_dir" "$WDA_ICON_APP_PATH" "$build_log"; then
+        _runner_icon_fail "$WDA_RUNNER_VALIDATION_ERROR" || true
+        return 1
     fi
     signing_identity="$(codesign -dvv "$WDA_ICON_APP_PATH" 2>&1 \
         | sed -n 's/^Authority=//p' | head -1 || true)"
@@ -2553,7 +2950,7 @@ if [ -z "${WDA_UDID:-}" ]; then
     # xcodebuild exposes the classic UDID WDA needs. Never use `head -1`: with
     # multiple paired phones, guessing can build/sign/drive the wrong device.
     WDA_DESTINATION_UDIDS="$(cd "$WDA_DIR" \
-        && "$XCODEBUILD_BIN" -project WebDriverAgent.xcodeproj \
+        && _wda_xcodebuild -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner -showdestinations 2>/dev/null \
         | sed -n 's/.*platform:iOS, arch:arm64.*id:\([0-9A-F-]*\),.*/\1/p' \
         | sort -u || true)"
@@ -2585,6 +2982,7 @@ fi
 # ── 3. Wait for dev services (DDI) ────────────────────────────────────────────
 # Pitfall: 'Developer Disk Image is not mounted' usually means the phone is
 # LOCKED or just-connected — not an Xcode version problem. Keep it unlocked.
+_DDI_BLOCKER="$_BUILD_BLOCKER"
 if [ "$WDA_ALLOW_LAN" = "1" ]; then
     # Carry the sticky trust blocker through this early phase too: clearing it
     # here made status flip back to a generic "waiting for developer services"
@@ -2595,6 +2993,7 @@ if [ "$WDA_ALLOW_LAN" = "1" ]; then
         info "Waiting for developer services (UNLOCK the iPhone and keep it awake)"
     fi
 else
+    _DDI_BLOCKER="usb"
     _setstatus ddi-wait usb "waiting for developer services — unlock + USB"
     if [ "$KEEPALIVE_LOCK_RETRY" != "1" ]; then
         info "Waiting for developer services (UNLOCK the iPhone, keep it awake, and plug it in via USB)"
@@ -2603,6 +3002,9 @@ fi
 TRIES=0
 until _devicectl_t 10 device info details --device "$WDA_UDID" | grep -q "ddiServicesAvailable: true"; do
     TRIES=$((TRIES+1))
+    # Keep per-step diagnostics fresh too; the independent 15s heartbeat
+    # covers a devicectl call (or another blocking stage) that stalls.
+    _setstatus ddi-wait "$_DDI_BLOCKER" "waiting for developer services (attempt $TRIES)"
     if [ $TRIES -gt 45 ]; then
         warn "developer services never became available for $WDA_UDID."
         warn "Most reliable fix: connect this iPhone to the Mac with a USB cable"
@@ -2682,6 +3084,12 @@ if [ -n "$RUNNER_ICON_SOURCE" ]; then
         fi
     fi
 fi
+if [ "$WDA_ICON_BUILD_LOCKED" != "1" ] && ! _ensure_launchable_runner; then
+    if [ "$WDA_ICON_BUILD_LOCKED" != "1" ]; then
+        _setstatus building-fail wda "$WDA_RUNNER_VALIDATION_ERROR"
+        die "runner product is not launchable: $WDA_RUNNER_VALIDATION_ERROR"
+    fi
+fi
 if [ "$WDA_ICON_BUILD_LOCKED" = "1" ]; then
     if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
         _prepare_locked_retry
@@ -2692,32 +3100,15 @@ fi
 # Keep `RUNNER_COMMAND=` at column 0: the icon regression test isolates the
 # selection block by scanning for it, and indenting it swallowed the runner
 # launch block into that excerpt.
-if [ -n "${WDA_XCTESTRUN:-}" ]; then
-    # `-xctestrun` cannot be combined with `-project`/`-scheme` — xcodebuild
-    # refuses outright ("Cannot use -xctestrun with -project, -workspace or
-    # -scheme options"), and the team/bundle build settings are already baked
-    # into the xctestrun that build-for-testing produced. The identity this
-    # form pins is the destination UDID plus the exact xctestrun path, which
-    # carries the WebDriverAgent DerivedData hash and the scheme name.
-    RUNNER_ARGS="-destination platform=iOS,id=$WDA_UDID test-without-building -xctestrun $WDA_XCTESTRUN"
-else
-    RUNNER_ARGS="-project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination platform=iOS,id=$WDA_UDID -allowProvisioningUpdates DEVELOPMENT_TEAM=$TEAM_ID PRODUCT_BUNDLE_IDENTIFIER=$WDA_BUNDLE_ID test"
-fi
+# `-xctestrun` cannot be combined with `-project`/`-scheme`. Build both launch
+# forms and their signing suffix through one argv source, also used by the
+# exact PID identity record. No eval or string-based command execution.
+_prepare_runner_args || die "could not prepare WDA runner signing arguments"
 RUNNER_COMMAND="$XCODEBUILD_BIN $RUNNER_ARGS"
 RUNNER_EXPECTED="runner:$RUNNER_COMMAND"
 (
     cd "$WDA_DIR" || exit 1
-    if [ -n "${WDA_XCTESTRUN:-}" ]; then
-        exec nohup "$XCODEBUILD_BIN" \
-            -destination "platform=iOS,id=$WDA_UDID" \
-            test-without-building -xctestrun "$WDA_XCTESTRUN"
-    fi
-    exec nohup "$XCODEBUILD_BIN" -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
-        -destination "platform=iOS,id=$WDA_UDID" \
-        -allowProvisioningUpdates \
-        DEVELOPMENT_TEAM="$TEAM_ID" \
-        PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_ID" \
-        test
+    exec nohup "$XCODEBUILD_BIN" "${RUNNER_ARGV[@]}"
 ) > "$RUN_LOG" 2>&1 &
 RUNNER_PID=$!
 if ! _write_pid_record "$RUNNER_PID_FILE" "$RUNNER_PID" "$RUNNER_EXPECTED" runner; then
@@ -2743,9 +3134,7 @@ while [ -z "$PHONE_URL" ]; do
     # first used to hide the real account/profile error behind a generic
     # "runner exited" message.
     if grep -q "No Accounts:" "$RUN_LOG" 2>/dev/null; then
-        _setstatus signing-fail account "sign in to an Apple account in Xcode"
-        die "Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,
-   sign in and select the development team, then rerun."
+        _report_missing_xcode_account
     fi
     if grep -q "No profiles for .* were found\|requires a provisioning profile" \
         "$RUN_LOG" 2>/dev/null; then

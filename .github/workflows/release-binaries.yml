@@ -38,6 +38,11 @@ jobs:
           bash -n scripts/test-setup-wda-warp-preflight.sh
           bash scripts/test-install-release-transaction.sh
           bash scripts/test-setup-wda-warp-preflight.sh
+          bash scripts/test-setup-wda-lock-backoff.sh
+          bash scripts/test-setup-wda-icon-injection.sh
+          python3 scripts/test-setup-wda-status.py
+          python3 scripts/test-setup-wda-runner-product.py
+          python3 scripts/test-setup-wda-asc-signing.py
 
           skill_file_count="$(
             find skills/iphone-use -type f -print | wc -l | tr -d '[:space:]'

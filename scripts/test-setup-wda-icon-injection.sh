@@ -5,6 +5,7 @@
 # their reads or the eval-time call used to prove the `none` branch is inert.
 set -euo pipefail
 umask 077
+unset WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SETUP="$ROOT/scripts/setup-wda.sh"
@@ -43,6 +44,14 @@ awk '
     copying && /^if \[ -z "\$\{WDA_UDID:-\}" \]; then/ { exit }
     copying { print }
 ' "$SETUP" > "$TMP_ROOT/icon-injection-functions.sh"
+awk '
+    /^# BEGIN ASC signing helpers\./ { copying=1; next }
+    /^# END ASC signing helpers\./ { copying=0 }
+    copying { print }
+    /^_safe_expected\(\)/ { copying=1; print }
+    copying && /^}/ { if (safe) copying=0 }
+    /^_safe_expected\(\)/ { safe=1 }
+' "$SETUP" > "$TMP_ROOT/asc-functions.sh"
 [ -s "$TMP_ROOT/icon-transaction-functions.sh" ] \
     && [ -s "$TMP_ROOT/icon-injection-functions.sh" ] \
     || fail_test "could not isolate the production icon helpers"
@@ -50,6 +59,7 @@ awk '
 info() { printf 'info: %s\n' "$*"; }
 ok() { printf 'ok: %s\n' "$*"; }
 warn() { printf 'warn: %s\n' "$*"; }
+_setstatus() { :; }
 WDA_ICON_WORK_DIR=""
 WDA_ICON_PRODUCTS_DIR=""
 WDA_ICON_APP_PATH=""
@@ -61,8 +71,14 @@ WDA_RUNNER_NAME=iPhoneUse
 WDA_UDID=00008110-001234567890001E
 TEAM_ID=ABCDE12345
 WDA_BUNDLE_ID=com.example.wda
+# Exercise both icon prebuild and showBuildSettings with the complete signing
+# suffix; these values are synthetic and the key path is never opened.
+WDA_ASC_KEY_PATH="/nonexistent/fixture keys/AuthKey_FAKE123456.p8"
+WDA_ASC_KEY_ID=FAKE123456
+WDA_ASC_ISSUER_ID=00000000-1111-2222-3333-444444444444
 . "$TMP_ROOT/icon-transaction-functions.sh"
 . "$TMP_ROOT/icon-injection-functions.sh"
+. "$TMP_ROOT/asc-functions.sh"
 
 cat > "$TEST_BIN/iconutil" <<'SH'
 #!/usr/bin/env bash
@@ -140,7 +156,7 @@ case " $* " in
         printf '[{"target":"WebDriverAgentRunner","buildSettings":{"BUILT_PRODUCTS_DIR":"%s"}}]\n' "$PRODUCTS_DIR"
         exit 0
         ;;
-    *" build-for-testing ") ;;
+    *" build-for-testing "*) ;;
     *) exit 64 ;;
 esac
 if [ "${XCODE_LOCK_FAIL:-0}" = "1" ]; then
@@ -153,11 +169,18 @@ mkdir -p "$app/Frameworks/Fake.framework" "$app/PlugIns/RunnerTests.xctest"
 printf 'framework\n' > "$app/Frameworks/Fake.framework/Fake"
 printf 'dylib\n' > "$app/Frameworks/libFake.dylib"
 printf 'tests\n' > "$app/PlugIns/RunnerTests.xctest/RunnerTests"
+printf 'runner\n' > "$app/iPhoneUse-Runner"
+chmod +x "$app/iPhoneUse-Runner" "$app/Frameworks/Fake.framework/Fake" \
+    "$app/PlugIns/RunnerTests.xctest/RunnerTests"
+printf '<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Fake</string></dict></plist>\n' \
+    > "$app/Frameworks/Fake.framework/Info.plist"
+printf '<plist version="1.0"><dict><key>CFBundleExecutable</key><string>RunnerTests</string></dict></plist>\n' \
+    > "$app/PlugIns/RunnerTests.xctest/Info.plist"
 printf 'pristine\n' > "$app/original-marker.txt"
 cat > "$app/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>CFBundleName</key><string>iPhoneUse-Runner</string></dict></plist>
+<plist version="1.0"><dict><key>CFBundleName</key><string>iPhoneUse-Runner</string><key>CFBundleExecutable</key><string>iPhoneUse-Runner</string></dict></plist>
 PLIST
 SH
 
@@ -279,6 +302,7 @@ selection_block="$(awk '
     WDA_RUNNER_ICON=none
     WDA_ICON_BUILD_LOCKED=0
     _build_and_inject_runner_icon() { : > "$SKIP_MARKER"; }
+    _ensure_launchable_runner() { return 0; }
     eval "$selection_block"
 )
 [ ! -e "$SKIP_MARKER" ] \
