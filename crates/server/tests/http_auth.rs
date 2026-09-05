@@ -3197,3 +3197,42 @@ fn a_second_session_is_refused_while_the_first_owns_the_phone() {
     assert_eq!(refused.status(), StatusCode::CONFLICT);
     })
 }
+
+
+/// #69: an agent parsing `/agent/elements` with a strict JSON parser hit
+/// `Invalid control character` on screens whose accessibility labels contain
+/// line breaks (App Store search, Messages previews, WKWebViews). Python's
+/// `json.loads(..., strict=False)` tolerates it; `jq`, Go and serde do not, and
+/// the failure surfaced far downstream as `invalid_element_snapshot` because
+/// the parse had already died upstream.
+///
+/// The whole response body goes through one `serde_json::to_string`, which
+/// escapes U+0000-U+001F per RFC 8259. This test exists to keep it that way:
+/// the moment any part of this body is assembled by hand with `format!`, the
+/// property silently breaks again and only shows up on a real device screen.
+#[test]
+fn element_labels_with_control_characters_serialize_as_valid_json() {
+    let label = format!("Line one\nLine two\tcol{}", '\u{0001}');
+    let row = server::wda::ElementRow {
+        kind: "StaticText".to_string(),
+        label: label.clone(),
+        rect: [0.0, 0.0, 10.0, 10.0],
+        depth: 1,
+        ..Default::default()
+    };
+    let body = serde_json::json!({ "elements": [row] });
+    let text = serde_json::to_string(&body).expect("serializes");
+
+    // No raw control character may survive into the wire format.
+    assert!(
+        !text.chars().any(|c| (c as u32) < 0x20),
+        "raw control character in body: {text}"
+    );
+    assert!(text.contains(r"\n"), "newline must be escaped: {text}");
+    assert!(text.contains(r"\t"), "tab must be escaped: {text}");
+    assert!(text.contains(r"\u0001"), "control char must be escaped: {text}");
+
+    // And it must round-trip through a strict parser back to the original.
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("strict parse");
+    assert_eq!(parsed["elements"][0]["label"], serde_json::json!(label));
+}
