@@ -2499,6 +2499,11 @@ function flowStepPresentation(step) {
       return [`按键 ${step.name}`, '设备按键'];
     case 'back':
       return ['返回上一层', '应用内导航'];
+    case 'alert':
+      return [
+        step.button ? `系统弹窗按「${step.button}」` : `系统弹窗 ${step.action === 'accept' ? '确认' : '取消'}`,
+        '原生 alert 路径 · 无弹窗时不动作',
+      ];
     case 'launch_app':
       return ['打开指定应用', step.bundle];
     case 'picker':
@@ -3363,6 +3368,17 @@ function normalizeImportedStep(step, index, inputDefinitions) {
     case 'back':
       withAfter([]);
       return finishAction({});
+    case 'alert': {
+      withAfter([], ['button', 'action']);
+      const hasButton = step.button !== undefined;
+      const hasAction = step.action !== undefined;
+      requireFlow(hasButton !== hasAction, `${context} 需要 button 或 action 二选一`);
+      if (hasButton) {
+        return finishAction({ button: requireFlowString(step.button, `${context}.button`, { max: 200 }) });
+      }
+      requireFlow(step.action === 'accept' || step.action === 'dismiss', `${context}.action 只能是 accept 或 dismiss`);
+      return finishAction({ action: step.action });
+    }
     case 'picker': {
       withAfter(['value'], ['column']);
       return finishAction({

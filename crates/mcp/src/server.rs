@@ -200,6 +200,19 @@ pub enum PhoneStep {
         #[serde(default)]
         after_ms: u64,
     },
+    /// Press a button on a system alert (UIAlertController) through WDA's
+    /// native alert route — the only path that actually acts on one; taps on
+    /// alert buttons are acknowledged without effect. Give the exact button
+    /// text, or `action: accept|dismiss` for the default/cancel button. Fails
+    /// closed when no alert is showing.
+    Alert {
+        #[serde(default)]
+        button: Option<String>,
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        after_ms: u64,
+    },
     /// Select a value in a native picker wheel.
     Picker {
         #[serde(default)]
@@ -518,7 +531,7 @@ impl PhoneHandler {
         description = "Execute a bounded sequence of iPhone actions in ONE MCP \
         call through Direct/WDA. Supported step kinds: tap, longpress, swipe, drag, \
         tap_label, tap_locator, type, key, shortcut, scroll, launch_app, back, picker, \
-        wait_for, and pause. The daemon validates \
+        alert (native system-alert button; taps on alerts do not act), wait_for, and pause. The daemon validates \
         the complete sequence before dispatch, holds one WDA control lock, and \
         stops immediately on the first failure. DEFAULT TO THIS TOOL when two or more \
         consecutive actions are already understood, safe, and verifiable; reserve \
@@ -1290,6 +1303,30 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                 validate_after(after_ms)?;
                 action_step(serde_json::json!({"type":"back"}), after_ms)
             }
+            PhoneStep::Alert {
+                button,
+                action,
+                after_ms,
+            } => {
+                validate_after(after_ms)?;
+                let button = button.filter(|b| !b.trim().is_empty());
+                let action = action.filter(|a| !a.trim().is_empty());
+                match (&button, &action) {
+                    (Some(b), None) if b.chars().count() <= 200 => action_step(
+                        serde_json::json!({"type":"alert","button":b}),
+                        after_ms,
+                    ),
+                    (None, Some(a)) if a == "accept" || a == "dismiss" => action_step(
+                        serde_json::json!({"type":"alert","action":a}),
+                        after_ms,
+                    ),
+                    _ => {
+                        return Err(format!(
+                            "steps[{index}] alert needs exactly one of button (exact text, ≤200 chars) or action accept|dismiss; no action was sent"
+                        ))
+                    }
+                }
+            }
             PhoneStep::Picker {
                 column,
                 value,
@@ -1497,6 +1534,52 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("steps[1]"));
         assert!(error.contains("no action was sent"));
+    }
+
+    #[test]
+    fn multi_step_alert_encodes_button_or_action_and_rejects_both_or_neither() {
+        let ok = phone_steps_request(vec![
+            PhoneStep::Alert {
+                button: Some("导出".into()),
+                action: None,
+                after_ms: 100,
+            },
+            PhoneStep::Alert {
+                button: None,
+                action: Some("dismiss".into()),
+                after_ms: 0,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            ok["steps"][0]["action"],
+            serde_json::json!({"type":"alert","button":"导出"})
+        );
+        assert_eq!(
+            ok["steps"][1]["action"],
+            serde_json::json!({"type":"alert","action":"dismiss"})
+        );
+        for step in [
+            PhoneStep::Alert {
+                button: None,
+                action: None,
+                after_ms: 0,
+            },
+            PhoneStep::Alert {
+                button: Some("OK".into()),
+                action: Some("accept".into()),
+                after_ms: 0,
+            },
+            PhoneStep::Alert {
+                button: None,
+                action: Some("yes".into()),
+                after_ms: 0,
+            },
+        ] {
+            assert!(phone_steps_request(vec![step])
+                .unwrap_err()
+                .contains("alert needs"));
+        }
     }
 
     #[test]
