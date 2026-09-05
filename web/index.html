@@ -1369,9 +1369,15 @@ function showOverlay(kind) {
       ? `另一个观看者正在使用 — 已排队(前面还有 ${queuedAhead} 位)，对方断开后自动接入`
       : '另一个观看者正在使用 — 已排队，对方断开后将自动接入');
     offlineOverlay.classList.add('disconnected');
+  } else if (kind === 'background') {
+    setTextIfChanged(olTitle, '页面在后台');
+    setTextIfChanged(olSub, '后台标签页不连接设备；切到前台后会自动重新连接');
+    offlineOverlay.classList.add('disconnected');
   } else if (kind === 'released') {
     setTextIfChanged(olTitle, '手机已交还给你');
-    setTextIfChanged(olSub, '一段时间无远程操作，设备连接已释放。需要远程控制时重新连接');
+    setTextIfChanged(olSub, backendStatus?.human_handoff === true
+      ? '请在 Mac 上用 iPhone 镜像操作（本机或屏幕共享均可）。需要 agent 控制时点"重新连接"'
+      : '一段时间无远程操作，设备连接已释放。需要远程控制时重新连接');
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'releasing') {
     setTextIfChanged(olTitle, '正在释放设备');
@@ -1508,7 +1514,10 @@ async function pollAgentMode() {
         // A background/locked browser must not keep an MJPEG viewer alive and
         // defeat the daemon's idle release. Visible recovery starts with a
         // fresh status probe instead of silently retaining control readiness.
+        // Say so on the page: a capture of a background tab (agents do this)
+        // otherwise shows a black frame and a stale pill with no explanation.
         stopStills();
+        showOverlay('background');
       } else if (s.releasing === true) {
         stopStills();
         showOverlay('releasing');
@@ -1964,6 +1973,7 @@ document.addEventListener('visibilitychange', () => {
     cancelStatusPoll();
     setDirectControlReady(false);
     stopStills();
+    showOverlay('background');
   }
 });
 window.addEventListener('pagehide', () => {
@@ -4456,6 +4466,7 @@ function paintDot() {
       overlayState === 'released' ||
       overlayState === 'releasing' ||
       overlayState === 'reconnecting' ||
+      overlayState === 'background' ||
       overlayState === 'locked' ||
       overlayState === 'connecting' ||
       overlayState === 'frame-stale' ||
