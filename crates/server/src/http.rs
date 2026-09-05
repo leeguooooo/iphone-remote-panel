@@ -2053,6 +2053,31 @@ fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
     }
 }
 
+/// Whether `setup-wda.sh` is actively working right now.
+///
+/// The script stamps its progress into `wda-setup-status.json` as it goes, so
+/// a recently-touched file means a bring-up is in flight. The idle watchdog
+/// needs this to tell two states apart that look identical from the outside —
+/// "WDA is down because the supervisor is in a rebuild loop pestering the
+/// human for a passcode" (release it) versus "WDA is down because it is being
+/// started right now, for an agent that asked for it" (leave it alone).
+/// Without the distinction the watchdog kills a legitimate build partway, the
+/// next request restarts it, and the phone never becomes drivable — observed
+/// on hardware.
+fn setup_recently_active(home: &str) -> bool {
+    const ACTIVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(180);
+    if home.is_empty() {
+        return false;
+    }
+    std::path::Path::new(home)
+        .join(".iphone-use")
+        .join("wda-setup-status.json")
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified.elapsed().unwrap_or_default() < ACTIVE_WITHIN)
+        .unwrap_or(false)
+}
+
 /// Name of the retry state `setup-wda.sh` persists across supervisor restarts.
 /// Kept in one place because the daemon must clear exactly this file — and
 /// nothing else — when a caller explicitly asks for the phone.
@@ -2503,6 +2528,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     || state.wda_control_pending.load(Ordering::Acquire) != 0
                 {
                     continue;
+                }
+                if setup_recently_active(&home) {
+                    continue; // a bring-up is in progress — do not kill the build
                 }
                 // Nobody has driven the phone for a full window and the device
                 // layer is down anyway: stop the supervisor so it stops
@@ -6301,6 +6329,11 @@ async fn agent_input(
         }
         let won = state.wda_lifecycle.try_begin_reconnecting();
         if won {
+            // Someone just asked for the phone, so it is not idle — restart the
+            // clock before the supervisor starts building. Otherwise the idle
+            // watchdog can reach its window mid-bring-up and stop the very
+            // build this request triggered.
+            state.touch_activity();
             let recovery_state = state.clone();
             let home = std::env::var("HOME").unwrap_or_default();
             let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
@@ -8648,6 +8681,49 @@ mod tests {
     // resumes — well past the daemon's readiness window. Clearing it must hit
     // exactly one file: deleting anything else in ~/.iphone-use would be worse
     // than the bug.
+    // The idle watchdog must not kill a build it is watching start. Observed on
+    // hardware: releasing on "WDA down + idle" also matched "WDA down because
+    // an agent just asked for it", so setup was stopped mid-build, the next
+    // request restarted it, and the phone never became drivable.
+    #[test]
+    fn an_in_flight_setup_counts_as_active_and_a_stale_one_does_not() {
+        let home = std::env::temp_dir().join(format!("iu-setup-{}", std::process::id()));
+        let dir = home.join(".iphone-use");
+        std::fs::create_dir_all(&dir).expect("temp home");
+        let home_str = home.to_str().expect("utf-8 home");
+
+        // No status file at all: nothing is being set up.
+        assert!(!setup_recently_active(home_str));
+
+        let status = dir.join("wda-setup-status.json");
+        std::fs::write(&status, b"{\"phase\":\"building\"}").expect("write status");
+        assert!(
+            setup_recently_active(home_str),
+            "a just-written status file means a bring-up is in progress"
+        );
+
+        // An old stamp must not pin the watchdog forever — a supervisor that
+        // died mid-setup would otherwise be immune to release. `touch -t` is
+        // enough here and keeps the crate free of a test-only dependency.
+        let backdated = std::process::Command::new("touch")
+            .args(["-t", "202001010000", status.to_str().expect("utf-8 path")])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if backdated {
+            assert!(
+                !setup_recently_active(home_str),
+                "a stale stamp is not activity"
+            );
+        }
+
+        assert!(
+            !setup_recently_active(""),
+            "an unknown home is never active"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn clearing_the_retry_backoff_removes_only_that_one_file() {
         let home = std::env::temp_dir().join(format!("iu-backoff-{}", std::process::id()));
