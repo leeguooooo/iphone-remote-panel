@@ -4102,7 +4102,16 @@ async fn resolve_row_by_frame(
 /// stock Settings switch, and a stock timer's PickerWheel (empty label, no
 /// identifier — hardware-verified, issue #57). Every other verb still
 /// requires a real locator.
-const PERFORM_VERBS_WITH_FRAME_FALLBACK: &[&str] = &["toggle", "increment", "decrement", "adjust"];
+///
+/// `scroll_to_visible` joins them for a different reason (#73): the rows of an
+/// open WKWebView `<select>` popup carry no label and no identifier, so the
+/// only way to page through the menu was refused as `invalid_element_target`
+/// — and gestures dismiss the menu, so there was no way through at all.
+/// It is also the safest possible member of this list: bringing something into
+/// view mutates no state, so a mis-resolved target is visible and harmless,
+/// unlike a mis-resolved `toggle` or `adjust` that are already here.
+const PERFORM_VERBS_WITH_FRAME_FALLBACK: &[&str] =
+    &["toggle", "increment", "decrement", "adjust", "scroll_to_visible"];
 
 async fn perform_snapshot_element(
     w: &mut crate::wda::WdaClient,
@@ -9872,6 +9881,42 @@ mod tests {
         // Gesture verbs stay universal.
         for action in ["menu", "double_tap", "two_finger_tap", "scroll_to_visible"] {
             assert!(perform_action_kind_permitted(action, &row("Cell")));
+        }
+    }
+
+    /// #73: an open WKWebView `<select>` popup lists its options as Cell rows
+    /// with no label and no identifier. `snapshot_row_locator` returns None for
+    /// those, so `scroll_to_visible` was refused as `invalid_element_target` —
+    /// and gestures dismiss the popup, so there was no way to page through it.
+    /// The verb has to reach the geometry fallback, like the semantic-less
+    /// Switch and PickerWheel before it (#57).
+    #[test]
+    fn scroll_to_visible_survives_a_semantic_less_row() {
+        assert!(PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&"scroll_to_visible"));
+
+        // The shape that triggered it: a popup-menu Cell carrying nothing but
+        // a rect. No locator can be built from it.
+        let cell = crate::wda::ElementRow {
+            kind: "Cell".to_string(),
+            label: String::new(),
+            identifier: None,
+            rect: [0.0, 1559.0, 440.0, 44.0],
+            depth: 7,
+            ..Default::default()
+        };
+        assert!(
+            snapshot_row_locator(&cell).is_none(),
+            "an unlabeled, unidentified row must have no semantic locator"
+        );
+        assert!(perform_action_kind_permitted("scroll_to_visible", &cell));
+
+        // Mutating verbs must NOT have been widened by this change: a
+        // mis-resolved tap changes state, a mis-resolved scroll does not.
+        for action in ["tap", "menu", "double_tap", "two_finger_tap"] {
+            assert!(
+                !PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&action),
+                "{action} must still require a semantic locator"
+            );
         }
     }
 
