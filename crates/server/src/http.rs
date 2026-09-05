@@ -4274,10 +4274,31 @@ async fn perform_snapshot_element(
             .two_finger_tap_element(&element_id)
             .await
             .map_err(after_dispatch),
-        "scroll_to_visible" => w
-            .scroll_element_to_visible(&element_id)
-            .await
-            .map_err(after_dispatch),
+        "scroll_to_visible" => match w.scroll_element_to_visible(&element_id).await {
+            Ok(()) => Ok(()),
+            // WDA's scrollTo drives XCUITest's private "scroll then find a hit
+            // point"; inside a WKWebView the element scrolls into view and the
+            // hit point still comes back nil, so WDA answers "invalid element
+            // state" for a scroll that happened (issue #73, hardware-hit on a
+            // bank form). Trust the screen, not the verdict: if the element's
+            // frame is now mostly inside the window, the action succeeded.
+            Err(error) if !wda_error_is_missing_element(&error) => {
+                let visible = async {
+                    let rect = w.element_rect(&element_id).await?;
+                    let (width, height) = w.window_size().await?;
+                    Ok::<bool, anyhow::Error>(rect_mostly_on_screen(rect, width, height))
+                }
+                .await;
+                match visible {
+                    Ok(true) => {
+                        tracing::info!("scroll_to_visible: WDA reported failure but the element is on screen; treating as success ({error:#})");
+                        Ok(())
+                    }
+                    _ => Err(after_dispatch(error)),
+                }
+            }
+            Err(error) => Err(after_dispatch(error)),
+        },
         "pinch" => {
             let scale = value
                 .get("scale")
@@ -4356,6 +4377,17 @@ fn swipe_travel(d: f64, axis: f64) -> f64 {
     } else {
         (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
     }
+}
+
+/// Is at least half of `rect` inside a `width` × `height` window?
+fn rect_mostly_on_screen(rect: [f64; 4], width: f64, height: f64) -> bool {
+    let [x, y, w, h] = rect;
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return false;
+    }
+    let ix = (x + w).min(width) - x.max(0.0);
+    let iy = (y + h).min(height) - y.max(0.0);
+    ix > 0.0 && iy > 0.0 && (ix * iy) >= 0.5 * (w * h)
 }
 
 /// Element kinds whose rect is a viewport: a swipe inside it moves content.
@@ -9389,6 +9421,18 @@ mod tests {
         assert!(!valid_owner_name("a\"b"));
         assert!(!valid_owner_name("名字"));
         assert!(!valid_owner_name(&"x".repeat(65)));
+    }
+
+    // Issue #73: WDA says scrollTo failed while the element is plainly on
+    // screen. The screen decides.
+    #[test]
+    fn an_element_counts_as_on_screen_when_at_least_half_of_it_is() {
+        assert!(rect_mostly_on_screen([20.0, 459.0, 400.0, 44.0], 440.0, 956.0));
+        assert!(!rect_mostly_on_screen([20.0, 1559.0, 400.0, 44.0], 440.0, 956.0), "below the fold");
+        assert!(rect_mostly_on_screen([20.0, 940.0, 400.0, 30.0], 440.0, 956.0), "16 of 30pt showing");
+        assert!(!rect_mostly_on_screen([20.0, 950.0, 400.0, 30.0], 440.0, 956.0), "6 of 30pt showing");
+        assert!(!rect_mostly_on_screen([f64::NAN, 0.0, 10.0, 10.0], 440.0, 956.0));
+        assert!(!rect_mostly_on_screen([0.0, 0.0, 0.0, 10.0], 440.0, 956.0));
     }
 
     #[test]
