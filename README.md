@@ -340,6 +340,13 @@ never written back; a flow stops at the first failed step and never retries; com
 values can appear in shell history, so inputs must not carry credentials, codes, or
 private content, and send/publish/pay/delete actions must be declared `side_effect`.
 
+An app update does not silently break the registry: each flow records the app (or iOS)
+version it was proved on, the CLI reads what the phone has installed (`flow apps`), and
+every listing shows a `compat` verdict — `verified`, `untested-newer`, `incompatible`,
+`broken`, `needs-verification`, `draft`, `unknown`. `flow run` refuses broken or
+incompatible flows without `--force`. A nightly canary (`scripts/flow-reverify.py`) re-runs
+the verified read-only flows on a real phone, refreshes `verified_on`, and tags failures.
+
 Agents are pushed toward the registry rather than asked to remember it: `phone_elements`
 lists the installed flows for the app on screen, a 3+-step `phone_run_steps` success
 suggests saving the sequence, and a failed `phone_flow_run` keeps the failure so

@@ -201,6 +201,34 @@ PHONE_REMOTE_TOKEN="$TOKEN" "$MCP" flow run <app>/<flow> [--input K=V]... [--con
 untouched; an official flow that disappears from the index is removed locally, flows
 added with `flow add` are kept, and a local flow may not shadow an official id.
 
+### Compat: matching flows to the app version on the phone
+
+`flow list`, `flow list --json`, `phone_flow_list`, and the `registry` block in
+`phone_elements` report a `compat` verdict per flow, computed from the flow's
+`verified_on[].app_version` (and optional `app_version_min`) against the installed
+version. Apple system apps compare against the **iOS version**, because their own
+version string is a placeholder. Verdicts: `verified`, `untested-newer`,
+`incompatible`, `broken` (tag), `needs-verification` (tag), `draft`, `unknown`.
+`flow run` / `phone_flow_run` refuse `broken` and `incompatible` unless `--force` /
+`force=true`; `untested-newer` runs and asks for a checkpoint plus a `verified_on` update.
+
+Installed versions come from `GET /agent/apps` when the daemon provides it
+([#76](https://github.com/leeguooooo/iphone-use/issues/76)); with a loopback daemon the
+CLI falls back to `xcrun devicectl device info apps --include-all-apps` on this Mac
+(~2.5 s, cached 10 min in the store). `flow apps [--json]` prints the inventory.
+
+### Nightly re-verification
+
+`scripts/flow-reverify.py run` (on the Mac that owns the phone) runs every installed
+official flow that is hardware-verified, `read_only`/`navigation`, not tagged
+`no-canary`, and whose inputs are satisfiable from `example_inputs`, under the owner
+lease `flow-reverify`. Passing flows get their `verified_on` entry for this device
+refreshed; failing flows are tagged `needs-verification` and reported with
+`flow report`. One PR per night (`reverify/<date>`) on the registry; nothing merges
+itself. `enable` / `disable` / `status` manage a daily 03:30 launchd job; it skips
+quietly when another session owns the phone, a hold is active, or the phone is not
+drivable.
+
 Contributing back is one command each way (both use the user's `gh` login and are
 outward-facing, so the CLI/MCP never run them without being asked):
 
@@ -238,9 +266,9 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 | `phone_key` | `name` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
 | `phone_shortcut` | `name` | Direct/WDA system shortcut: `home` or `spotlight`; App Switcher is unsupported |
 | `phone_run_steps` | `steps` | Run up to 24 guarded action/wait steps in one MCP call; includes long-press/swipe/drag, strict `tap_locator`, bundle-id `launch_app`, full preflight, one WDA lock, and first-failure stop |
-| `phone_flow_list` | `category?`, `app?`, `verified?` | Installed registry flows with risk/verified/inputs — check this before exploring an app step by step |
+| `phone_flow_list` | `category?`, `app?`, `verified?` | Installed registry flows with risk/verified/compat/inputs — check this before exploring an app step by step |
 | `phone_flow_info` | `id` | One flow's metadata, inputs, and step templates (never runtime values) |
-| `phone_flow_run` | `id`, `inputs?`, `confirm?` | Run an installed flow once through Direct/WDA; `side_effect` flows require `confirm=true` |
+| `phone_flow_run` | `id`, `inputs?`, `confirm?`, `force?` | Run an installed flow once through Direct/WDA; `side_effect` needs `confirm=true`, `broken`/`incompatible` compat needs `force=true` |
 | `phone_flow_update` | — | Mirror the official registry (checksum + strict validation); network only, phone untouched |
 | `phone_flow_publish` | `source`, `id`, `app_name?`, `aliases?`, `note?`, `confirm` | Fork/branch/PR a validated flow into the registry via `gh`; `confirm=true` only after the user agreed |
 | `phone_flow_report` | `id`, `note?`, `confirm` | File a registry issue for a failed flow using the captured last failure (redacted); `confirm=true` only after the user agreed |

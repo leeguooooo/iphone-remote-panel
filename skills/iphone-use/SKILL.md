@@ -247,6 +247,20 @@ locator, publish the corrected file with a bumped `verified_on` and mention the
 issue. Do not report a phone that was merely locked, offline, or on the wrong
 app. Never replay a failed flow blindly — the first tap may already have acted.
 
+**Compat is computed for you.** Every flow in `flow list` / `phone_flow_list` /
+the `registry` block carries `compat`, derived from the flow's `verified_on`
+app version (the iOS version for Apple system apps) against what this phone has
+installed (`flow apps` shows the inventory):
+
+| compat | what you do |
+|---|---|
+| `verified` | run it |
+| `untested-newer` | the app updated since the last verification: run it, take one checkpoint screenshot, and if it worked publish the new `verified_on` |
+| `incompatible` / `broken` | do not run (`flow run` refuses without `--force`): explore by hand, then publish the fixed flow |
+| `needs-verification` | nightly re-verification failed and nobody fixed it yet: treat like broken, fixing it is the contribution |
+| `draft` | no hardware record: run with a checkpoint, then publish `verified_on` |
+| `unknown` | no version data (daemon has no `/agent/apps` and is not on loopback): behave as `untested-newer` |
+
 Flow labels are locale-specific (`locale`): an `en` flow fails closed on a
 Chinese phone with zero matches and no tap. Pick the variant that matches the
 device language or record one (`health/export-all-zh-cn`). Keep your own flows

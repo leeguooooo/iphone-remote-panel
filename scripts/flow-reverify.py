@@ -183,6 +183,8 @@ def run(a):
     st, why = preflight()
     if why:
         log(f"skip: {why}"); return 0
+    if a.dry_run and not st.get("drivable"):
+        log("dry run: phone not drivable; would request a bring-up"); return 0
     if not bring_up(st):
         log("skip: phone not drivable"); return 0
     apps = installed_versions()

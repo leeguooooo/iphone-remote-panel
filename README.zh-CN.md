@@ -237,6 +237,8 @@ flow 上的源元数据都是可选的：`app`（bundle id）、`category`、`ri
 
 格式里定死的规则：`--input KEY=VALUE` 只在本次运行解析，不写回文件；flow 在第一个失败步骤停下，不自动重试；命令行参数会留在 shell 历史里，所以参数不能装凭据、验证码或隐私内容，发送 / 发布 / 支付 / 删除类动作必须声明 `side_effect`。
 
+app 更新不会让源悄悄失效：每条 flow 记着它在哪个 app（系统 app 则是 iOS）版本上验过，CLI 读出手机上实际装的版本（`flow apps`），每次列表都给出 `compat` 结论：`verified`、`untested-newer`、`incompatible`、`broken`、`needs-verification`、`draft`、`unknown`。`flow run` 对 broken / incompatible 的 flow 不带 `--force` 就拒跑。夜间 canary（`scripts/flow-reverify.py`）在真机上重跑已验证的只读 flow，刷新 `verified_on`，失败的打标记。
+
 agent 不靠记性去查源，而是被推着走：`phone_elements` 直接列出屏幕上这个 app 已安装的 flow；`phone_run_steps` 成功跑完 3 步以上会提示把这段存成 flow；`phone_flow_run` 失败时保留现场，`phone_flow_report` 只需补一句说明。格式背后的调研见 [`docs/scripted-flows-research.html`](docs/scripted-flows-research.html)。
 
 ## 运维
