@@ -3479,6 +3479,38 @@ if [ "$SUPERVISOR_VERIFIED" != "1" ] || [ "$MJPEG_READY" != "1" ]; then
     die "WDA endpoint is up, but dedicated launchd supervision could not be verified"
 fi
 
+# Post-handoff verdict from one `/agent/status` body. Prints exactly one word:
+#   drivable   — the phone can act right now (setup and runtime both good)
+#   reachable  — the daemon reaches WDA through the relays; the phone cannot
+#                act yet (locked, automation pending, or the probe is running)
+#   down       — the daemon does not see WDA at all (real handoff failure)
+# `"wda"` is matched with its opening quote so `managed_wda` / `wda_actionable`
+# never satisfy it.
+_daemon_product_verdict() {
+    local status="${1:-}"
+    if printf '%s' "$status" | grep -Eq '"drivable"[[:space:]]*:[[:space:]]*true'; then
+        printf 'drivable\n'
+    elif printf '%s' "$status" | grep -Eq '"wda"[[:space:]]*:[[:space:]]*true'; then
+        printf 'reachable\n'
+    else
+        printf 'down\n'
+    fi
+}
+
+# Whether the daemon read the device as locked (`wda_locked:true`). `null`
+# (unknown) and `false` both return 1.
+_daemon_status_reports_locked() {
+    printf '%s' "${1:-}" | grep -Eq '"wda_locked"[[:space:]]*:[[:space:]]*true'
+}
+
+# Polling budget for the verdict: 0.5s per try. The daemon probes WDA every
+# ~2s with a 20s action timeout, so `wda:true` can take a couple of probe
+# rounds to surface even when the relay came up instantly.
+DAEMON_STATUS_MAX_TRIES="${DAEMON_STATUS_MAX_TRIES:-120}"
+# Once WDA is reachable, keep waiting this many tries for drivable before
+# accepting the handoff as-is (an unlocked phone usually clears within it).
+DAEMON_REACHABLE_GRACE_TRIES="${DAEMON_REACHABLE_GRACE_TRIES:-20}"
+
 # The daemon intentionally refreshes Direct health in the background: the first
 # /agent/status after a cold start can return its conservative cached `offline`
 # value while also starting the real WDA actionability probe. Do not announce a
@@ -3491,8 +3523,23 @@ if [ "$DAEMON_HTTP_READY" = "1" ]; then
     if [ -z "$DAEMON_AGENT_SECRET" ]; then
         DAEMON_AGENT_SECRET="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PHONE_REMOTE_PASSWORD" "$DAEMON_PLIST" 2>/dev/null || true)"
     fi
+    # Two different questions hide behind that status, and only the first is a
+    # setup verdict:
+    #   1. did the handoff work — does the daemon reach WDA through the relays
+    #      (`wda:true`)?
+    #   2. can the phone act right now — unlocked, automation mode granted
+    #      (`drivable:true`)?
+    # The daemon keeps `reconnecting=true` (hence drivable=false) until its own
+    # action-level probe succeeds, which a locked phone defers indefinitely.
+    # Gating on drivable therefore failed every daemon-initiated rebuild while
+    # the phone sat locked, and the rollback below killed a perfectly healthy
+    # WDA each time — 62 KeepAlive failures in one evening (2026-09-05).
+    # A reachable-but-locked phone is a runtime hint for the daemon and the web
+    # client, never a reason to tear the runner down.
     DAEMON_STATUS_TRIES=0
-    while [ "$DAEMON_STATUS_TRIES" -lt 30 ]; do
+    DAEMON_PRODUCT_VERDICT=down
+    DAEMON_REACHABLE_TRIES=0
+    while [ "$DAEMON_STATUS_TRIES" -lt "$DAEMON_STATUS_MAX_TRIES" ]; do
         DAEMON_STATUS_TRIES=$((DAEMON_STATUS_TRIES + 1))
         if [ -n "$DAEMON_AGENT_SECRET" ]; then
             DAEMON_STATUS="$(curl -sS -m 2 -H "Authorization: Bearer $DAEMON_AGENT_SECRET" \
@@ -3501,21 +3548,42 @@ if [ "$DAEMON_HTTP_READY" = "1" ]; then
             DAEMON_STATUS="$(curl -sS -m 2 \
                 "http://127.0.0.1:$DAEMON_PORT/agent/status" 2>/dev/null || true)"
         fi
-        if printf '%s' "$DAEMON_STATUS" \
-            | grep -Eq '"drivable"[[:space:]]*:[[:space:]]*true'; then
+        DAEMON_PRODUCT_VERDICT="$(_daemon_product_verdict "$DAEMON_STATUS")"
+        if [ "$DAEMON_PRODUCT_VERDICT" = "drivable" ]; then
             DAEMON_PRODUCT_READY=1
             break
         fi
+        if [ "$DAEMON_PRODUCT_VERDICT" = "reachable" ]; then
+            # Give an unlocked phone a moment to finish the action probe, then
+            # accept the handoff as-is instead of waiting out the whole budget.
+            DAEMON_REACHABLE_TRIES=$((DAEMON_REACHABLE_TRIES + 1))
+            if [ "$DAEMON_REACHABLE_TRIES" -ge "$DAEMON_REACHABLE_GRACE_TRIES" ]; then
+                DAEMON_PRODUCT_READY=1
+                break
+            fi
+        fi
         sleep 0.5
     done
+    DAEMON_LOCKED_HINT=0
+    if _daemon_status_reports_locked "$DAEMON_STATUS"; then
+        DAEMON_LOCKED_HINT=1
+    fi
     DAEMON_STATUS=""
     DAEMON_AGENT_SECRET=""
     if [ "$DAEMON_PRODUCT_READY" != "1" ]; then
-        _setstatus daemon-fail wda "daemon never reported drivable after verified WDA handoff"
-        die "WDA, relays, and launchd supervision are verified, but the daemon did not report drivable=true within 15s.
+        _setstatus daemon-fail wda "daemon never reached WDA after verified WDA handoff"
+        die "WDA, relays, and launchd supervision are verified, but the daemon did not report wda=true within $((DAEMON_STATUS_MAX_TRIES / 2))s.
    Inspect: ~/Library/Logs/iPhoneUse/iphone-use.err"
     fi
-    ok "daemon product status verified: drivable=true"
+    if [ "$DAEMON_PRODUCT_VERDICT" = "drivable" ]; then
+        ok "daemon product status verified: drivable=true"
+    elif [ "$DAEMON_LOCKED_HINT" = "1" ]; then
+        ok "daemon product status verified: WDA reachable through the relays"
+        warn "the iPhone is locked — unlock it once; the daemon keeps probing and reports drivable=true as soon as WDA can act"
+    else
+        ok "daemon product status verified: WDA reachable through the relays"
+        warn "WDA answers but cannot act yet (drivable=false) — keep the iPhone unlocked and awake; the daemon keeps probing"
+    fi
 fi
 
 if [ "$WDA_MARKER_REFRESH_ALLOWED" = "1" ]; then

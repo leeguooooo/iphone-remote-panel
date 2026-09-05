@@ -1486,6 +1486,7 @@ fn spawn_wda_readiness_wait(state: Arc<AppState>) {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(WDA_READINESS_TIMEOUT_SECS);
         let mut ready = false;
+        let mut locked = false;
         let mut seen_up = false;
         let mut setup_blocker = String::new();
         while tokio::time::Instant::now() < deadline && !state.wda_lifecycle.is_releasing() {
@@ -1519,12 +1520,25 @@ fn spawn_wda_readiness_wait(state: Arc<AppState>) {
                         ready = true;
                         break;
                     }
+                    if health.up && health.locked == Some(true) {
+                        // WDA is up and only the lock screen stands between it
+                        // and actions. That is the user's to clear, not the
+                        // daemon's, so the reconnect is complete: end the
+                        // lifecycle now instead of hiding the "unlock" hint
+                        // behind `reconnecting` for the rest of the budget.
+                        locked = true;
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         if ready {
             state.touch_activity();
+        } else if locked {
+            tracing::info!(
+                "managed WDA is up but the iPhone is locked — reconnect complete, unlock to drive"
+            );
         } else if !setup_blocker.is_empty() {
             tracing::warn!(
                 blocked_on = %setup_blocker,

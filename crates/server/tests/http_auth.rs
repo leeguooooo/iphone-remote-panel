@@ -2285,7 +2285,9 @@ fn direct_agent_input_does_not_replay_after_response_loss() {
 #[test]
 fn delayed_cold_wda_session_eventually_becomes_actionable() {
     block(async {
-        let (base, server) = mock_wda(4, |request, _| {
+        // /status, the session-less /wda/locked read, POST /session,
+        // session /wda/locked, /wda/apps/list.
+        let (base, server) = mock_wda(5, |request, _| {
             let (delay, body) = if request.starts_with("POST /session ") {
                 (
                     std::time::Duration::from_millis(1_800),

@@ -20,11 +20,25 @@ fn bounded_move_duration_ms(duration_ms: u64) -> u64 {
     duration_ms.clamp(80, 2_000)
 }
 
+/// Budget for the actionability half of [`WdaClient::probe_health`]. Every
+/// caller wraps the whole probe in a 15–20s timeout; a locked phone can stall
+/// `POST /session` for the reqwest client's full 20s, which used to make the
+/// *entire* observation vanish — a reachable runner then reported `wda:false`
+/// for the whole reconnect and setup-wda.sh's hand-off verdict failed on it.
+const ACTIONABILITY_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Budget for the session-less `GET /wda/locked` that precedes session
+/// creation in `probe_health`. It is a plain in-process read on the runner.
+const UNATTACHED_LOCK_BUDGET: Duration = Duration::from_secs(3);
+
 /// A WDA endpoint plus a lazily-created session id.
 pub struct WdaClient {
     base: String, // e.g. "http://192.168.0.190:8100"
     http: reqwest::Client,
     session: Option<String>,
+    /// How long `probe_health` waits for session/lock/apps-list before
+    /// settling on "up, not actionable". Tests shrink it.
+    actionability_budget: Duration,
 }
 
 impl WdaClient {
@@ -40,6 +54,7 @@ impl WdaClient {
             base: base_url.into().trim_end_matches('/').to_string(),
             http,
             session: None,
+            actionability_budget: ACTIONABILITY_PROBE_BUDGET,
         })
     }
 
@@ -73,6 +88,26 @@ impl WdaClient {
             .ok_or_else(|| anyhow!("GET /wda/locked returned a non-boolean value: {body}"))
     }
 
+    /// Session-less `GET /wda/locked`. WDA serves this route `withoutSession`
+    /// (FBCustomCommands), so it answers even while a locked phone would stall
+    /// `POST /session` — which is exactly when the answer matters most.
+    pub async fn locked_unattached(&self) -> Result<bool> {
+        let body = self
+            .http
+            .get(format!("{}/wda/locked", self.base))
+            .send()
+            .await
+            .context("GET /wda/locked (unattached)")?
+            .error_for_status()
+            .context("/wda/locked (unattached) status")?
+            .text()
+            .await
+            .context("parse /wda/locked (unattached)")?;
+        parse_wda_value(&body, "GET /wda/locked (unattached)")?
+            .as_bool()
+            .ok_or_else(|| anyhow!("GET /wda/locked returned a non-boolean value: {body}"))
+    }
+
     /// Probe WDA at the ACTION level, not just `/status`. `GET /status` lies:
     /// it keeps reporting `ready` even when every UI action fails Code=41 "Not
     /// authorized for performing UI testing actions" — the "zombie ready" state
@@ -92,6 +127,43 @@ impl WdaClient {
         if !self.is_up().await {
             return WdaHealth::down();
         }
+        // Reachability is settled here; everything below only decides
+        // actionability. Read the lock state without a session first: a
+        // locked phone stalls `POST /session`, so asking after would mean
+        // learning "locked" only from a timeout. Answered up front, a locked
+        // phone is reported immediately and session creation is skipped.
+        let unattached_locked =
+            tokio::time::timeout(UNATTACHED_LOCK_BUDGET, self.locked_unattached())
+                .await
+                .ok()
+                .and_then(Result::ok);
+        if unattached_locked == Some(true) {
+            self.invalidate_session();
+            return WdaHealth {
+                up: true,
+                actionable: false,
+                locked: Some(true),
+            };
+        }
+        // Session creation can still stall past the callers' probe budget.
+        // When it does, the honest answer is "up, not actionable" with
+        // whatever lock state the unattached read gave — not "no observation".
+        match tokio::time::timeout(self.actionability_budget, self.probe_actionability()).await {
+            Ok(health) => health,
+            Err(_) => {
+                self.invalidate_session();
+                WdaHealth {
+                    up: true,
+                    actionable: false,
+                    locked: unattached_locked,
+                }
+            }
+        }
+    }
+
+    /// The session-scoped half of [`Self::probe_health`]: lock state plus a
+    /// real testmanagerd-backed action. Always reports `up: true`.
+    async fn probe_actionability(&mut self) -> WdaHealth {
         let sid = match self.ensure_session().await {
             Ok(s) => s.to_string(),
             Err(_) => {
@@ -1724,7 +1796,9 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).unwrap();
+                // A client that timed out on this request has already hung
+                // up; the mock must not panic on that EPIPE.
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         (format!("http://{address}"), task)
@@ -1953,7 +2027,8 @@ mod tests {
 
     #[test]
     fn health_rejects_active_apps_http_200_error_envelope() {
-        let (base, server) = mock_wda(3, |request| {
+        // /status, unattached /wda/locked, session /wda/locked, /wda/apps/list
+        let (base, server) = mock_wda(4, |request| {
             if request.contains("/wda/locked") {
                 r#"{"value":false}"#.to_string()
             } else if request.contains("/wda/apps/list") {
@@ -1975,8 +2050,64 @@ mod tests {
     }
 
     #[test]
-    fn health_rejects_locked_device_even_when_active_apps_succeeds() {
+    fn health_reads_lock_state_without_a_session_and_skips_session_creation() {
+        let (base, server) = mock_wda(2, |request| {
+            assert!(!request.starts_with("POST /session "), "{request}");
+            if request.starts_with("GET /wda/locked ") {
+                r#"{"value":true}"#.to_string()
+            } else {
+                r#"{"value":{"ready":true}}"#.to_string()
+            }
+        });
+        let mut client = WdaClient::new(base).unwrap();
+
+        let health = block(client.probe_health());
+        server.join().unwrap();
+
+        assert!(health.up);
+        assert!(!health.actionable);
+        assert_eq!(health.locked, Some(true));
+        assert!(client.session.is_none());
+    }
+
+    #[test]
+    fn health_reports_up_but_not_actionable_when_session_creation_stalls() {
+        // A locked phone can hold `POST /session` for the client's full 20s
+        // timeout. The reachability verdict must survive that: `up:true`,
+        // `actionable:false`, lock state unknown — and the probe must return
+        // within its own budget so callers never discard the observation.
+        // /status, unattached /wda/locked (non-boolean → unknown), POST /session
         let (base, server) = mock_wda(3, |request| {
+            if request.starts_with("POST /session ") {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                r#"{"sessionId":"LATE","value":{}}"#.to_string()
+            } else {
+                r#"{"value":{"ready":true}}"#.to_string()
+            }
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        client.actionability_budget = std::time::Duration::from_millis(150);
+
+        let started = std::time::Instant::now();
+        let health = block(client.probe_health());
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(health.up);
+        assert!(!health.actionable);
+        assert_eq!(health.locked, None);
+        assert!(
+            elapsed < std::time::Duration::from_millis(550),
+            "{elapsed:?}"
+        );
+        assert!(client.session.is_none(), "stalled session must not be kept");
+    }
+
+    #[test]
+    fn health_rejects_locked_device_even_when_active_apps_succeeds() {
+        // The unattached lock read answers `true`, so the probe stops after
+        // /status + /wda/locked — no session traffic against a locked phone.
+        let (base, server) = mock_wda(2, |request| {
             if request.contains("/wda/locked") {
                 r#"{"value":true}"#.to_string()
             } else if request.contains("/wda/apps/list") {
