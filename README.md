@@ -398,7 +398,7 @@ upgrades, warning before any ad-hoc fallback.
 | `PHONE_REMOTE_UDID` | detected and persisted by the installer | Canonical iPhone for managed WDA and destructive commands. Requests cannot switch it; change the deployment and restart. Pass the same value as `WDA_UDID` to setup. |
 | `PHONE_REMOTE_WDA_URL` / `PHONE_REMOTE_WDA_MJPEG_URL` | `http://127.0.0.1:8100` / `:9100` | WDA control and MJPEG loopbacks. Direct fails closed when unreachable. |
 | `PHONE_REMOTE_WDA_MANAGED` | on for loopback endpoints | Whether this daemon owns the WDA supervisor/relay lifecycle. |
-| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | Stop WDA after this idle time; `0` keeps it running. |
+| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `0` | Stop WDA after this many idle seconds (`300` was the pre-v0.6.3 default); `0` keeps the runner up so a reconnect never rebuilds. |
 | `PHONE_REMOTE_OWNER_LEASE_SECS` | `300` | How long an `X-Phone-Owner` lease lives without a refreshing request. |
 | `WDA_RUNNER_ICON` | `auto` | Home-screen icon for the runner: `auto` reuses the app icon, `none` keeps WDA's placeholder, or a `.png`/`.icns` path. Failures only warn. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | WDA default 50 | Bound the accessibility snapshot depth (try `20`–`30` for apps with huge trees, issue #44). |

@@ -2776,12 +2776,20 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     {
         return; // external/remote WDA and mirror mode are never lifecycle-managed here
     }
+    // Off by default since v0.6.3. Stopping the runner after five idle minutes
+    // meant the next request paid a full bring-up (DDI wait, xcodebuild,
+    // install) — and on a locked phone it turned into the rebuild loop fixed in
+    // cc1d3fb. The runner idling costs a little battery; a human who wants the
+    // phone back uses the explicit release, and installs that prefer the old
+    // behaviour set PHONE_REMOTE_IDLE_RELEASE_SECS=300.
     let idle_secs = std::env::var("PHONE_REMOTE_IDLE_RELEASE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(300);
+        .unwrap_or(0);
     if idle_secs == 0 {
-        tracing::info!("idle auto-release disabled (PHONE_REMOTE_IDLE_RELEASE_SECS=0)");
+        tracing::info!(
+            "idle auto-release disabled (default; set PHONE_REMOTE_IDLE_RELEASE_SECS=<secs> to stop WDA after idling)"
+        );
         return;
     }
     let window = std::time::Duration::from_secs(idle_secs);

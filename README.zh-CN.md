@@ -268,7 +268,7 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.
 | `PHONE_REMOTE_UDID` | 安装器识别并持久化 | 托管 WDA 和破坏性命令使用的 canonical iPhone。请求不能临时换机，要改就改部署并重启。setup 时传同值 `WDA_UDID`。 |
 | `PHONE_REMOTE_WDA_URL` / `PHONE_REMOTE_WDA_MJPEG_URL` | `http://127.0.0.1:8100` / `:9100` | WDA 控制和 MJPEG 的 loopback。不可达时 Direct 直接失败。 |
 | `PHONE_REMOTE_WDA_MANAGED` | loopback 端点默认开 | daemon 是否负责 WDA supervisor / 中继的生命周期。 |
-| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `300` | 空闲多久后停 WDA；`0` 不停。 |
+| `PHONE_REMOTE_IDLE_RELEASE_SECS` | `0` | 空闲多少秒后停 WDA（v0.6.3 之前默认 `300`）；`0` 表示常驻，重连不用重建。 |
 | `PHONE_REMOTE_OWNER_LEASE_SECS` | `300` | `X-Phone-Owner` 租约在没有请求刷新时的存活时间。 |
 | `WDA_RUNNER_ICON` | `auto` | runner 的桌面图标：`auto` 用 app 图标，`none` 用 WDA 占位图，或给 `.png` / `.icns` 路径。失败只警告。 |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | WDA 默认 50 | 限制辅助功能快照深度（树特别大的 app 试 `20`–`30`，issue #44）。 |

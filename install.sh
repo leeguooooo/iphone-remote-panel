@@ -2403,7 +2403,6 @@ for ENV_KEY in \
     PHONE_REMOTE_CF_TURN_API_TOKEN \
     PHONE_REMOTE_CF_TURN_TTL_SECS \
     PHONE_REMOTE_FRONT_DEADLINE_MS \
-    PHONE_REMOTE_IDLE_RELEASE_SECS \
     PHONE_REMOTE_NO_UPDATE_CHECK \
     PHONE_REMOTE_SECRET \
     PHONE_REMOTE_SESSION_TTL \
@@ -2417,6 +2416,21 @@ for ENV_KEY in \
 do
     append_plist_env "$ENV_KEY" "$(env_or_existing "$ENV_KEY")"
 done
+# v0.6.3 stopped idling the runner out by default (a reconnect then never
+# rebuilds). Installs from before carry the old default, 300, in their plist;
+# copying it forward would pin the old behaviour on every upgrade. Treat a
+# stored 300 as "the old default" unless the operator sets the variable for
+# this run; any other stored value is a deliberate choice and is kept.
+IDLE_RELEASE_SECS="$(printenv PHONE_REMOTE_IDLE_RELEASE_SECS 2>/dev/null || true)"
+if [ -z "$IDLE_RELEASE_SECS" ]; then
+    IDLE_RELEASE_SECS="$(plist_env_get PHONE_REMOTE_IDLE_RELEASE_SECS)"
+    if [ "$IDLE_RELEASE_SECS" = "300" ]; then
+        info "Dropping the pre-v0.6.3 idle-release default (300s): the runner now stays up between requests."
+        info "  Set PHONE_REMOTE_IDLE_RELEASE_SECS=300 when re-running the installer to keep the old behaviour."
+        IDLE_RELEASE_SECS=""
+    fi
+fi
+append_plist_env PHONE_REMOTE_IDLE_RELEASE_SECS "$IDLE_RELEASE_SECS"
 for ENV_KEY in \
     WDA_REF \
     WDA_TEAM_ID \
