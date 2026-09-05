@@ -1,7 +1,9 @@
 {
-  "_comment": "Golden cases for instance derivation. crates/server/src/instance.rs and scripts/setup-wda.sh must agree on every row (#67).",
+  "_comment": "Golden cases for instance derivation. crates/server/src/instance.rs and scripts/setup-wda.sh must agree on every row (#67). state_dir_override must be absolute, free of . and .., not / or HOME, and neither equal to, inside, nor an ancestor of ~/.iphone-use; on-disk it must be a real directory (no symlink) owned by HOME's owner.",
   "name_pattern": "^[a-z][a-z0-9-]{0,31}$",
-  "reserved_names": ["wda"],
+  "reserved_names": [
+    "wda"
+  ],
   "cases": [
     {
       "name": "default",
@@ -47,5 +49,25 @@
       "_note": "PHONE_REMOTE_STATE_DIR overrides the derived state dir only"
     }
   ],
-  "invalid_names": ["wda", "Lab", "lab.1", "lab/1", "lab 1", "1lab", "-lab", "a-very-long-instance-name-that-exceeds-thirty-two", "default.wda"]
+  "invalid_names": [
+    "wda",
+    "Lab",
+    "lab.1",
+    "lab/1",
+    "lab 1",
+    "1lab",
+    "-lab",
+    "a-very-long-instance-name-that-exceeds-thirty-two",
+    "default.wda"
+  ],
+  "invalid_state_dir_overrides": [
+    "relative/dir",
+    "/",
+    "/Users/leo",
+    "/Users/leo/.iphone-use",
+    "/Users/leo/.iphone-use/instances",
+    "/Users/leo/.iphone-use/instances/other",
+    "/Users",
+    "/Volumes/fast/../iu-lab"
+  ]
 }

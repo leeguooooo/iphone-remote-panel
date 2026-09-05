@@ -221,6 +221,9 @@ fn serve() -> Result<()> {
     let instance = server::instance::install(
         server::instance::Instance::from_env().map_err(|error| anyhow::anyhow!(error))?,
     );
+    instance
+        .verify_on_disk()
+        .map_err(|error| anyhow::anyhow!(error))?;
     tracing::info!(
         "instance {} (state_dir={}, wda_label={})",
         instance.name,

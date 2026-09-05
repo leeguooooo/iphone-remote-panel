@@ -69,26 +69,82 @@ impl Instance {
                 format!("{DAEMON_LABEL}.wda.{name}"),
             )
         };
+        let state_dir = match state_dir_override {
+            Some(dir) => {
+                check_state_dir_override(&dir, &home)?;
+                dir
+            }
+            None => state_dir,
+        };
         Ok(Instance {
             name: name.to_string(),
             home,
-            state_dir: state_dir_override.unwrap_or(state_dir),
+            state_dir,
             daemon_label,
             wda_label,
         })
     }
 
+    /// Refuse a state directory the daemon must not own: one that exists but
+    /// is not a plain directory, is reached through a symlink, or belongs to
+    /// someone other than the owner of HOME. A missing directory is fine —
+    /// the helper creates it.
+    pub fn verify_on_disk(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = &self.state_dir;
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return Ok(());
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!("state dir {} is a symlink; refusing to use it", dir.display()));
+        }
+        if !meta.is_dir() {
+            return Err(format!("state dir {} is not a directory", dir.display()));
+        }
+        let canonical = dir
+            .canonicalize()
+            .map_err(|e| format!("state dir {}: {e}", dir.display()))?;
+        let home_canonical = self.home.canonicalize().unwrap_or_else(|_| self.home.clone());
+        let expected = if dir.starts_with(&self.home) {
+            home_canonical.join(dir.strip_prefix(&self.home).unwrap_or(dir))
+        } else {
+            dir.clone()
+        };
+        if canonical != expected {
+            return Err(format!(
+                "state dir {} resolves through a symlink to {}; refusing to use it",
+                dir.display(),
+                canonical.display()
+            ));
+        }
+        if let Ok(home_meta) = std::fs::metadata(&self.home) {
+            if home_meta.uid() != meta.uid() {
+                return Err(format!(
+                    "state dir {} is owned by uid {} but HOME by uid {}; refusing to use it",
+                    dir.display(),
+                    meta.uid(),
+                    home_meta.uid()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// From `PHONE_REMOTE_INSTANCE`, `HOME`, and an optional
-    /// `PHONE_REMOTE_STATE_DIR` override.
+    /// `PHONE_REMOTE_STATE_DIR` override. Values are taken verbatim: a name
+    /// with stray whitespace is invalid, not trimmed into a different
+    /// instance.
     pub fn from_env() -> Result<Instance, String> {
         let name = std::env::var("PHONE_REMOTE_INSTANCE").unwrap_or_default();
         let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return Err("HOME is not set; cannot derive the instance state dir".into());
+        }
         let state_dir = std::env::var("PHONE_REMOTE_STATE_DIR")
             .ok()
-            .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
-        Self::derive(name.trim(), home, state_dir)
+        Self::derive(&name, home, state_dir)
     }
 
     pub fn is_default(&self) -> bool {
@@ -122,6 +178,34 @@ impl Instance {
     }
 }
 
+/// Lexical rules for a `PHONE_REMOTE_STATE_DIR` override. The on-disk rules
+/// (symlink, ownership) are [`Instance::verify_on_disk`].
+///
+/// The override must be absolute and must stay clear of the `~/.iphone-use`
+/// namespace entirely — not equal to it, not inside it, not an ancestor of
+/// it — so it can neither alias the default instance nor overlap another
+/// named instance's derived directory. Nor may it be `/` or HOME.
+fn check_state_dir_override(dir: &Path, home: &Path) -> Result<(), String> {
+    let reject = |why: &str| Err(format!("PHONE_REMOTE_STATE_DIR={}: {why}", dir.display()));
+    if !dir.is_absolute() {
+        return reject("must be an absolute path");
+    }
+    if dir.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return reject("must not contain `.` or `..` components");
+    }
+    if dir == Path::new("/") {
+        return reject("must not be the filesystem root");
+    }
+    if dir == home {
+        return reject("must not be HOME itself");
+    }
+    let namespace = home.join(".iphone-use");
+    if dir == namespace || dir.starts_with(&namespace) || namespace.starts_with(dir) {
+        return reject("must not be, contain, or live inside ~/.iphone-use");
+    }
+    Ok(())
+}
+
 static CURRENT: OnceLock<Instance> = OnceLock::new();
 
 /// Pin the process-wide instance. Call once at startup, before anything reads
@@ -132,15 +216,14 @@ pub fn install(instance: Instance) -> &'static Instance {
     pinned
 }
 
-/// The process-wide instance. Derives the default from the environment when
-/// nothing was installed (tests, tools), so callers never see a missing value.
+/// The process-wide instance. Derives it from the environment when nothing
+/// was installed (tests, tools). Fails closed: an invalid instance name or
+/// state dir aborts rather than quietly falling back to the default — a
+/// daemon with a mistyped name must never drive the default phone.
 pub fn current() -> &'static Instance {
-    CURRENT.get_or_init(|| {
-        Instance::from_env().unwrap_or_else(|error| {
-            tracing::warn!("{error}; using the default instance");
-            Instance::derive("", std::env::var("HOME").unwrap_or_default(), None)
-                .expect("the default instance always derives")
-        })
+    CURRENT.get_or_init(|| match Instance::from_env() {
+        Ok(instance) => instance,
+        Err(error) => panic!("{error}"),
     })
 }
 
@@ -184,6 +267,47 @@ mod tests {
         assert_eq!(d.status_file(), PathBuf::from("/Users/leo/.iphone-use/wda-setup-status.json"));
         assert_eq!(d.intents_registry(), PathBuf::from("/Users/leo/.iphone-use/intents-registry.json"));
         assert_eq!(d.wda_label, "com.leeguoo.iphone-use.wda");
+    }
+
+    #[test]
+    fn a_state_dir_override_must_stay_out_of_the_namespace() {
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+        for bad in golden["invalid_state_dir_overrides"].as_array().unwrap() {
+            let bad = bad.as_str().unwrap();
+            assert!(
+                Instance::derive("lab", "/Users/leo", Some(PathBuf::from(bad))).is_err(),
+                "override {bad:?} must be rejected"
+            );
+        }
+        assert!(Instance::derive("lab", "/Users/leo", Some(PathBuf::from("/Volumes/fast/iu-lab"))).is_ok());
+    }
+
+    #[test]
+    fn whitespace_around_a_name_is_not_trimmed_into_another_instance() {
+        assert!(Instance::derive(" lab", "/Users/leo", None).is_err());
+        assert!(Instance::derive("lab ", "/Users/leo", None).is_err());
+        assert!(Instance::derive("default ", "/Users/leo", None).is_err());
+    }
+
+    #[test]
+    fn on_disk_verification_refuses_a_symlinked_state_dir() {
+        let root = std::env::temp_dir().join(format!("iu-inst-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut ok = Instance::derive("", &root, None).unwrap();
+        ok.state_dir = real.clone();
+        // A plain directory under a home that is itself reached via /tmp's
+        // symlink is compared through the same prefix, so it passes.
+        assert!(ok.verify_on_disk().is_ok(), "{:?}", ok.verify_on_disk());
+        let mut bad = ok.clone();
+        bad.state_dir = link;
+        assert!(bad.verify_on_disk().is_err());
+        let mut missing = ok.clone();
+        missing.state_dir = root.join("not-yet");
+        assert!(missing.verify_on_disk().is_ok(), "a missing dir is created later");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
