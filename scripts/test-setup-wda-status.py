@@ -64,15 +64,20 @@ class StatusTests(unittest.TestCase):
         self.fail('status did not reach expected state')
 
     def done(self, process, expected=0):
-        _, errors = process.communicate(timeout=8)
+        # Long enough for the heartbeat test's 27s body to finish after the
+        # beat was observed; only a hung helper ever waits this out.
+        _, errors = process.communicate(timeout=20)
         self.assertEqual(process.returncode, expected, errors)
 
     def test_heartbeat_during_synchronous_work_and_owner_identity(self):
-        process = self.start('_setstatus building "" "long prebuild"\nsleep 17\n_setstatus ready "" "ready"')
+        # The heartbeat fires every 15s. Waiting 16s left one second for the
+        # helper's python to start on a loaded CI runner, which is why this
+        # test failed on roughly every other release run; give it a real margin.
+        process = self.start('_setstatus building "" "long prebuild"\nsleep 27\n_setstatus ready "" "ready"')
         initial = self.state_when(lambda s: s['phase'] == 'building')
         self.assertEqual(initial['owner_pid'], process.pid)
         self.assertTrue(initial['owner_start'])
-        beat = self.state_when(lambda s: s['heartbeat_ts'] > initial['heartbeat_ts'], timeout=16)
+        beat = self.state_when(lambda s: s['heartbeat_ts'] > initial['heartbeat_ts'], timeout=25)
         self.assertEqual(beat['phase'], 'building')
         self.assertEqual(beat['phase_started_at'], initial['phase_started_at'])
         self.done(process)
