@@ -57,6 +57,12 @@ pub struct StatusResponse {
     /// `external`, or `mirror`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_owner: Option<String>,
+    /// Which session currently holds the phone lease (#72), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Seconds left on that lease (0 when nobody holds it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_lease_remaining_secs: Option<u64>,
     /// True when the daemon intentionally stopped WDA after an idle period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released: Option<bool>,

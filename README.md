@@ -252,13 +252,17 @@ replacement for it. It applies to `/control`, `/agent/input`, `/agent/mode`, and
 POST forms of `/agent/inbox` and `/agent/inbox/drain`; GET requests do not need it.
 The bundled web and MCP clients add the header automatically.
 
+**Phone owner lease (#72).** Send `X-Phone-Owner: <session-name>` (1–64 printable ASCII) on control requests to claim the phone for this session. While that lease is live (refreshed by each of your control requests; `PHONE_REMOTE_OWNER_LEASE_SECS`, default 300), control requests from any other session — or from a client that sends no owner — are refused with `409 phone_owned` naming the owner and the seconds left; read-only calls still work. The owner releases early with `POST /agent/owner {"release":true}`; the daemon clears the lease when it idle-releases the phone. `X-Phone-Owner-Takeover: 1` replaces a live lease and is logged — use it only for an abandoned session. The bundled MCP server sends `PHONE_REMOTE_OWNER` (else `mcp-<pid>`) automatically.
+
+
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/agent/status` | Health and readiness: check `backend`, `target_configured`, `managed_wda`, `managed_wda_pending`, `recovery_owner`, WDA readiness, lifecycle fields, viewer counts, `hint`, `setup_blocked_on`, `setup_phase`, and `setup_message`. |
+| `GET` | `/agent/status` | Health and readiness: check `backend`, `target_configured`, `managed_wda`, `managed_wda_pending`, `recovery_owner`, WDA readiness, lifecycle fields, viewer counts, `hint`, `setup_blocked_on`, `setup_phase`, and `setup_message`. | Includes `instance`, `udid`, and — when a session has claimed the phone — `owner` / `owner_lease_remaining_secs` (#72).
 | `GET` | `/agent/mjpeg` | Authenticated live on-device screen stream for browsers. |
 | `POST` | `/control` | Cookie-authenticated browser input. Requires the mutation header and a bounded `ttl_ms`; the only success body is `{"ok":true}`. |
 | `POST` | `/agent/mode` | Requires the mutation header and recovers only the configured backend: Direct accepts `{"mode":"agent"}`, Mirror accepts `{"mode":"mirror"}`. It never changes backend or the canonical UDID. |
 | `POST` | `/agent/hold` | Requires bearer auth and the mutation header. `{"secs":N}` keeps the phone from idle-release for N seconds (0 clears, max 14400); status echoes `hold_remaining_secs`. Use around a hands-on step so a human pause never triggers a 60–120s WDA rebuild. Answers `503 device_release_in_progress` (+`Retry-After`) if the idle watchdog is already stopping WDA — a hold is never accepted and then lost. |
+| `POST` | `/agent/owner` | Requires bearer auth and the mutation header. `{"release":true}` hands the phone lease back (only the current `X-Phone-Owner` may release a live lease). Status reports `owner` and `owner_lease_remaining_secs`. |
 | `POST` | `/agent/input` | Requires bearer auth and the mutation header. Sends tap / drag / long-press / scroll / text / `set_value` / `perform` / `alert` and currently supported WDA commands. `?return=delta` also returns the settled post-action element change (and any system `alert`) in the same response. |
 | `POST` | `/agent/actions` | Direct/WDA-only bounded multi-step execution. The whole batch is validated before dispatch; `wait_for` provides semantic checkpoints and the first failure prevents every later action. |
 | `GET` / `POST` | `/agent/inbox` | GET safely peeks at the legacy Shortcuts result queue. POST requires bearer auth plus the mutation header and appends one result. |

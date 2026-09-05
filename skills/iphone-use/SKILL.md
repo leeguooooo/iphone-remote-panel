@@ -279,6 +279,14 @@ documented or unit-tested action is not automatically a current-device proof:
   nothing** (same false-success class as switches). Dismiss/answer them with
   `{"type":"alert","button":"<exact button text>"}` or
   `{"type":"alert","action":"accept"|"dismiss"}`.
+- **One session per phone.** Name yourself on every state-changing request
+  with `X-Phone-Owner: <session-name>` (the MCP server does this for you, from
+  `PHONE_REMOTE_OWNER` or `mcp-<pid>`). Status then shows `owner` and
+  `owner_lease_remaining_secs`. If `owner` is someone else, do not drive the
+  phone: control calls answer `409 phone_owned` with the owner's name — wait,
+  ask that session to `POST /agent/owner {"release":true}` when it is done,
+  and never send `X-Phone-Owner-Takeover: 1` unless the user confirms the
+  other session is abandoned. Release your own lease when your task ends.
 - **Human-in-the-loop pauses** within a current user-requested phone task
   (waiting for the operator to type a password, approve a prompt, or fetch a
   code): use a bounded HTTP `POST /agent/hold {"secs":600}` before the pause

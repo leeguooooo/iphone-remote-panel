@@ -33,6 +33,9 @@ pub struct Config {
     pub session_ttl_secs: u64,
     /// Optional directory for persistent state files.
     pub state_dir: Option<PathBuf>,
+    /// How long a client's phone-owner lease outlives its last control
+    /// request (`PHONE_REMOTE_OWNER_LEASE_SECS`). Default: `300`.
+    pub owner_lease_secs: u64,
     /// Optional dedicated bearer token for agent/API access (`PHONE_REMOTE_AGENT_TOKEN`).
     ///
     /// When set, the agent `Authorization: Bearer <token>` path checks this value
@@ -124,6 +127,10 @@ impl Config {
             .filter(|secs| *secs > 0)
             .unwrap_or(DEFAULT_SESSION_TTL_SECS);
 
+        let owner_lease_secs = get("PHONE_REMOTE_OWNER_LEASE_SECS")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(300);
         let state_dir = get("PHONE_REMOTE_STATE_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
@@ -140,6 +147,7 @@ impl Config {
             secret,
             session_ttl_secs,
             state_dir,
+            owner_lease_secs,
             agent_token,
             device_udid,
         }

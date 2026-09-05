@@ -25,6 +25,9 @@ pub struct DaemonClient {
     client: Client,
     base_url: String,
     token: Option<String>,
+    /// Sent as `X-Phone-Owner` on every control request so the daemon can
+    /// refuse a second session that tries to drive the same phone (#72).
+    owner: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -118,6 +121,11 @@ impl DaemonClient {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
+            owner: std::env::var("PHONE_REMOTE_OWNER")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("mcp-{}", std::process::id())),
         }
     }
 
@@ -141,6 +149,33 @@ impl DaemonClient {
         }
     }
 
+    /// `POST /agent/hold {"secs":N}` — keep the phone from idle release for a
+    /// bounded human-in-the-loop pause; `0` clears the hold.
+    pub async fn hold(&self, secs: u64) -> anyhow::Result<String> {
+        let req = self
+            .auth(self.client.post(self.url("/agent/hold")))
+            .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(format!(r#"{{"secs":{secs}}}"#));
+        let resp = req.send().await?;
+        let resp = check_status(resp).await?;
+        Ok(resp.text().await?)
+    }
+
+    /// `POST /agent/owner {"release":true}` — hand the phone lease back.
+    pub async fn release_owner(&self) -> anyhow::Result<String> {
+        let req = self
+            .auth(self.client.post(self.url("/agent/owner")))
+            .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"release":true}"#);
+        let resp = req.send().await?;
+        let resp = check_status(resp).await?;
+        Ok(resp.text().await?)
+    }
+
     // -----------------------------------------------------------------------
     // Daemon API
     // -----------------------------------------------------------------------
@@ -160,6 +195,7 @@ impl DaemonClient {
         let req = self
             .auth(self.client.post(self.url("/agent/input")))
             .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(json);
         let resp = req.send().await?;
@@ -175,6 +211,7 @@ impl DaemonClient {
             .auth(self.client.post(self.url("/agent/actions")))
             .timeout(ACTIONS_TIMEOUT)
             .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         let resp = req.send().await?;
@@ -217,6 +254,7 @@ impl DaemonClient {
             .auth(self.client.post(self.url("/agent/mode")))
             .timeout(RECONNECT_TIMEOUT)
             .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"mode":"agent"}"#);
         let resp = req.send().await?;
@@ -239,6 +277,7 @@ impl DaemonClient {
         let req = self
             .auth(self.client.post(self.url("/agent/input")))
             .header("x-phone-control", "1")
+            .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(json);
         let resp = req.send().await?;

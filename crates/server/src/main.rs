@@ -428,6 +428,8 @@ fn serve() -> Result<()> {
         mjpeg_stream_activity: Arc::new(Mutex::new(std::collections::HashMap::new())),
         element_snapshots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         hold_until: Arc::new(Mutex::new(None)),
+        owner: Arc::new(Mutex::new(None)),
+        owner_lease_secs: cfg.owner_lease_secs,
     });
 
     run_server(cfg, state, dir)
@@ -1183,6 +1185,7 @@ mod tests {
             secret: None,
             session_ttl_secs: 28_800,
             state_dir: None,
+            owner_lease_secs: 300,
             agent_token: None,
             device_udid: None,
         }

@@ -109,6 +109,8 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
             std::collections::VecDeque::new(),
         )),
         hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        owner_lease_secs: 300,
     })
 }
 
@@ -259,6 +261,8 @@ fn build_state_with_agent_token(
             std::collections::VecDeque::new(),
         )),
         hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        owner_lease_secs: 300,
     })
 }
 
@@ -3112,4 +3116,84 @@ fn inbox_peek_does_not_drain() {
             assert!(String::from_utf8_lossy(&body).contains("\"k\":1"));
         }
     });
+}
+
+// Issue #72: two sessions drove the same phone at once. A client that names
+// itself owns the phone for the lease window; everyone else hears who does.
+#[test]
+fn a_second_session_is_refused_while_the_first_owns_the_phone() {
+    block(async {
+    let state = build_state_with_agent_token(None, Some("tok"));
+    let app = http::router(state.clone());
+    let hold = |owner: Option<&str>, takeover: bool| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/agent/hold")
+            .header("authorization", "Bearer tok")
+            .header("x-phone-control", "1")
+            .header("content-type", "application/json");
+        if let Some(owner) = owner {
+            req = req.header("x-phone-owner", owner);
+        }
+        if takeover {
+            req = req.header("x-phone-owner-takeover", "1");
+        }
+        req.body(Body::from(r#"{"secs":30}"#)).unwrap()
+    };
+
+    let first = app.clone().oneshot(hold(Some("bank-flow"), false)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app.clone().oneshot(hold(Some("tester"), false)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = second.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "phone_owned");
+    assert_eq!(json["owner"], "bank-flow");
+    assert_eq!(json["outcome"], "not_sent");
+
+    let anonymous = app.clone().oneshot(hold(None, false)).await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::CONFLICT, "legacy clients are refused too");
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/agent/status")
+                .header("authorization", "Bearer tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = status.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["owner"], "bank-flow");
+    assert!(json["owner_lease_remaining_secs"].as_u64().unwrap() > 250);
+
+    // The owner may hand the phone back; then anyone may take it.
+    let release = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/owner")
+                .header("authorization", "Bearer tok")
+                .header("x-phone-control", "1")
+                .header("x-phone-owner", "bank-flow")
+                .body(Body::from(r#"{"release":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(release.status(), StatusCode::OK);
+    let third = app.clone().oneshot(hold(Some("tester"), false)).await.unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+
+    // An explicit takeover replaces a live lease.
+    let taken = app.clone().oneshot(hold(Some("bank-flow"), true)).await.unwrap();
+    assert_eq!(taken.status(), StatusCode::OK);
+    let refused = app.oneshot(hold(Some("tester"), false)).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    })
 }

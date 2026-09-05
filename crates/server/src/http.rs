@@ -426,6 +426,230 @@ pub struct AppState {
     /// in the loop (typing a password, approving a prompt) otherwise trips the
     /// idle window and pays a 60–120s WDA rebuild every time.
     pub hold_until: Arc<Mutex<Option<Instant>>>,
+    /// Who is driving the phone right now (issue #72). A client that names
+    /// itself with `X-Phone-Owner` takes this lease on its first control
+    /// request and refreshes it on every one; other clients' control requests
+    /// are refused with 409 until the lease lapses, the owner releases it, or
+    /// the phone is idle-released. Clients that do not name themselves never
+    /// take a lease and are only refused while someone else holds one.
+    pub owner: Arc<Mutex<Option<PhoneOwner>>>,
+    /// How long an owner's lease outlives its last control request.
+    pub owner_lease_secs: u64,
+}
+
+/// The current phone owner: a client-chosen name and when it last acted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneOwner {
+    pub name: String,
+    pub last_seen: Instant,
+}
+
+/// What a control request asked for, ownership-wise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerClaim<'a> {
+    /// No `X-Phone-Owner` header: a legacy or one-off client.
+    Anonymous,
+    /// `X-Phone-Owner: name`.
+    Named(&'a str),
+    /// `X-Phone-Owner: name` + `X-Phone-Owner-Takeover: 1`.
+    Takeover(&'a str),
+}
+
+/// Why a control request was refused on ownership grounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedByOther {
+    owner: String,
+    lease_remaining_secs: u64,
+}
+
+/// Arbitrate one control request against the current lease and, when it is
+/// admitted, record it. Pure over its inputs so the rules are testable:
+///
+/// - no live lease: a named client takes it; an anonymous one leaves it empty;
+/// - live lease, same name: refreshed;
+/// - live lease, other name or anonymous: refused — unless the request is an
+///   explicit takeover, which replaces the lease (the caller logs it).
+fn arbitrate_owner(
+    slot: &mut Option<PhoneOwner>,
+    claim: OwnerClaim<'_>,
+    now: Instant,
+    lease: std::time::Duration,
+) -> Result<(), OwnedByOther> {
+    let live = slot
+        .as_ref()
+        .filter(|current| now.saturating_duration_since(current.last_seen) < lease)
+        .cloned();
+    match (live, claim) {
+        (None, OwnerClaim::Anonymous) => {
+            *slot = None;
+            Ok(())
+        }
+        (None, OwnerClaim::Named(name) | OwnerClaim::Takeover(name)) => {
+            *slot = Some(PhoneOwner { name: name.to_string(), last_seen: now });
+            Ok(())
+        }
+        (Some(current), OwnerClaim::Named(name)) if current.name == name => {
+            *slot = Some(PhoneOwner { name: current.name, last_seen: now });
+            Ok(())
+        }
+        (Some(_), OwnerClaim::Takeover(name)) => {
+            *slot = Some(PhoneOwner { name: name.to_string(), last_seen: now });
+            Ok(())
+        }
+        (Some(current), _) => Err(OwnedByOther {
+            lease_remaining_secs: lease
+                .saturating_sub(now.saturating_duration_since(current.last_seen))
+                .as_secs(),
+            owner: current.name,
+        }),
+    }
+}
+
+/// A usable owner name: 1..=64 visible ASCII characters, no quotes.
+fn valid_owner_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+        && !name.contains('"')
+}
+
+fn owner_claim_from_headers(headers: &HeaderMap) -> Result<OwnerClaim<'_>, Response> {
+    let Some(raw) = headers.get("x-phone-owner") else {
+        return Ok(OwnerClaim::Anonymous);
+    };
+    let name = raw.to_str().ok().map(str::trim).unwrap_or_default();
+    if !valid_owner_name(name) {
+        return Err(with_security_headers(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"invalid_owner","hint":"X-Phone-Owner must be 1-64 printable ASCII characters without quotes"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        ));
+    }
+    let takeover = headers
+        .get("x-phone-owner-takeover")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    Ok(if takeover { OwnerClaim::Takeover(name) } else { OwnerClaim::Named(name) })
+}
+
+/// Gate a device-control request on the phone owner lease. Call right after
+/// the mutation-header check in every handler that drives the phone.
+fn claim_phone_owner(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let claim = owner_claim_from_headers(headers)?;
+    let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+    let mut slot = recover(state.owner.lock());
+    let previous = slot.clone();
+    let outcome = arbitrate_owner(&mut slot, claim, Instant::now(), lease);
+    drop(slot);
+    match outcome {
+        Ok(()) => {
+            if let (OwnerClaim::Takeover(name), Some(prev)) = (claim, previous) {
+                if prev.name != name {
+                    tracing::warn!("phone owner lease taken over: {} -> {name}", prev.name);
+                }
+            }
+            Ok(())
+        }
+        Err(other) => Err(with_security_headers(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, other.lease_remaining_secs.max(1).to_string())
+                .body(Body::from(format!(
+                    r#"{{"ok":false,"error":"phone_owned","owner":{},"owner_lease_remaining_secs":{},"outcome":"not_sent","hint":"another session is driving this phone; wait for its lease to lapse, ask it to release via POST /agent/owner, or send X-Phone-Owner-Takeover: 1 only if you are sure it is abandoned"}}"#,
+                    serde_json::to_string(&other.owner).unwrap_or_else(|_| "null".into()),
+                    other.lease_remaining_secs
+                )))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        )),
+    }
+}
+
+/// The current owner name and the seconds left on its lease (0 when none).
+fn owner_status(state: &AppState) -> (Option<String>, u64) {
+    let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+    let now = Instant::now();
+    match recover(state.owner.lock()).as_ref() {
+        Some(owner) if now.saturating_duration_since(owner.last_seen) < lease => (
+            Some(owner.name.clone()),
+            lease
+                .saturating_sub(now.saturating_duration_since(owner.last_seen))
+                .as_secs(),
+        ),
+        _ => (None, 0),
+    }
+}
+
+/// `POST /agent/owner {"release":true}` — give up the lease. Only the current
+/// owner (matching `X-Phone-Owner`) may release it; anyone may release a
+/// lapsed one. Never takes a lease itself.
+async fn agent_owner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let release = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("release").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    if !release {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"ok":false,"error":"invalid_owner_request","hint":"send {"release":true}"}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    let claim = match owner_claim_from_headers(&headers) {
+        Ok(claim) => claim,
+        Err(response) => return response,
+    };
+    let (current, remaining) = owner_status(&state);
+    let allowed = match (&current, claim) {
+        (None, _) => true,
+        (Some(owner), OwnerClaim::Named(name) | OwnerClaim::Takeover(name)) => owner == name,
+        (Some(_), OwnerClaim::Anonymous) => false,
+    };
+    if !allowed {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"ok":false,"error":"phone_owned","owner":{},"owner_lease_remaining_secs":{remaining}}}"#,
+                    serde_json::to_string(&current).unwrap_or_else(|_| "null".into())
+                )))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    *recover(state.owner.lock()) = None;
+    with_security_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"ok":true,"owner":null}"#))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 /// The bounded ring behind [`AppState::element_snapshots`]: recently served
@@ -615,6 +839,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/intents", get(agent_intents))
         .route("/agent/intent", post(agent_intent))
         .route("/agent/hold", post(agent_hold))
+        .route("/agent/owner", post(agent_owner))
         .with_state(state)
 }
 
@@ -1594,10 +1819,15 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","instance":"{}","udid":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
+        {
+            let (owner, _) = owner_status(&state);
+            serde_json::to_string(&owner).unwrap_or_else(|_| "null".into())
+        },
+        owner_status(&state).1,
         state.device_udid.is_some(),
         state.managed_wda,
         state.managed_wda_pending,
@@ -2635,6 +2865,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     state.wda_actionable.store(false, Ordering::Relaxed);
                     *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
                     state.released.store(true, Ordering::Release);
+                    *recover(state.owner.lock()) = None;
                     release_backoff_until = None;
                     release_failures = 0;
                     tracing::info!("phone released: supervisor stopped while WDA was already down");
@@ -2729,6 +2960,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 state.wda_actionable.store(false, Ordering::Relaxed);
                 *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
                 state.released.store(true, Ordering::Release);
+                *recover(state.owner.lock()) = None;
                 was_up = false;
                 release_backoff_until = None;
                 release_failures = 0;
@@ -2787,6 +3019,9 @@ async fn agent_mode(
     }
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
+    }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
     let mode = parsed
@@ -4983,6 +5218,9 @@ async fn direct_control(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
+    }
     if state.backend != crate::config::DeviceBackend::Direct {
         return with_security_headers(
             (
@@ -5865,6 +6103,9 @@ async fn agent_actions(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
+    }
     if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
         return agent_actions_invalid(format!(
             "request body exceeds {AGENT_ACTIONS_MAX_BODY_BYTES} bytes"
@@ -6361,6 +6602,9 @@ async fn agent_input(
     }
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
+    }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
     }
     // The MCP client waits 30 seconds. Keep the daemon's complete Direct WDA
     // budget comfortably below that so the authoritative HTTP outcome arrives
@@ -7104,6 +7348,9 @@ async fn agent_hold(
     }
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
+    }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
     }
     let secs = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -8150,6 +8397,9 @@ async fn agent_intent(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
+    if let Err(refused) = claim_phone_owner(&state, &headers) {
+        return refused;
+    }
     // Same total server deadline as `/agent/input`: the authoritative outcome
     // must arrive before a 30-second MCP client can abandon the call.
     let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
@@ -9091,6 +9341,54 @@ mod tests {
         assert_eq!(pick_scroll_container(row, &[[21.0, 301.0, 348.0, 42.0]]), Some(0));
         assert_eq!(pick_scroll_container(row, &[[24.0, 300.0, 350.0, 44.0]]), None);
         assert_eq!(pick_scroll_container(row, &[[f64::NAN, 0.0, 400.0, 900.0]]), None);
+    }
+
+    // Issue #72: two sessions drove the same phone at once. The lease makes
+    // the second one hear "no, and here is who" instead of stepping on the
+    // first.
+    #[test]
+    fn a_named_client_takes_the_lease_and_others_are_refused_until_it_lapses() {
+        let lease = std::time::Duration::from_secs(300);
+        let t0 = Instant::now();
+        let mut slot = None;
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("bank-flow"), t0, lease).is_ok());
+        let refused = arbitrate_owner(&mut slot, OwnerClaim::Named("tester"), t0 + std::time::Duration::from_secs(10), lease)
+            .expect_err("a second session must be refused");
+        assert_eq!(refused.owner, "bank-flow");
+        assert_eq!(refused.lease_remaining_secs, 290);
+        assert!(
+            arbitrate_owner(&mut slot, OwnerClaim::Anonymous, t0 + std::time::Duration::from_secs(10), lease).is_err(),
+            "an unnamed client is refused while someone holds the phone"
+        );
+        // The owner keeps refreshing.
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("bank-flow"), t0 + std::time::Duration::from_secs(200), lease).is_ok());
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("tester"), t0 + std::time::Duration::from_secs(480), lease).is_err());
+        // ... and once it stops, the lease lapses and the next client takes it.
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("tester"), t0 + std::time::Duration::from_secs(501), lease).is_ok());
+        assert_eq!(slot.as_ref().map(|o| o.name.as_str()), Some("tester"));
+    }
+
+    #[test]
+    fn anonymous_clients_never_hold_a_lease_and_a_takeover_replaces_one() {
+        let lease = std::time::Duration::from_secs(300);
+        let t0 = Instant::now();
+        let mut slot = None;
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Anonymous, t0, lease).is_ok());
+        assert!(slot.is_none(), "legacy clients leave the phone unowned");
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("a"), t0, lease).is_ok());
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Takeover("b"), t0 + std::time::Duration::from_secs(1), lease).is_ok());
+        assert_eq!(slot.as_ref().map(|o| o.name.as_str()), Some("b"));
+        assert!(arbitrate_owner(&mut slot, OwnerClaim::Named("a"), t0 + std::time::Duration::from_secs(2), lease).is_err());
+    }
+
+    #[test]
+    fn owner_names_are_short_printable_ascii() {
+        assert!(valid_owner_name("bank-flow"));
+        assert!(valid_owner_name("mcp 12345"));
+        assert!(!valid_owner_name(""));
+        assert!(!valid_owner_name("a\"b"));
+        assert!(!valid_owner_name("名字"));
+        assert!(!valid_owner_name(&"x".repeat(65)));
     }
 
     #[test]

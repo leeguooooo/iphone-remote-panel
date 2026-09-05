@@ -370,6 +370,13 @@ pub struct PhoneHandler {
     last_flow_failure: std::sync::Arc<std::sync::Mutex<Option<crate::contrib::ReportContext>>>,
 }
 
+/// Parameters for [`PhoneHandler::phone_hold`].
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+pub struct HoldParams {
+    /// Seconds to keep the phone (0 clears the hold; at most 14400).
+    pub secs: u64,
+}
+
 impl PhoneHandler {
     pub fn new(daemon: DaemonClient) -> Self {
         Self {
@@ -583,7 +590,10 @@ impl PhoneHandler {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "Read Direct/WDA status without taking control. The JSON preserves \
+        description = "Read Direct/WDA status without taking control. `owner` names the \
+        session currently driving the phone (this session presents PHONE_REMOTE_OWNER, \
+        else mcp-<pid>); if it is someone else, do not drive the phone — control calls \
+        will be refused with phone_owned. The JSON preserves \
         backend, target_configured, managed_wda, managed_wda_pending, recovery_owner, \
         device_state, screen_state, wda, wda_actionable, locked, drivable, released, \
         hint, setup_blocked_on, setup_phase, and setup_message. Gate actions on drivable=true, not on \
@@ -711,6 +721,34 @@ impl PhoneHandler {
             Err(e) => {
                 CallToolResult::error(vec![Content::text(format!("reconnect failed: {e:#}"))])
             }
+        }
+    }
+
+    #[tool(
+        description = "Keep the phone for a bounded human-in-the-loop pause inside the \
+        current user-requested task (the operator types a PIN, approves a prompt, \
+        fetches a code): the idle watchdog will not release it for `secs` seconds \
+        (0 clears the hold; max 14400). Not for initialization, health checks, or \
+        keeping the phone ready; clear it when the step is done. Fails with \
+        device_release_in_progress if the daemon is already releasing, and with \
+        phone_owned if another session holds the phone lease."
+    )]
+    async fn phone_hold(&self, Parameters(params): Parameters<HoldParams>) -> CallToolResult {
+        match self.daemon.hold(params.secs).await {
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!("hold failed: {e:#}"))]),
+        }
+    }
+
+    #[tool(
+        description = "Hand the phone lease back when this session's phone task is \
+        finished, so another session may drive it without waiting for the lease \
+        to lapse. Only the current owner can release."
+    )]
+    async fn phone_release_owner(&self) -> CallToolResult {
+        match self.daemon.release_owner().await {
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!("release failed: {e:#}"))]),
         }
     }
 
