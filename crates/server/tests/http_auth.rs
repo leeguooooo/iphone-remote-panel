@@ -2329,6 +2329,63 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
 }
 
 #[test]
+fn status_clears_a_reconnect_that_an_actionable_runner_has_overtaken() {
+    block(async {
+        // WDA answers /status and a real action, i.e. the bring-up the
+        // reconnect was waiting for already succeeded.
+        let (base, server) = mock_wda(64, |request, _| {
+            let body = if request.contains("/wda/locked") {
+                r#"{"value":false}"#
+            } else if request.contains("/wda/apps/list") {
+                r#"{"value":[{"bundleId":"com.apple.springboard","pid":1}]}"#
+            } else if request.starts_with("POST /session ") {
+                r#"{"value":{"sessionId":"SESSION"}}"#
+            } else {
+                r#"{"value":{"ready":true}}"#
+            };
+            Some((std::time::Duration::ZERO, body.to_string()))
+        });
+        let state = build_state_with_wda(&base);
+        let app = http::router(state.clone());
+        // Prime the cached health so the first status read sees actionable.
+        for _ in 0..3 {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/agent/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+        assert!(state.wda_actionable.load(std::sync::atomic::Ordering::Acquire));
+
+        // A reconnect whose readiness task never finished.
+        assert!(state.wda_lifecycle.begin_reconnecting_for_test());
+        assert!(state.wda_lifecycle.is_reconnecting());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        drop(server);
+
+        assert!(text.contains(r#""reconnecting":false"#), "{text}");
+        assert!(!state.wda_lifecycle.is_reconnecting());
+    });
+}
+
+#[test]
 fn human_handoff_is_refused_when_wda_is_not_daemon_managed() {
     block(async {
         let app = http::router(build_state(None));

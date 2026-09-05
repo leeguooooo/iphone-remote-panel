@@ -276,6 +276,38 @@ impl WdaLifecycle {
         self.current() == WdaLifecycleTransition::Reconnecting
     }
 
+    /// End a reconnect that reality has already overtaken.
+    ///
+    /// The readiness task normally clears the flag when its probe succeeds,
+    /// but it is one `tokio::spawn` away from the truth: if it is starved of
+    /// the WDA mutex, cancelled, or otherwise never reaches its epilogue, the
+    /// flag stays set forever. `drivable` is false while it is, so a
+    /// completely healthy runner reads as "still reconnecting" — the browser
+    /// shows a spinner and every agent action is refused, with nothing to
+    /// recover from.
+    ///
+    /// Observed on hardware 2026-09-06: WDA up and action-level actionable for
+    /// 7+ minutes with `reconnecting:true` and `drivable:false`.
+    ///
+    /// Only a Reconnecting→Active transition is attempted, so a release in
+    /// progress is never disturbed and a concurrent finish just loses the CAS.
+    /// Test-only: enter the Reconnecting state without a bring-up.
+    #[doc(hidden)]
+    pub fn begin_reconnecting_for_test(&self) -> bool {
+        self.try_begin_reconnecting()
+    }
+
+    fn finish_reconnect_if_stale(&self) -> bool {
+        self.transition
+            .compare_exchange(
+                WdaLifecycleTransition::Reconnecting as u8,
+                WdaLifecycleTransition::Active as u8,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn is_transitioning(&self) -> bool {
         self.current() != WdaLifecycleTransition::Active
     }
@@ -1623,6 +1655,21 @@ async fn agent_status(
     };
     let wda = health.up;
     let wda_actionable = health.actionable;
+    // An actionable runner means the bring-up this reconnect was waiting for
+    // has already succeeded. Clear a flag its own task failed to clear, so
+    // `drivable` below reflects the device instead of a lost bookkeeping
+    // update. Re-read the flag afterwards: the response must not claim a
+    // transition that no longer exists.
+    let reconnecting = if reconnecting && wda_actionable && !releasing {
+        if state.wda_lifecycle.finish_reconnect_if_stale() {
+            tracing::warn!(
+                "cleared a stale reconnect: WDA is actionable but the readiness task never finished"
+            );
+        }
+        state.wda_lifecycle.is_reconnecting()
+    } else {
+        reconnecting
+    };
     let wda_locked = match health.locked {
         Some(true) => "true",
         Some(false) => "false",
