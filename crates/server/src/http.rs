@@ -4152,15 +4152,12 @@ const SCROLLABLE_KINDS: [&str; 6] = [
     "WebView",
 ];
 
-/// The rect of the smallest live scroll container enclosing `row`, if any.
+/// Rects of every live scroll container on screen.
 ///
-/// Containers are looked up live rather than in the snapshot because the
-/// flattened tree drops label-less non-interactive nodes — which is exactly
-/// what most tables and scroll views are.
-async fn scroll_container_rect(
-    w: &mut crate::wda::WdaClient,
-    row: &crate::wda::ElementRow,
-) -> Option<[f64; 4]> {
+/// Looked up live rather than in the snapshot because the flattened tree drops
+/// label-less non-interactive nodes — which is exactly what most tables and
+/// scroll views are.
+async fn scroll_container_candidates(w: &mut crate::wda::WdaClient) -> Vec<[f64; 4]> {
     let mut candidates = Vec::new();
     for kind in SCROLLABLE_KINDS {
         let Ok(ids) = w
@@ -4175,7 +4172,7 @@ async fn scroll_container_rect(
             }
         }
     }
-    pick_scroll_container(row.rect, &candidates).map(|index| candidates[index])
+    candidates
 }
 
 /// Index of the smallest candidate rect that fully contains `inner` (2pt
@@ -4223,7 +4220,24 @@ async fn scroll_snapshot_element(
     let [x, y, width, height] = if SCROLLABLE_KINDS.contains(&row.kind.as_str()) {
         row.rect
     } else {
-        scroll_container_rect(w, row).await.unwrap_or(row.rect)
+        // Live scroll views first, then any snapshot row that encloses the
+        // target — a WKWebView <select> menu, for one, lives inside a plain
+        // `Other` (hardware-verified: swiping inside that Other scrolls ~20
+        // options per call and keeps the menu open; a page-level swipe
+        // dismisses it). Smallest enclosing rect wins either way.
+        let mut candidates = scroll_container_candidates(w).await;
+        candidates.extend(
+            rows.iter()
+                .enumerate()
+                .filter(|(i, other)| {
+                    *i != index
+                        && (other.kind == "Other" || SCROLLABLE_KINDS.contains(&other.kind.as_str()))
+                })
+                .map(|(_, other)| other.rect),
+        );
+        pick_scroll_container(row.rect, &candidates)
+            .map(|i| candidates[i])
+            .unwrap_or(row.rect)
     };
     // A meaningful in-element gesture needs room for both endpoints.
     if ![x, y, width, height].into_iter().all(f64::is_finite) || width < 8.0 || height < 8.0 {
