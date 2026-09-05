@@ -216,6 +216,17 @@ fn serve() -> Result<()> {
     // 1. Resolve the backend before touching any Mac capture/input API. Direct is
     //    the default and must start without Screen Recording or Accessibility.
     let cfg = Config::from_env();
+    // Which daemon this is (#67): pin the instance before anything derives a
+    // path or a launchd label from it.
+    let instance = server::instance::install(
+        server::instance::Instance::from_env().map_err(|error| anyhow::anyhow!(error))?,
+    );
+    tracing::info!(
+        "instance {} (state_dir={}, wda_label={})",
+        instance.name,
+        instance.state_dir.display(),
+        instance.wda_label
+    );
 
     // 2. The legacy mirror backend alone needs Mac TCC + AppKit.
     if cfg.backend == DeviceBackend::Mirror {

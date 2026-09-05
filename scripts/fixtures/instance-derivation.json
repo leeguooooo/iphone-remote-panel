@@ -1,0 +1,51 @@
+{
+  "_comment": "Golden cases for instance derivation. crates/server/src/instance.rs and scripts/setup-wda.sh must agree on every row (#67).",
+  "name_pattern": "^[a-z][a-z0-9-]{0,31}$",
+  "reserved_names": ["wda"],
+  "cases": [
+    {
+      "name": "default",
+      "home": "/Users/leo",
+      "state_dir": "/Users/leo/.iphone-use",
+      "daemon_label": "com.leeguoo.iphone-use",
+      "wda_label": "com.leeguoo.iphone-use.wda",
+      "wda_plist": "/Users/leo/Library/LaunchAgents/com.leeguoo.iphone-use.wda.plist"
+    },
+    {
+      "name": "",
+      "home": "/Users/leo",
+      "state_dir": "/Users/leo/.iphone-use",
+      "daemon_label": "com.leeguoo.iphone-use",
+      "wda_label": "com.leeguoo.iphone-use.wda",
+      "wda_plist": "/Users/leo/Library/LaunchAgents/com.leeguoo.iphone-use.wda.plist",
+      "_note": "unset or empty means default"
+    },
+    {
+      "name": "lab",
+      "home": "/Users/leo",
+      "state_dir": "/Users/leo/.iphone-use/instances/lab",
+      "daemon_label": "com.leeguoo.iphone-use.lab",
+      "wda_label": "com.leeguoo.iphone-use.wda.lab",
+      "wda_plist": "/Users/leo/Library/LaunchAgents/com.leeguoo.iphone-use.wda.lab.plist"
+    },
+    {
+      "name": "iphone-14",
+      "home": "/Users/leo",
+      "state_dir": "/Users/leo/.iphone-use/instances/iphone-14",
+      "daemon_label": "com.leeguoo.iphone-use.iphone-14",
+      "wda_label": "com.leeguoo.iphone-use.wda.iphone-14",
+      "wda_plist": "/Users/leo/Library/LaunchAgents/com.leeguoo.iphone-use.wda.iphone-14.plist"
+    },
+    {
+      "name": "lab",
+      "home": "/Users/leo",
+      "state_dir_override": "/Volumes/fast/iu-lab",
+      "state_dir": "/Volumes/fast/iu-lab",
+      "daemon_label": "com.leeguoo.iphone-use.lab",
+      "wda_label": "com.leeguoo.iphone-use.wda.lab",
+      "wda_plist": "/Users/leo/Library/LaunchAgents/com.leeguoo.iphone-use.wda.lab.plist",
+      "_note": "PHONE_REMOTE_STATE_DIR overrides the derived state dir only"
+    }
+  ],
+  "invalid_names": ["wda", "Lab", "lab.1", "lab/1", "lab 1", "1lab", "-lab", "a-very-long-instance-name-that-exceeds-thirty-two", "default.wda"]
+}

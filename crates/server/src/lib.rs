@@ -1,6 +1,7 @@
 pub mod config;
 pub mod http;
 pub mod input_bridge;
+pub mod instance;
 pub mod macos;
 pub mod protocol;
 pub mod runtime_dir;

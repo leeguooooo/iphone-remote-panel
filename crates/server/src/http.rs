@@ -1594,8 +1594,10 @@ async fn agent_status(
         "offline"
     };
     let body = format!(
-        r#"{{"ok":true,"backend":"{}","target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"{}","instance":"{}","udid":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","phone_target":{phone_target},"wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"human_active":{human_active},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","mirror_state":"{mirror_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"hold_remaining_secs":{hold_remaining},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         state.backend.as_str(),
+        crate::instance::current().name,
+        serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
         state.device_udid.is_some(),
         state.managed_wda,
         state.managed_wda_pending,
@@ -1622,11 +1624,7 @@ fn read_setup_blocked_on() -> String {
     if !blocker.is_empty() {
         return blocker;
     }
-    let home = match std::env::var("HOME") {
-        Ok(home) => home,
-        Err(_) => return String::new(),
-    };
-    read_recent_setup_log_blocker(&format!("{home}/.iphone-use/wda-agent.log"))
+    read_recent_setup_log_blocker(&crate::instance::Instance::path_str(&crate::instance::current().agent_log()))
 }
 
 /// Read only the current helper's timestamped structured prerequisite state.
@@ -1665,11 +1663,7 @@ struct WdaSetupStatus {
 }
 
 fn read_structured_setup_status() -> Option<WdaSetupStatus> {
-    let home = match std::env::var("HOME") {
-        Ok(home) => home,
-        Err(_) => return None,
-    };
-    let status_path = format!("{home}/.iphone-use/wda-setup-status.json");
+    let status_path = crate::instance::Instance::path_str(&crate::instance::current().status_file());
     std::fs::read_to_string(status_path)
         .ok()
         .and_then(|txt| parse_setup_status(&txt, now_secs()))
@@ -1928,8 +1922,7 @@ fn derive_wda_build(
 /// reported as a live blocker. Build state needs the opposite: a stale
 /// `building` is exactly the signal that the helper died mid-build.
 fn read_raw_setup_status() -> Option<WdaSetupStatus> {
-    let home = std::env::var("HOME").ok()?;
-    let txt = std::fs::read_to_string(format!("{home}/.iphone-use/wda-setup-status.json")).ok()?;
+    let txt = std::fs::read_to_string(crate::instance::current().status_file()).ok()?;
     let mut status: WdaSetupStatus = serde_json::from_str(&txt).ok()?;
     status.phase = status.phase.chars().take(64).collect();
     status.message = status.message.chars().take(512).collect();
@@ -1938,14 +1931,15 @@ fn read_raw_setup_status() -> Option<WdaSetupStatus> {
 
 /// Tail of `~/.iphone-use/wda-runner.log` — the xcodebuild output.
 fn read_runner_log_tail() -> String {
-    let Ok(home) = std::env::var("HOME") else {
-        return String::new();
-    };
-    std::fs::read_to_string(format!("{home}/.iphone-use/wda-runner.log")).unwrap_or_default()
+    std::fs::read_to_string(crate::instance::current().runner_log()).unwrap_or_default()
 }
 
 /// launchd label for the dedicated, self-healing WDA job.
-const WDA_AGENT_LABEL: &str = "com.leeguoo.iphone-use.wda";
+/// launchd label of this instance's WDA supervisor (`com.leeguoo.iphone-use.wda`
+/// for the default instance, `.wda.<name>` for a named one — #67).
+fn wda_agent_label() -> &'static str {
+    &crate::instance::current().wda_label
+}
 
 /// Current GUI launchd domain (`gui/<uid>`), via `id -u`.
 fn gui_domain() -> String {
@@ -2084,13 +2078,11 @@ fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
 /// file every round — no longer masquerades as setup activity (the first cut
 /// of this guard keyed on mtime alone and did exactly that, also on hardware).
 /// A file from an older helper has no protocol fields; fall back to mtime.
-fn setup_in_flight(home: &str) -> bool {
-    if home.is_empty() {
+fn setup_in_flight(state_dir: &std::path::Path) -> bool {
+    if state_dir.as_os_str().is_empty() {
         return false;
     }
-    let path = std::path::Path::new(home)
-        .join(".iphone-use")
-        .join("wda-setup-status.json");
+    let path = state_dir.join("wda-setup-status.json");
     let Ok(txt) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -2162,13 +2154,11 @@ const WDA_RETRY_STATE_FILE: &str = "wda-retry-state.v1";
 /// for the phone — so an explicit bring-up would otherwise inherit a long
 /// sleep and blow past the daemon's readiness window. An explicit request is
 /// the one signal that outranks the backoff, so clear it here.
-fn clear_wda_retry_backoff(home: &str) {
-    if home.is_empty() {
+fn clear_wda_retry_backoff(state_dir: &std::path::Path) {
+    if state_dir.as_os_str().is_empty() {
         return;
     }
-    let path = std::path::Path::new(home)
-        .join(".iphone-use")
-        .join(WDA_RETRY_STATE_FILE);
+    let path = state_dir.join(WDA_RETRY_STATE_FILE);
     match std::fs::remove_file(&path) {
         Ok(()) => tracing::warn!("cleared the WDA retry backoff for an explicit bring-up"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2185,16 +2175,14 @@ fn clear_wda_retry_backoff(home: &str) {
 /// bootstrapped because launchd caches environment variables; an unchanged
 /// policy may be kickstarted. A minimal plist is created only when no
 /// setup-generated file exists yet.
-fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &str) -> bool {
+fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> bool {
     if !std::path::Path::new(setup_sh).is_file() || !valid_wda_udid(udid) {
         return false;
     }
     // Both callers mean "bring the phone up now" (the setup endpoint and an
     // explicit reconnect), so neither should inherit a pending backoff.
-    clear_wda_retry_backoff(home);
-    let plist_path = std::path::PathBuf::from(format!(
-        "{home}/Library/LaunchAgents/{WDA_AGENT_LABEL}.plist"
-    ));
+    clear_wda_retry_backoff(&crate::instance::current().state_dir);
+    let plist_path = crate::instance::current().wda_plist();
     let Some(parent) = plist_path.parent() else {
         return false;
     };
@@ -2257,7 +2245,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>Label</key><string>{WDA_AGENT_LABEL}</string>
+    <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
     <array><string>/bin/bash</string><string>{setup_sh_xml}</string></array>
     <key>EnvironmentVariables</key>
@@ -2269,7 +2257,8 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
     <key>StandardOutPath</key><string>{log_xml}</string>
     <key>StandardErrorPath</key><string>{log_xml}</string>
 </dict></plist>
-"#
+"#,
+            label = wda_agent_label()
         )
         .into_bytes()
     };
@@ -2343,8 +2332,8 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
     }
 
     let domain = gui_domain();
-    let service = format!("{domain}/{WDA_AGENT_LABEL}");
-    let was_loaded = launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    let service = format!("{domain}/{}", wda_agent_label());
+    let was_loaded = launchd_job_loaded(&domain, wda_agent_label());
     // Cold start: the job isn't in the gui domain yet — it was booted out on a
     // prior stop, or never loaded after login. `launchctl enable`/`kickstart`
     // both fail on an unknown service with "Could not find service … in domain
@@ -2362,7 +2351,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 .unwrap_or(false)
         };
         let mut bootstrapped = bootstrap_job();
-        if !bootstrapped && !launchd_job_loaded(&domain, WDA_AGENT_LABEL) {
+        if !bootstrapped && !launchd_job_loaded(&domain, wda_agent_label()) {
             // A persistently-disabled service refuses bootstrap. Now that the
             // label is known to the domain, clearing the disabled flag and
             // retrying recovers it.
@@ -2371,7 +2360,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 .status();
             bootstrapped = bootstrap_job();
         }
-        if !launchd_job_loaded(&domain, WDA_AGENT_LABEL) {
+        if !launchd_job_loaded(&domain, wda_agent_label()) {
             if !bootstrapped && plist_changed {
                 restore_plist(&plist_path, original.as_deref());
             }
@@ -2383,7 +2372,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
         let _ = std::process::Command::new("launchctl")
             .args(["kickstart", "-k", &service])
             .status();
-        return launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+        return launchd_job_loaded(&domain, wda_agent_label());
     }
     // A persistently disabled service rejects bootstrap. Enable first and treat
     // failure as authoritative instead of continuing into a misleading start.
@@ -2398,7 +2387,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 let _ = std::process::Command::new("launchctl")
                     .args(["bootout", &service])
                     .status();
-                let _ = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+                let _ = wait_launchd_job_gone(&domain, wda_agent_label());
             }
             restore_plist(&plist_path, original.as_deref());
         }
@@ -2419,7 +2408,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 .args(["bootout", &service])
                 .status();
         }
-        wait_launchd_job_gone(&domain, WDA_AGENT_LABEL)
+        wait_launchd_job_gone(&domain, wda_agent_label())
             && std::process::Command::new("launchctl")
                 .args(["bootstrap", &domain])
                 .arg(&plist_path)
@@ -2427,14 +2416,14 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
                 .map(|status| status.success())
                 .unwrap_or(false)
     };
-    let verified = activated && launchd_job_loaded(&domain, WDA_AGENT_LABEL);
+    let verified = activated && launchd_job_loaded(&domain, wda_agent_label());
     if !verified && plist_changed {
         // Preserve the last known-good on-disk policy while leaving the
         // mismatched service down; never restart a cached old target.
         let _ = std::process::Command::new("launchctl")
             .args(["bootout", &service])
             .status();
-        let _ = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+        let _ = wait_launchd_job_gone(&domain, wda_agent_label());
         restore_plist(&plist_path, original.as_deref());
     }
     verified
@@ -2444,7 +2433,7 @@ fn write_and_bootstrap_wda_agent(home: &str, setup_sh: &str, log: &str, udid: &s
 /// Best-effort; ignored if it isn't loaded.
 fn bootout_wda_agent() {
     let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("{}/{WDA_AGENT_LABEL}", gui_domain())])
+        .args(["bootout", &format!("{}/{}", gui_domain(), wda_agent_label())])
         .status();
 }
 
@@ -2465,7 +2454,7 @@ fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
             .map(|status| status.success())
             .unwrap_or(false);
     let domain = gui_domain();
-    let supervisor_gone = wait_launchd_job_gone(&domain, WDA_AGENT_LABEL);
+    let supervisor_gone = wait_launchd_job_gone(&domain, wda_agent_label());
     supervisor_gone && stopped_by_owner
 }
 
@@ -2544,8 +2533,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
         const POLL: std::time::Duration = std::time::Duration::from_secs(20);
-        let home = std::env::var("HOME").unwrap_or_default();
-        let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+        let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
         let mut was_up = false;
         // When the endpoint went down, so an up edge can tell a human cold
         // start from a crash-loop bounce; and the retry state for a stop that
@@ -2608,7 +2596,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 {
                     continue;
                 }
-                if setup_in_flight(&home) {
+                if setup_in_flight(&crate::instance::current().state_dir) {
                     continue; // a bring-up is in progress — do not kill the build
                 }
                 // Nobody has driven the phone for a full window and the device
@@ -2629,7 +2617,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     || state.held()
                     || state.idle_for() < window
                     || state.wda_control_pending.load(Ordering::Acquire) != 0
-                    || setup_in_flight(&home)
+                    || setup_in_flight(&crate::instance::current().state_dir)
                 {
                     state.wda_lifecycle.finish_releasing();
                     continue;
@@ -2883,8 +2871,7 @@ async fn agent_mode(
         .device_udid
         .clone()
         .or_else(|| requested_udid.map(String::from));
-    let home = std::env::var("HOME").unwrap_or_default();
-    let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
+    let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
     match mode.as_str() {
         "mirror" => {
             // Mirror recovery never starts, stops, or reuses WDA. Installation
@@ -2968,23 +2955,17 @@ async fn agent_mode(
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
             }
-            let log = format!("{home}/.iphone-use/wda-agent.log");
+            let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
             let udid_env = udid.unwrap_or_default();
             // An explicit reconnect is intent, not idleness: restart the clock
             // before the bring-up begins, or a build longer than the idle
             // window ends with the watchdog stopping the very supervisor this
             // request started.
             state.touch_activity();
-            let home_for_bootstrap = home.clone();
             let setup_for_bootstrap = setup_sh.clone();
             let log_for_bootstrap = log.clone();
             let spawned = tokio::task::spawn_blocking(move || {
-                write_and_bootstrap_wda_agent(
-                    &home_for_bootstrap,
-                    &setup_for_bootstrap,
-                    &log_for_bootstrap,
-                    &udid_env,
-                )
+                write_and_bootstrap_wda_agent(&setup_for_bootstrap, &log_for_bootstrap, &udid_env)
             })
             .await
             .unwrap_or(false);
@@ -6527,13 +6508,12 @@ async fn agent_input(
             // build this request triggered.
             state.touch_activity();
             let recovery_state = state.clone();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let setup_sh = format!("{home}/.iphone-use/setup-wda.sh");
-            let log = format!("{home}/.iphone-use/wda-agent.log");
+            let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
+            let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
             let udid = state.device_udid.clone().unwrap_or_default();
             tokio::spawn(async move {
                 let bootstrapped = tokio::task::spawn_blocking(move || {
-                    write_and_bootstrap_wda_agent(&home, &setup_sh, &log, &udid)
+                    write_and_bootstrap_wda_agent(&setup_sh, &log, &udid)
                 })
                 .await
                 .unwrap_or(false);
@@ -7762,10 +7742,7 @@ enum IntentsRegistryLoad {
 /// Canonical on-disk registry location. Factored out of the handlers so tests
 /// exercise [`load_intents_registry`] with injected temp paths instead.
 fn intents_registry_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home)
-        .join(".iphone-use")
-        .join("intents-registry.json")
+    crate::instance::current().intents_registry()
 }
 
 fn valid_intent_name(name: &str) -> bool {
@@ -9008,8 +8985,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("iu-setup-{}", std::process::id()));
         let dir = home.join(".iphone-use");
         std::fs::create_dir_all(&dir).expect("temp home");
-        let home_str = home.to_str().expect("utf-8 home");
-        assert!(!setup_in_flight(home_str), "no status file: nothing is being set up");
+        assert!(!setup_in_flight(&dir), "no status file: nothing is being set up");
         std::fs::write(
             dir.join("wda-setup-status.json"),
             format!(
@@ -9019,8 +8995,8 @@ mod tests {
             ),
         )
         .expect("write status");
-        assert!(!setup_in_flight(home_str), "a terminal record just written is still terminal");
-        assert!(!setup_in_flight(""), "an unknown home is never active");
+        assert!(!setup_in_flight(&dir), "a terminal record just written is still terminal");
+        assert!(!setup_in_flight(std::path::Path::new("")), "an unknown home is never active");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -9127,14 +9103,14 @@ mod tests {
         std::fs::write(&target, b"version=1").expect("write target");
         std::fs::write(&bystander, b"{}").expect("write bystander");
 
-        clear_wda_retry_backoff(home.to_str().expect("utf-8 home"));
+        clear_wda_retry_backoff(&dir);
         assert!(!target.exists(), "the backoff state must be gone");
         assert!(bystander.exists(), "no other state file may be touched");
 
         // Idempotent: a second call with nothing to remove is not an error.
-        clear_wda_retry_backoff(home.to_str().expect("utf-8 home"));
+        clear_wda_retry_backoff(&dir);
         // And an unknown home is a no-op rather than a panic or a stray delete.
-        clear_wda_retry_backoff("");
+        clear_wda_retry_backoff(std::path::Path::new(""));
 
         std::fs::remove_dir_all(&home).ok();
     }
