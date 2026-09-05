@@ -170,6 +170,37 @@ enum Command {
     Serve,
     /// Stop a running daemon (best-effort; kills the recorded pid).
     Stop,
+    /// Print which instance this environment would run as, as JSON, and exit.
+    ///
+    /// Read-only: derives the instance from PHONE_REMOTE_INSTANCE / HOME /
+    /// PHONE_REMOTE_STATE_DIR (+ PHONE_REMOTE_UDID) without opening a socket,
+    /// touching launchd, or starting WDA. Installers run this on a staged
+    /// binary before switching services over: a binary that predates
+    /// instances rejects the subcommand outright, so it can never be started
+    /// against the wrong phone (#67).
+    InstanceContext,
+}
+
+/// `iphone-use instance-context`: the derived instance as one JSON object.
+fn instance_context() -> Result<()> {
+    let instance = server::instance::Instance::from_env().map_err(|error| anyhow::anyhow!(error))?;
+    let udid = std::env::var("PHONE_REMOTE_UDID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let state_dir_ok = instance.verify_on_disk().map_err(|error| error.to_string());
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "name": instance.name,
+        "state_dir": instance.state_dir,
+        "daemon_label": instance.daemon_label,
+        "wda_label": instance.wda_label,
+        "wda_plist": instance.wda_plist(),
+        "udid": udid,
+        "state_dir_ok": state_dir_ok.is_ok(),
+        "state_dir_error": state_dir_ok.err(),
+    });
+    println!("{body}");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -181,9 +212,13 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Only the long-running service earns the unattended-relaunch backoff
+    // below; a one-shot query must report and exit at once.
+    let unattended_service = matches!(cli.command, Command::Serve);
     let result = match cli.command {
         Command::Serve => serve(),
         Command::Stop => stop(),
+        Command::InstanceContext => instance_context(),
     };
 
     // Issue #28: under launchd `KeepAlive=true`, a startup that fails fast
@@ -195,7 +230,7 @@ fn main() -> Result<()> {
     // permissions / frees the port. (The plist also carries a ThrottleInterval;
     // this is belt-and-suspenders and protects even a hand-written plist.) A
     // human running `iphone-use serve` in a terminal exits immediately as before.
-    if result.is_err() && !stderr_is_tty() {
+    if result.is_err() && unattended_service && !stderr_is_tty() {
         if let Err(e) = &result {
             tracing::error!(
                 "startup failed: {e:#} — backing off {STARTUP_BACKOFF_SECS}s before exit \
