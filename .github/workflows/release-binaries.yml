@@ -22,7 +22,11 @@ jobs:
     # env (job env CAN reference secrets); steps gate on `env.*` instead.
     env:
       HAS_SIGNING: ${{ secrets.APPLE_SIGNING_CERTIFICATE != '' && secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD != '' }}
-      HAS_NOTARIZE: ${{ secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      # Notarization accepts either an App Store Connect API key (preferred:
+      # no Apple ID password, no 2FA, revocable per key) or an Apple ID with
+      # an app-specific password.
+      HAS_NOTARIZE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' }}
+      HAS_NOTARIZE: ${{ (secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '') || (secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '') }}
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -240,18 +244,35 @@ jobs:
       - name: Notarize
         if: ${{ env.HAS_NOTARIZE == 'true' }}
         env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          set -euo pipefail
           APP="$GITHUB_WORKSPACE/iPhoneUse.app"
           ZIP_FOR_NOTARIZE="$(mktemp).zip"
           ditto -c -k --keepParent "$APP" "$ZIP_FOR_NOTARIZE"
-          xcrun notarytool submit "$ZIP_FOR_NOTARIZE" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_ID_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait
+          if [[ "$HAS_NOTARIZE_API_KEY" == "true" ]]; then
+            # The .p8 is stored base64-encoded so the secret survives newline
+            # handling; it never leaves the runner's temp dir.
+            KEY_FILE="$(mktemp -d)/AuthKey_${APPLE_API_KEY_ID}.p8"
+            echo "$APPLE_API_KEY_P8" | base64 --decode > "$KEY_FILE"
+            xcrun notarytool submit "$ZIP_FOR_NOTARIZE" \
+              --key "$KEY_FILE" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER_ID" \
+              --wait
+            rm -f "$KEY_FILE"
+          else
+            xcrun notarytool submit "$ZIP_FOR_NOTARIZE" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+          fi
           xcrun stapler staple "$APP"
           rm -f "$ZIP_FOR_NOTARIZE"
 
