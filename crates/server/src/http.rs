@@ -1639,7 +1639,7 @@ fn read_structured_setup_blocked_on() -> String {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct WdaSetupStatus {
     #[serde(default)]
     phase: String,
@@ -1648,6 +1648,20 @@ struct WdaSetupStatus {
     #[serde(default)]
     message: String,
     ts: u64,
+    // Setup status protocol v1 (`_status_publish` in setup-wda.sh). Absent on
+    // files written by an older helper, which is what the zero defaults mean.
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
+    owner_pid: u32,
+    #[serde(default)]
+    owner_start: String,
+    #[serde(default)]
+    heartbeat_ts: u64,
 }
 
 fn read_structured_setup_status() -> Option<WdaSetupStatus> {
@@ -2055,27 +2069,83 @@ fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
 
 /// Whether `setup-wda.sh` is actively working right now.
 ///
-/// The script stamps its progress into `wda-setup-status.json` as it goes, so
-/// a recently-touched file means a bring-up is in flight. The idle watchdog
-/// needs this to tell two states apart that look identical from the outside —
-/// "WDA is down because the supervisor is in a rebuild loop pestering the
-/// human for a passcode" (release it) versus "WDA is down because it is being
-/// started right now, for an agent that asked for it" (leave it alone).
-/// Without the distinction the watchdog kills a legitimate build partway, the
-/// next request restarts it, and the phone never becomes drivable — observed
-/// on hardware.
-fn setup_recently_active(home: &str) -> bool {
-    const ACTIVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(180);
+/// The idle watchdog needs this to tell two states apart that look identical
+/// from the outside — "WDA is down because the supervisor is in a rebuild loop
+/// pestering the human for a passcode" (release it) versus "WDA is down because
+/// it is being started right now, for an agent that asked for it" (leave it
+/// alone). Without the distinction the watchdog kills a legitimate build
+/// partway, the next request restarts it, and the phone never becomes
+/// drivable — observed on hardware.
+///
+/// The helper publishes a status protocol (`_status_publish`): one owner per
+/// attempt, a 15s heartbeat while it works, and `terminal` once it has
+/// finished, failed, or backed off. Only a live owner with a fresh heartbeat
+/// counts as in flight, so a stable KeepAlive crash loop — which stamps the
+/// file every round — no longer masquerades as setup activity (the first cut
+/// of this guard keyed on mtime alone and did exactly that, also on hardware).
+/// A file from an older helper has no protocol fields; fall back to mtime.
+fn setup_in_flight(home: &str) -> bool {
     if home.is_empty() {
         return false;
     }
-    std::path::Path::new(home)
+    let path = std::path::Path::new(home)
         .join(".iphone-use")
-        .join("wda-setup-status.json")
+        .join("wda-setup-status.json");
+    let Ok(txt) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(status) = serde_json::from_str::<WdaSetupStatus>(&txt) else {
+        return false;
+    };
+    let mtime_age = path
         .metadata()
         .and_then(|meta| meta.modified())
-        .map(|modified| modified.elapsed().unwrap_or_default() < ACTIVE_WITHIN)
-        .unwrap_or(false)
+        .ok()
+        .map(|modified| modified.elapsed().unwrap_or_default());
+    setup_in_flight_from(&status, now_secs(), mtime_age, setup_owner_alive)
+}
+
+/// Heartbeats arrive every 15s; four missed beats means the helper is gone.
+const SETUP_HEARTBEAT_STALE_SECS: u64 = 60;
+/// Older helpers only touch the file as they go; treat a recent touch as work.
+const LEGACY_SETUP_ACTIVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The decision behind [`setup_in_flight`], with the process check injected so
+/// it can be exercised without a live helper. Precedence: a terminal record is
+/// never in flight; an inactive one is not; then the owner must still be the
+/// same process (pid *and* start time — pids get reused); then the heartbeat
+/// must be fresh.
+fn setup_in_flight_from(
+    status: &WdaSetupStatus,
+    now: u64,
+    mtime_age: Option<std::time::Duration>,
+    owner_alive: impl Fn(u32, &str) -> bool,
+) -> bool {
+    if status.schema_version == 0 {
+        return mtime_age.is_some_and(|age| age < LEGACY_SETUP_ACTIVE_WITHIN);
+    }
+    if status.terminal || !status.active {
+        return false;
+    }
+    if now.saturating_sub(status.heartbeat_ts) > SETUP_HEARTBEAT_STALE_SECS {
+        return false;
+    }
+    owner_alive(status.owner_pid, &status.owner_start)
+}
+
+/// Is `pid` still the process that wrote the status file? The helper records
+/// `LC_ALL=C ps -o lstart=` at start; compare against the same query now.
+fn setup_owner_alive(pid: u32, owner_start: &str) -> bool {
+    if pid == 0 || owner_start.trim().is_empty() {
+        return false;
+    }
+    std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == owner_start.trim())
 }
 
 /// Name of the retry state `setup-wda.sh` persists across supervisor restarts.
@@ -2529,13 +2599,30 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 {
                     continue;
                 }
-                if setup_recently_active(&home) {
+                if setup_in_flight(&home) {
                     continue; // a bring-up is in progress — do not kill the build
                 }
                 // Nobody has driven the phone for a full window and the device
                 // layer is down anyway: stop the supervisor so it stops
                 // rebuilding (and stops asking the human to unlock).
                 if release_backoff_until.is_some_and(|until| std::time::Instant::now() < until) {
+                    continue;
+                }
+                // Own the release like the up path does. Without the CAS an
+                // explicit reconnect could win `try_begin_reconnecting` while
+                // we were awaiting above, and this stop would bootout the
+                // supervisor it had just bootstrapped; with it, handlers fail
+                // fast on `releasing` and a reconnect cannot start underneath.
+                if !state.wda_lifecycle.try_begin_releasing() {
+                    continue;
+                }
+                if state.viewer_busy()
+                    || state.held()
+                    || state.idle_for() < window
+                    || state.wda_control_pending.load(Ordering::Acquire) != 0
+                    || setup_in_flight(&home)
+                {
+                    state.wda_lifecycle.finish_releasing();
                     continue;
                 }
                 tracing::info!(
@@ -2565,6 +2652,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                         backoff.as_secs()
                     );
                 }
+                state.wda_lifecycle.finish_releasing();
                 continue;
             }
             if !was_up {
@@ -2873,6 +2961,11 @@ async fn agent_mode(
             }
             let log = format!("{home}/.iphone-use/wda-agent.log");
             let udid_env = udid.unwrap_or_default();
+            // An explicit reconnect is intent, not idleness: restart the clock
+            // before the bring-up begins, or a build longer than the idle
+            // window ends with the watchdog stopping the very supervisor this
+            // request started.
+            state.touch_activity();
             let home_for_bootstrap = home.clone();
             let setup_for_bootstrap = setup_sh.clone();
             let log_for_bootstrap = log.clone();
@@ -6890,6 +6983,28 @@ const AGENT_HOLD_MAX_SECS: u64 = 4 * 3600;
 /// `POST /agent/hold` `{"secs": N}` — keep the phone for N seconds regardless
 /// of idle time (0 clears). Bearer + mutation header, like every control
 /// endpoint. Returns `{"ok":true,"hold_remaining_secs":N}`.
+/// Take (or, with `secs == 0`, clear) the idle-release hold, arbitrated
+/// against the watchdog.
+///
+/// The check and the write happen under the `hold_until` mutex — the same lock
+/// the watchdog takes in `held()` right after it wins `try_begin_releasing`.
+/// So either the hold lands first and the watchdog sees it and backs out, or
+/// the release begins first and the hold is refused here. A lock-free
+/// `is_releasing()` check followed by a locked write left a window where the
+/// hold was accepted with 200 and the phone was released anyway.
+fn try_take_hold(
+    lifecycle: &WdaLifecycle,
+    hold_until: &Mutex<Option<Instant>>,
+    secs: u64,
+) -> bool {
+    let mut hold = recover(hold_until.lock());
+    if lifecycle.is_releasing() {
+        return false;
+    }
+    *hold = (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
+    true
+}
+
 async fn agent_hold(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6925,8 +7040,18 @@ async fn agent_hold(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     };
-    *recover(state.hold_until.lock()) =
-        (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
+    if !try_take_hold(&state.wda_lifecycle, &state.hold_until, secs) {
+        return with_security_headers(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, "5")
+                .body(Body::from(
+                    r#"{"ok":false,"error":"device_release_in_progress","hint":"retry the hold after the release finishes"}"#,
+                ))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
     state.touch_activity();
     with_security_headers(
         Response::builder()
@@ -8681,47 +8806,194 @@ mod tests {
     // resumes — well past the daemon's readiness window. Clearing it must hit
     // exactly one file: deleting anything else in ~/.iphone-use would be worse
     // than the bug.
-    // The idle watchdog must not kill a build it is watching start. Observed on
-    // hardware: releasing on "WDA down + idle" also matched "WDA down because
-    // an agent just asked for it", so setup was stopped mid-build, the next
-    // request restarted it, and the phone never became drivable.
+    fn protocol_status(active: bool, terminal: bool, heartbeat_ts: u64) -> WdaSetupStatus {
+        WdaSetupStatus {
+            phase: "building".into(),
+            blocked_on: String::new(),
+            message: String::new(),
+            ts: heartbeat_ts,
+            schema_version: 1,
+            active,
+            terminal,
+            owner_pid: 4242,
+            owner_start: "Fri Sep  5 14:00:00 2026".into(),
+            heartbeat_ts,
+        }
+    }
+
+    // The idle watchdog must not kill a build it is watching start — but it
+    // must also not be fooled by a KeepAlive crash loop that stamps the status
+    // file every round. Both were observed on hardware: the first cut keyed on
+    // mtime, stopped a legitimate bring-up mid-build, and then, once patched,
+    // kept a crash loop alive forever because every retry looked "recent".
     #[test]
-    fn an_in_flight_setup_counts_as_active_and_a_stale_one_does_not() {
+    fn a_live_owner_with_a_fresh_heartbeat_is_in_flight() {
+        let now = 1_000_000;
+        let alive = |pid: u32, start: &str| pid == 4242 && start.starts_with("Fri Sep");
+        assert!(setup_in_flight_from(&protocol_status(true, false, now - 10), now, None, alive));
+    }
+
+    #[test]
+    fn a_terminal_or_inactive_record_is_never_in_flight() {
+        let now = 1_000_000;
+        let alive = |_: u32, _: &str| true;
+        assert!(
+            !setup_in_flight_from(&protocol_status(false, true, now), now, None, alive),
+            "a finished/failed/backed-off attempt is not activity, however fresh"
+        );
+        assert!(
+            !setup_in_flight_from(&protocol_status(false, false, now), now, None, alive),
+            "inactive without terminal (mid-handoff) is not activity either"
+        );
+    }
+
+    #[test]
+    fn a_stale_heartbeat_or_a_dead_owner_is_not_in_flight() {
+        let now = 1_000_000;
+        let alive = |_: u32, _: &str| true;
+        assert!(
+            !setup_in_flight_from(
+                &protocol_status(true, false, now - SETUP_HEARTBEAT_STALE_SECS - 1),
+                now,
+                None,
+                alive
+            ),
+            "four missed beats means the helper died without writing EXIT"
+        );
+        let dead = |_: u32, _: &str| false;
+        assert!(
+            !setup_in_flight_from(&protocol_status(true, false, now), now, None, dead),
+            "a reused pid with a different start time is not our owner"
+        );
+    }
+
+    #[test]
+    fn a_legacy_status_file_falls_back_to_its_mtime() {
+        let mut status = protocol_status(true, false, 1);
+        status.schema_version = 0; // written by an older helper: no protocol fields
+        let never = |_: u32, _: &str| unreachable!("legacy files do not know their owner");
+        assert!(setup_in_flight_from(
+            &status,
+            1,
+            Some(std::time::Duration::from_secs(30)),
+            never
+        ));
+        assert!(!setup_in_flight_from(
+            &status,
+            1,
+            Some(LEGACY_SETUP_ACTIVE_WITHIN),
+            never
+        ));
+        assert!(!setup_in_flight_from(&status, 1, None, never));
+    }
+
+    #[test]
+    fn the_owner_check_matches_our_own_process_and_not_a_bogus_start() {
+        let pid = std::process::id();
+        let start = std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if start.is_empty() {
+            return; // no ps here; nothing to assert against
+        }
+        assert!(setup_owner_alive(pid, &start));
+        assert!(!setup_owner_alive(pid, "Thu Jan  1 00:00:00 1970"));
+        assert!(!setup_owner_alive(0, &start));
+    }
+
+    #[test]
+    fn setup_in_flight_reads_the_protocol_file_and_ignores_an_unknown_home() {
         let home = std::env::temp_dir().join(format!("iu-setup-{}", std::process::id()));
         let dir = home.join(".iphone-use");
         std::fs::create_dir_all(&dir).expect("temp home");
         let home_str = home.to_str().expect("utf-8 home");
+        assert!(!setup_in_flight(home_str), "no status file: nothing is being set up");
+        std::fs::write(
+            dir.join("wda-setup-status.json"),
+            format!(
+                r#"{{"schema_version":1,"phase":"building-fail","ts":{now},"heartbeat_ts":{now},"active":false,"terminal":true,"owner_pid":{pid},"owner_start":"x"}}"#,
+                now = now_secs(),
+                pid = std::process::id()
+            ),
+        )
+        .expect("write status");
+        assert!(!setup_in_flight(home_str), "a terminal record just written is still terminal");
+        assert!(!setup_in_flight(""), "an unknown home is never active");
+        std::fs::remove_dir_all(&home).ok();
+    }
 
-        // No status file at all: nothing is being set up.
-        assert!(!setup_recently_active(home_str));
-
-        let status = dir.join("wda-setup-status.json");
-        std::fs::write(&status, b"{\"phase\":\"building\"}").expect("write status");
-        assert!(
-            setup_recently_active(home_str),
-            "a just-written status file means a bring-up is in progress"
-        );
-
-        // An old stamp must not pin the watchdog forever — a supervisor that
-        // died mid-setup would otherwise be immune to release. `touch -t` is
-        // enough here and keeps the crate free of a test-only dependency.
-        let backdated = std::process::Command::new("touch")
-            .args(["-t", "202001010000", status.to_str().expect("utf-8 path")])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if backdated {
+    // A hold and a release racing for the same phone must never both "win":
+    // an accepted hold followed by a release that saw no hold is the bug. The
+    // Barrier lines both sides up on every iteration to maximise the overlap.
+    #[test]
+    fn a_hold_and_a_release_never_both_win_under_contention() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..500 {
+            let lifecycle = Arc::new(WdaLifecycle::new());
+            let hold_until: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+            let barrier = Arc::new(Barrier::new(2));
+            let holder = {
+                let (lifecycle, hold_until, barrier) =
+                    (lifecycle.clone(), hold_until.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    try_take_hold(&lifecycle, &hold_until, 30)
+                })
+            };
+            let releaser = {
+                let (lifecycle, hold_until, barrier) =
+                    (lifecycle.clone(), hold_until.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if !lifecycle.try_begin_releasing() {
+                        return None;
+                    }
+                    // What the watchdog does right after its CAS: re-check the
+                    // hold under the same lock the hold is written under. The
+                    // transition stays open until the main thread has joined
+                    // both sides, so a hold accepted after a *finished* release
+                    // (legal) cannot be mistaken for the race.
+                    let held = recover(hold_until.lock()).is_some_and(|until| until > Instant::now());
+                    Some(!held)
+                })
+            };
+            let hold_ok = holder.join().expect("holder");
+            let release_proceeds = releaser.join().expect("releaser");
+            if release_proceeds.is_some() {
+                lifecycle.finish_releasing();
+            }
             assert!(
-                !setup_recently_active(home_str),
-                "a stale stamp is not activity"
+                !(hold_ok && release_proceeds == Some(true)),
+                "hold accepted with 200 while the release went ahead"
             );
         }
+    }
 
-        assert!(
-            !setup_recently_active(""),
-            "an unknown home is never active"
-        );
-        std::fs::remove_dir_all(&home).ok();
+    // The two orderings the lock is meant to serialise, pinned down one at a
+    // time (the contention test above cannot force either interleaving).
+    #[test]
+    fn a_hold_that_lands_first_makes_the_release_back_out() {
+        let lifecycle = WdaLifecycle::new();
+        let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
+        assert!(try_take_hold(&lifecycle, &hold_until, 30));
+        assert!(lifecycle.try_begin_releasing());
+        let held = recover(hold_until.lock()).is_some_and(|until| until > Instant::now());
+        assert!(held, "the post-CAS re-check must see the lease and back out");
+        lifecycle.finish_releasing();
+    }
+
+    #[test]
+    fn a_release_that_begins_first_refuses_the_hold_until_it_is_done() {
+        let lifecycle = WdaLifecycle::new();
+        let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
+        assert!(lifecycle.try_begin_releasing());
+        assert!(!try_take_hold(&lifecycle, &hold_until, 30), "503 while releasing");
+        assert!(recover(hold_until.lock()).is_none(), "a refused hold writes no lease");
+        lifecycle.finish_releasing();
+        assert!(try_take_hold(&lifecycle, &hold_until, 30), "and is accepted once the release is over");
     }
 
     #[test]
@@ -9492,6 +9764,7 @@ mod tests {
             blocked_on: String::new(),
             message: String::new(),
             ts,
+            ..Default::default()
         }
     }
 

@@ -2413,7 +2413,24 @@ fn failed_element_read_revokes_cached_actionability() {
             .unwrap();
         server.join().unwrap();
 
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        // The read fails at the 35s budget either way; which code surfaces
+        // depends on whether the inner retry or the outer timer is polled
+        // first once the shared deadline passes. Both are correct — what this
+        // test guards is the revocation below, so accept either and check the
+        // body agrees with the status.
+        let status = response.status();
+        assert!(
+            matches!(status, StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT),
+            "unexpected source failure status: {status}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected_error = if status == StatusCode::GATEWAY_TIMEOUT {
+            "wda_source_timeout"
+        } else {
+            "wda_source_failed"
+        };
+        assert_eq!(json["error"], expected_error);
         assert!(!observed.wda_actionable.load(Ordering::Acquire));
         let health = *observed.wda_health.lock().unwrap();
         assert!(health.up);
