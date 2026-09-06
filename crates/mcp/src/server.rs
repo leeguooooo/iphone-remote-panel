@@ -1006,7 +1006,8 @@ impl PhoneHandler {
             // refused before dispatch. There is no result to diagnose.
             Err(e) => {
                 return CallToolResult::error(vec![Content::text(format!(
-                    "flow {id} did not run: {e:#}. Nothing was recorded; check phone_status and                      do NOT replay blindly."
+                    "flow {id} did not run: {e:#}. Nothing was recorded; check phone_status \
+                     and do NOT replay blindly."
                 ))])
             }
         };
@@ -1020,11 +1021,15 @@ impl PhoneHandler {
         if run.succeeded {
             if compat.compat == crate::compat::Compat::UntestedNewer {
                 summary["hint"] = serde_json::json!(
-                    "the installed app is newer than this flow's last verification — if the phone ended where                      the flow promised, publish an updated verified_on (phone_flow_publish) so others get compat=verified"
+                    "the installed app is newer than this flow's last verification — if the \
+                     phone ended where the flow promised, publish an updated verified_on \
+                     (phone_flow_publish) so others get compat=verified"
                 );
             } else if !flow.meta.verified() {
                 summary["hint"] = serde_json::json!(
-                    "this flow had no hardware verification yet — if the phone is now where the flow                      promised, tell the user and offer to add verified_on via phone_flow_publish"
+                    "this flow had no hardware verification yet — if the phone is now where \
+                     the flow promised, tell the user and offer to add verified_on via \
+                     phone_flow_publish"
                 );
             }
             return CallToolResult::success(vec![Content::text(summary.to_string())]);

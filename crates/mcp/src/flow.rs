@@ -880,7 +880,10 @@ fn locator_weight(matched: &[String]) -> u32 {
 /// Score one element row against a locator: which fields matched, which
 /// differed. The basis is reported as FIELD NAMES, so a reader can see why a
 /// candidate is a candidate without the daemon having to explain itself.
-fn candidate_basis(row: &serde_json::Value, locator: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+fn candidate_basis(
+    row: &serde_json::Value,
+    locator: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
     let (mut matched, mut differed) = (Vec::new(), Vec::new());
     let Some(fields) = locator.as_object() else {
         return (matched, differed);
@@ -889,8 +892,21 @@ fn candidate_basis(row: &serde_json::Value, locator: &serde_json::Value) -> (Vec
         if !LOCATOR_FIELDS.contains(&key.as_str()) {
             continue;
         }
-        match row.get(key) {
-            Some(actual) if actual == expected => matched.push(key.clone()),
+        // The element tree is sparse: a row omits `enabled` / `visible` when
+        // they are true and `focused` when it is false. The daemon's matcher
+        // applies exactly those defaults, so comparing raw presence here would
+        // report a field as `differed` that the daemon considers a MATCH —
+        // a diagnosis that disagrees with the thing it is diagnosing.
+        let actual = match row.get(key) {
+            Some(value) => Some(value.clone()),
+            None => match key.as_str() {
+                "enabled" | "visible" => Some(serde_json::Value::Bool(true)),
+                "focused" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            },
+        };
+        match actual {
+            Some(actual) if actual == *expected => matched.push(key.clone()),
             _ => differed.push(key.clone()),
         }
     }
@@ -1612,6 +1628,67 @@ mod tests {
     fn ran_steps(flow: &ValidatedFlow, inputs: &BTreeMap<String, String>) -> serde_json::Value {
         let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs)).unwrap();
         phone_steps_request(steps).unwrap()["steps"].clone()
+    }
+
+    /// The element tree is sparse: a row omits `enabled`/`visible` when they
+    /// are true and `focused` when it is false. The daemon's matcher applies
+    /// those defaults, so a diagnosis that compares raw presence would call a
+    /// field `differed` on a row the daemon considers a MATCH — and send a
+    /// reader hunting for a difference that does not exist.
+    #[test]
+    fn absent_boolean_fields_match_the_daemons_defaults() {
+        // A row as WDA actually serialises it: nothing but identity.
+        let sparse = serde_json::json!({"index": 0, "kind": "Button", "label": "搜索"});
+
+        let (matched, differed) = candidate_basis(
+            &sparse,
+            &serde_json::json!({"kind": "Button", "enabled": true, "visible": true}),
+        );
+        assert_eq!(differed, Vec::<String>::new(), "matched={matched:?}");
+        assert!(matched.contains(&"enabled".to_string()), "{matched:?}");
+        assert!(matched.contains(&"visible".to_string()), "{matched:?}");
+
+        let (matched, differed) = candidate_basis(
+            &sparse,
+            &serde_json::json!({"kind": "Button", "focused": false}),
+        );
+        assert_eq!(differed, Vec::<String>::new(), "matched={matched:?}");
+        assert!(matched.contains(&"focused".to_string()), "{matched:?}");
+    }
+
+    /// The defaults are defaults, not wildcards: asking for the opposite of
+    /// what an omitted field means must still be a difference.
+    #[test]
+    fn asking_for_the_opposite_of_a_default_is_a_difference() {
+        let sparse = serde_json::json!({"index": 0, "kind": "Button", "label": "搜索"});
+
+        for (field, wanted) in [("enabled", false), ("visible", false), ("focused", true)] {
+            let (matched, differed) = candidate_basis(
+                &sparse,
+                &serde_json::json!({"kind": "Button", field: wanted}),
+            );
+            assert_eq!(
+                differed,
+                vec![field.to_string()],
+                "{field}={wanted} must differ from the default; matched={matched:?}"
+            );
+        }
+    }
+
+    /// An explicit value on the row still wins over the default.
+    #[test]
+    fn an_explicit_field_is_compared_as_given() {
+        let row = serde_json::json!({"kind": "Button", "enabled": false, "focused": true});
+
+        let (matched, _) = candidate_basis(
+            &row,
+            &serde_json::json!({"enabled": false, "focused": true}),
+        );
+        assert_eq!(matched, vec!["enabled".to_string(), "focused".to_string()]);
+
+        let (_, differed) =
+            candidate_basis(&row, &serde_json::json!({"enabled": true, "focused": false}));
+        assert_eq!(differed, vec!["enabled".to_string(), "focused".to_string()]);
     }
 
     #[tokio::test]
