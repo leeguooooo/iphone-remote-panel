@@ -518,12 +518,6 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   an unreadable screen is not evidence something is gone. <code>rows</code>,
   <code>attempts</code> and <code>reads</code> carry the raw counts.
 </p>
-
-  <code>wait_for</code> rebuilds one stale WDA source session within its existing
-  deadline. The retry flag describes replaying
-  the <em>whole batch</em>: once an earlier action landed, it is false even when the
-  current failed step itself was not sent.
-</p>
 <aside class="note">
   <strong>This is not permission to batch guesses.</strong> Discover a changing or
   high-consequence flow with the normal see → one action → verify loop. Batch only the
