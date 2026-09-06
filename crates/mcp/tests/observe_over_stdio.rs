@@ -39,6 +39,12 @@ impl ScriptedDaemon {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).ok();
+                        // A bounded `accept` still leaves `read` and
+                        // `write_all` able to park this thread forever: a peer
+                        // that connects and says nothing, or stops reading
+                        // mid-response. Both sides get a deadline.
+                        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
                         let mut buffer = [0_u8; 8_192];
                         let _ = stream.read(&mut buffer);
                         let head = format!(

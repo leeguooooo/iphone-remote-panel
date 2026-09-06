@@ -1840,6 +1840,15 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).ok();
+                        // The accept deadline does not cover the socket: a
+                        // peer that connects and stays silent would park this
+                        // thread in `read`.
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                            .ok();
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                            .ok();
                         let mut request = [0_u8; 8_192];
                         let _ = stream.read(&mut request);
                         let head = format!(

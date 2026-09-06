@@ -641,6 +641,17 @@ mod tests {
                 }
             };
             stream.set_nonblocking(false).ok();
+            // Bounding `accept` alone is not enough: a peer that connects and
+            // then says nothing would park this thread in `read` forever, and
+            // a peer that stops reading would park it in `write_all`. Both
+            // sides get a deadline so the thread always ends and the join
+            // always returns.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .ok();
             let mut request = [0_u8; 4_096];
             let _ = stream.read(&mut request);
             let response = format!(
@@ -677,6 +688,17 @@ mod tests {
                 }
             };
             stream.set_nonblocking(false).ok();
+            // Bounding `accept` alone is not enough: a peer that connects and
+            // then says nothing would park this thread in `read` forever, and
+            // a peer that stops reading would park it in `write_all`. Both
+            // sides get a deadline so the thread always ends and the join
+            // always returns.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .ok();
             let mut request = [0_u8; 4_096];
             let _ = stream.read(&mut request);
             let head = format!(

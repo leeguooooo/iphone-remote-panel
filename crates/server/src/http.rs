@@ -12097,6 +12097,17 @@ mod tests {
                         return;
                     }
                     let Ok(mut stream) = incoming else { return };
+                    // A peer that connects and then says nothing would park
+                    // this thread in `read` forever, and one that stops
+                    // reading would park it in `write_all`. Both sides get a
+                    // deadline so the thread always ends and the join always
+                    // returns.
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .ok();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                        .ok();
                     let mut buffer = [0_u8; 8192];
                     let Ok(read) = stream.read(&mut buffer) else {
                         continue;
