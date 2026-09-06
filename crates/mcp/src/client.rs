@@ -621,17 +621,33 @@ mod tests {
     fn mock_daemon(status: &str, body: &str) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Same bound as `mock_daemon_bytes`: a joined handle must not be able
+        // to wait forever for a connection a failed test never opened.
+        listener.set_nonblocking(true).unwrap();
         let status = status.to_string();
         let body = body.to_string();
         let task = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
             let mut request = [0_u8; 4_096];
             let _ = stream.read(&mut request);
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).unwrap();
+            let _ = stream.write_all(response.as_bytes());
         });
         (format!("http://{addr}"), task)
     }
@@ -641,9 +657,26 @@ mod tests {
     fn mock_daemon_bytes(status: &str, body: Vec<u8>) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Non-blocking with a deadline. A blocking `accept` waiting for a
+        // connection a failed test never makes turns a joined handle into a
+        // hung suite rather than a red one.
+        listener.set_nonblocking(true).unwrap();
         let status = status.to_string();
         let task = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
             let mut request = [0_u8; 4_096];
             let _ = stream.read(&mut request);
             let head = format!(
