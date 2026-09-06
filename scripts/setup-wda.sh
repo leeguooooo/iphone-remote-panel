@@ -3274,6 +3274,10 @@ while [ -z "$PHONE_URL" ]; do
    registered, then rerun. If WARP is connected, its effective Excluded routes
    must contain fe80::/10 and fd00::/8 (otherwise disconnect it temporarily)."
     fi
+    if grep -Eq "Failed to establish communication with the test runner|A connection to this device could not be established" \
+        "$RUN_LOG" 2>/dev/null; then
+        warn "the device link dropped while starting the runner (CoreDevice tunnel). Over Wi-Fi this is usually the phone's address changing or the phone sleeping; a USB cable makes it immune."
+    fi
     if grep -q "not trusted" "$RUN_LOG" 2>/dev/null; then
         _setstatus trust trust "trust the Apple Development cert on the iPhone"
         die "Developer cert not trusted. On the iPhone: 设置 → 通用 → VPN与设备管理 → 信任 'Apple Development: …', then re-run. (pitfall ②)"
@@ -3288,9 +3292,14 @@ while [ -z "$PHONE_URL" ]; do
             _setstatus building-fail wda "phone is locked and the WDA runner exited"
             die "the phone is locked and xcodebuild exited. Unlock it, then rerun setup."
         fi
-        if [ "$WDA_RUNNER_FROM_CACHE" = "1" ]; then
+        # Only evict for a failure of the product itself. A runner can also
+        # exit because the device link dropped ("Failed to establish
+        # communication with the test runner", the CoreDevice tunnel over
+        # Wi-Fi), which says nothing about the built product — evicting there
+        # made every flaky connection cost a full rebuild.
+        if [ "$WDA_RUNNER_FROM_CACHE" = "1" ] && _runner_log_shows_product_failure "$RUN_LOG"; then
             _runner_cache_drop || true
-            warn "the cached runner product exited before serving; the next round rebuilds it"
+            warn "the cached runner product failed to install or launch; the next round rebuilds it"
         fi
         _setstatus building-fail wda "WDA runner exited before reporting its server URL"
         die "the PID-verified WDA runner exited before reporting its server URL — check $RUN_LOG"
