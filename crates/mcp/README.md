@@ -225,7 +225,22 @@ official flow that is hardware-verified, `read_only`/`navigation`, not tagged
 lease `flow-reverify`. Passing flows get their `verified_on` entry for this device
 refreshed; failing flows are tagged `needs-verification` and reported with
 `flow report`. One PR per night (`reverify/<date>`) on the registry; nothing merges
-itself. `enable` / `disable` / `status` manage a daily 03:30 launchd job; it skips
+itself.
+
+Each run ends in one of three verdicts, and only two of them write anything:
+
+| Verdict | Effect |
+|---|---|
+| `verified` | Refreshes this device's `verified_on` entry and clears `needs-verification` |
+| `failed` | Tags `needs-verification` and files a `flow-broken` issue |
+| `skipped` | **Nothing.** No refreshed date, no tag, no issue |
+
+`skipped` covers a night that answered nothing: the phone was locked, owned by
+another session, handed to a person, not drivable, or the run produced an
+unknown outcome or a result that could not be read. Calling that a failure
+would file a broken-flow issue against a flow that is probably fine and stop
+`flow list` recommending it; calling it a pass would refresh a verification
+date for a run that never happened. Both are wrong, so it is its own verdict. `enable` / `disable` / `status` manage a daily 03:30 launchd job; it skips
 quietly when another session owns the phone, a hold is active, or the phone is not
 drivable.
 
@@ -255,16 +270,17 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 | Tool | Arguments | Description |
 |---|---|---|
 | `phone_status` | — | Query backend, canonical target, `drivable`, WDA readiness, lifecycle, and recovery hints |
+| `phone_capabilities` | — | What this build supports for the configured backend, and whether the phone can be driven now. Read-only: wakes nothing, takes no owner lease |
 | `phone_reconnect` | — | Restart daemon-managed WDA once, then poll `phone_status`; never changes backend or target |
 | `phone_screenshot` | — | Capture current screen → PNG image content |
 | `phone_elements` | — | **(wda)** The UI as a flattened element list — prefer over screenshots for reasoning |
-| `phone_tap` | `x`, `y` (0–1) | Single tap at normalized position |
-| `phone_tap_element` | `element`, `snapshot` | **(wda)** Snapshot-bound indexed tap; stale trees are rejected without tapping |
-| `phone_tap_label` | `label` | **(wda)** Exact-label tap; requires one unique match and sends nothing on ambiguity |
-| `phone_scroll` | `x`, `y`, `dx`, `dy` | Scroll-wheel gesture; negative `dy` scrolls content up |
-| `phone_type` | `text` | Type text; with `wda:true` any Unicode (incl. CJK) lands cleanly, else US-ASCII keycodes |
-| `phone_key` | `name` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
-| `phone_shortcut` | `name` | Direct/WDA system shortcut: `home` or `spotlight`; App Switcher is unsupported |
+| `phone_tap` | `x`, `y` (0–1), `observe?` | Single tap at normalized position |
+| `phone_tap_element` | `element`, `snapshot`, `observe?` | **(wda)** Snapshot-bound indexed tap; stale trees are rejected without tapping |
+| `phone_tap_label` | `label`, `observe?` | **(wda)** Exact-label tap; requires one unique match and sends nothing on ambiguity |
+| `phone_scroll` | `x`, `y`, `dx`, `dy`, `observe?` | Scroll-wheel gesture; negative `dy` scrolls content up |
+| `phone_type` | `text`, `observe?` | Type text; with `wda:true` any Unicode (incl. CJK) lands cleanly, else US-ASCII keycodes |
+| `phone_key` | `name`, `observe?` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
+| `phone_shortcut` | `name`, `observe?` | Direct/WDA system shortcut: `home` or `spotlight`; App Switcher is unsupported |
 | `phone_run_steps` | `steps` | Run up to 24 guarded action/wait steps in one MCP call; includes long-press/swipe/drag, strict `tap_locator`, bundle-id `launch_app`, full preflight, one WDA lock, and first-failure stop |
 | `phone_flow_list` | `category?`, `app?`, `verified?` | Installed registry flows with risk/verified/compat/inputs — check this before exploring an app step by step |
 | `phone_flow_info` | `id` | One flow's metadata, inputs, and step templates (never runtime values) |
@@ -272,6 +288,77 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 | `phone_flow_update` | — | Mirror the official registry (checksum + strict validation); network only, phone untouched |
 | `phone_flow_publish` | `source`, `id`, `app_name?`, `aliases?`, `note?`, `confirm` | Fork/branch/PR a validated flow into the registry via `gh`; `confirm=true` only after the user agreed |
 | `phone_flow_report` | `id`, `note?`, `confirm` | File a registry issue for a failed flow using the captured last failure (redacted); `confirm=true` only after the user agreed |
+
+### Reading a result: `structuredContent` vs the text block
+
+**Read `structuredContent` first. If it is absent, read `content` according to
+the tool.** That order is the whole rule; the notes below say what `content`
+holds where it matters, and none of them is a promise about every message a
+tool can produce.
+
+* **`structuredContent` present** — the seven single-step act tools listed
+  above (`phone_tap`, `phone_tap_element`, `phone_tap_label`, `phone_scroll`,
+  `phone_type`, `phone_key`, `phone_shortcut`), `phone_capabilities`, and
+  `phone_run_steps`. Parse it.
+* **For those first eight, the text block is a preview**, trimmed at 8 KiB on
+  a character boundary — a real observation or a large capability response is
+  cut there. Do not parse it as complete JSON.
+* **`phone_run_steps` also keeps the complete batch result in its text**, so
+  callers written before `structuredContent` existed keep working. Either side
+  is safe to parse.
+* **Everything else keeps the return it always had.** `phone_elements`,
+  `phone_status` and the `phone_flow_*` family answer with complete JSON in
+  the text block — including `phone_flow_run`'s execution result, whether the
+  run passed or failed. `phone_screenshot` answers with an **image** block.
+  Errors raised *before* a call reaches the phone — a bad argument, a refused
+  precondition, a transport failure — are explanatory text rather than JSON
+  (`elements failed (is WDA set up? …): <cause>`).
+
+So: do not assume a tool's every reply has one encoding. Take
+`structuredContent` when it is there; otherwise try the tool's documented JSON
+and fall back to reading the text, and reach for `phone_status` or
+`phone_capabilities` when what you need is a machine-readable state.
+
+`observe: true` (off by default, because the settle wait is latency an action
+does not otherwise pay) asks the daemon to watch the screen after the action
+and returns `settle`, `snapshot` and `delta` alongside the result. Read
+`settle.reason`:
+
+| `reason` | Meaning |
+|---|---|
+| `stable` | The screen stopped changing within the budget |
+| `budget_exhausted` | The observation window ran out. Says **nothing** against the action itself |
+| `observation_failed` | The read broke. Also not a statement about the action |
+
+`stale: true` marks a tree from the previous successful read rather than the
+current screen; `sparse: true` marks an empty or container-only tree, which is
+never reported stable.
+
+When a result cannot be confirmed, these tools say so in a form a program can
+branch on rather than in prose:
+
+| `outcome` | `retry_safe` | When |
+|---|---|---|
+| *(absent — success)* | — | The daemon confirmed the action with `ok:true` |
+| `acknowledged` | — | Legacy plain-text `ok` from the Mirror backend: the event was dispatched, `verified:false`, that backend cannot report what happened on screen |
+| `not_sent` | `true` | Nothing was sent — either refused locally (e.g. an empty `snapshot`) or reported as such by the daemon. Either source is valid evidence; the `retry_safe` boolean is what makes it actionable |
+| *(from the daemon)* | *(from the daemon)* | An explicit refusal — an object saying `ok:false` — keeps its own fields, including its own `retry_safe` |
+| `unknown` | `false` | Everything else: an unparseable or oversized body, a non-JSON error page, a dropped connection |
+
+**Branch on `retry_safe`, not on `outcome`.** It is the explicit boolean the
+daemon (or, for a local refusal, this client) sets; `outcome` describes what
+happened, and the two are not interchangeable. A daemon-reported
+`not_sent` with `retry_safe: true` is just as valid evidence as a local
+refusal — but `outcome: "not_sent"` alone never implies a whole batch can be
+replayed, because earlier steps in it may already have run.
+
+This uncertainty vocabulary is not limited to Rule 1: any tool that reports
+`retry_safe` means the same thing by it. Check the tool's own result for the
+field rather than assuming from which rule it follows.
+
+`unknown` means the request may well have reached the phone. **Do not resend
+automatically** — check `phone_elements` or `phone_screenshot` to see whether it
+took effect.
 
 ## Typical session flow
 

@@ -36,6 +36,11 @@ pub struct TapParams {
     pub x: f64,
     /// Vertical position, normalized 0–1 (0 = top edge, 1 = bottom edge).
     pub y: f64,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the tap produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_scroll`].
@@ -50,6 +55,11 @@ pub struct ScrollParams {
     /// Vertical scroll delta. **Positive dy reveals content farther down**;
     /// negative dy reveals content above. Typical magnitude: 30–120.
     pub dy: f64,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_type`].
@@ -58,6 +68,11 @@ pub struct TypeParams {
     /// Unicode text to send through the device-side input service. Focus the
     /// intended field and verify it before typing.
     pub text: String,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_tap_label`].
@@ -66,6 +81,11 @@ pub struct TapLabelParams {
     /// The element's visible accessibility label, exactly as shown by
     /// `phone_elements` (e.g. "新备忘录", "Connect").
     pub label: String,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_tap_element`].
@@ -75,6 +95,11 @@ pub struct TapElementParams {
     pub element: usize,
     /// Snapshot token from the same `phone_elements` response.
     pub snapshot: String,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_key`].
@@ -83,6 +108,11 @@ pub struct KeyParams {
     /// Supported names: `return`/`enter`, `escape`, `space`, `tab`,
     /// `delete`/`backspace`, `up`, `down`, `left`, `right`.
     pub name: String,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_shortcut`].
@@ -91,6 +121,11 @@ pub struct ShortcutParams {
     /// Supported names: `home` (Home Screen) and `spotlight` (search).
     /// App Switcher is unsupported by the Direct/WDA backend.
     pub name: String,
+    /// Ask the daemon to observe the screen after the action and return what
+    /// settled (`settle`, `snapshot`, `delta`). Costs extra latency, so it is
+    /// off unless you need to know what the action produced.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// Parameters for [`phone_run_steps`].
@@ -405,6 +440,32 @@ impl PhoneHandler {
 #[tool_router]
 impl PhoneHandler {
     // -----------------------------------------------------------------------
+    // phone_capabilities
+    // -----------------------------------------------------------------------
+
+    #[tool(
+        description = "What this iphone-use build supports, and whether the phone can be \
+        driven right now. Read-only: it opens no device connection, wakes nothing, and \
+        takes no owner lease, so it is safe to call before deciding what to do. \
+        `supported` is static for the configured backend (single-step and batch action \
+        vocabularies, the closed `perform` set, whether the element tree and post-action \
+        observation exist, and which `mode` values would be accepted). `available` is a \
+        cached snapshot with `blocked_by` naming what stands in the way \
+        (locked, released, reconnecting, human_handoff, owned_by_other, offline); \
+        `ok:null` means the daemon has no evidence either way, not that it is fine. \
+        Scope is UI control and observation only — it says nothing about app \
+        install/uninstall or other management surfaces."
+    )]
+    async fn phone_capabilities(&self) -> CallToolResult {
+        match self.daemon.capabilities().await {
+            Ok(response) => daemon_read_result(&response),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "capabilities failed: {e:#}"
+            ))]),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // phone_screenshot
     // -----------------------------------------------------------------------
 
@@ -446,9 +507,9 @@ impl PhoneHandler {
         pixel-only targets.")]
     async fn phone_tap(
         &self,
-        Parameters(TapParams { x, y }): Parameters<TapParams>,
+        Parameters(TapParams { x, y, observe }): Parameters<TapParams>,
     ) -> CallToolResult {
-        send_input(&self.daemon, &InputMsg::Tap { x, y }).await
+        send_input_observed(&self.daemon, &InputMsg::Tap { x, y }, observe).await
     }
 
     // -----------------------------------------------------------------------
@@ -462,9 +523,9 @@ impl PhoneHandler {
         one screen-length; dy=-80 scrolls back up.")]
     async fn phone_scroll(
         &self,
-        Parameters(ScrollParams { x, y, dx, dy }): Parameters<ScrollParams>,
+        Parameters(ScrollParams { x, y, dx, dy, observe }): Parameters<ScrollParams>,
     ) -> CallToolResult {
-        send_input(&self.daemon, &InputMsg::Scroll { x, y, dx, dy }).await
+        send_input_observed(&self.daemon, &InputMsg::Scroll { x, y, dx, dy }, observe).await
     }
 
     // -----------------------------------------------------------------------
@@ -478,9 +539,9 @@ impl PhoneHandler {
     )]
     async fn phone_type(
         &self,
-        Parameters(TypeParams { text }): Parameters<TypeParams>,
+        Parameters(TypeParams { text, observe }): Parameters<TypeParams>,
     ) -> CallToolResult {
-        send_input(&self.daemon, &InputMsg::Text { text }).await
+        send_input_observed(&self.daemon, &InputMsg::Text { text }, observe).await
     }
 
     // -----------------------------------------------------------------------
@@ -492,12 +553,14 @@ impl PhoneHandler {
         Other names return an explicit unsupported error.")]
     async fn phone_key(
         &self,
-        Parameters(KeyParams { name }): Parameters<KeyParams>,
+        Parameters(KeyParams { name, observe }): Parameters<KeyParams>,
     ) -> CallToolResult {
         let name = name.trim().to_ascii_lowercase();
         match name.as_str() {
             "return" | "enter" | "escape" | "space" | "tab" | "delete" | "backspace" | "up"
-            | "down" | "left" | "right" => send_input(&self.daemon, &InputMsg::Key { name }).await,
+            | "down" | "left" | "right" => {
+                send_input_observed(&self.daemon, &InputMsg::Key { name }, observe).await
+            }
             _ => CallToolResult::error(vec![Content::text(format!(
                 "unsupported key '{name}'; supported: return/enter, escape, space, tab, \
                  delete/backspace, up, down, left, right"
@@ -517,11 +580,13 @@ impl PhoneHandler {
         system App Switcher gesture.")]
     async fn phone_shortcut(
         &self,
-        Parameters(ShortcutParams { name }): Parameters<ShortcutParams>,
+        Parameters(ShortcutParams { name, observe }): Parameters<ShortcutParams>,
     ) -> CallToolResult {
         let name = name.trim().to_ascii_lowercase();
         match name.as_str() {
-            "home" | "spotlight" => send_input(&self.daemon, &InputMsg::Shortcut { name }).await,
+            "home" | "spotlight" => {
+                send_input_observed(&self.daemon, &InputMsg::Shortcut { name }, observe).await
+            }
             "switcher" => CallToolResult::error(vec![Content::text(
                 "unsupported shortcut 'switcher': the Direct/WDA backend cannot open \
                  the iOS App Switcher; use home, spotlight, or launch an app by a \
@@ -561,31 +626,64 @@ impl PhoneHandler {
             Err(error) => return CallToolResult::error(vec![Content::text(error)]),
         };
         let step_count = request["steps"].as_array().map_or(0, Vec::len);
-        match self.daemon.actions(&request).await {
-            Ok(body) => {
-                let hint = (step_count >= 3
-                    && serde_json::from_str::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
-                        == Some(true))
-                .then(|| {
-                    serde_json::json!({
-                        "hint": format!(
-                            "{step_count} steps ran deterministically. If this is a task someone will repeat, \
-                             save it as a flow: write these steps to a v1 JSON file (typed text → named input), \
-                             `flow validate`, then phone_flow_publish (with the user's go-ahead) so the next run \
-                             is one phone_flow_run call. Check phone_flow_list first: it may already exist."
-                        )
-                    })
-                });
+        // The batch entry point answers with the same structured result the
+        // CLI and phone_flow_run do. A failing batch carries the evidence a
+        // caller needs — `failed_step`, `applied_actions`, `retry_safe`, and
+        // each step's `observation` — and flattening that into error prose
+        // (bounded to a couple of kilobytes, at that) threw away exactly the
+        // part that says whether anyone could see the screen.
+        let response = match self.daemon.actions_outcome(&request).await {
+            Ok(response) => response,
+            // The request left this process; what the phone did is unknown.
+            Err(error) => {
+                return unknown_action_result("transport_error", format!("{error:#}"));
+            }
+        };
+
+        // A legacy plain-text `ok` is a Mirror single-action acknowledgement.
+        // It is not a batch result: it carries no per-step outcome, so it can
+        // never stand in for one.
+        if response.confirms_action() {
+            let body = response.body().to_string();
+            let hint = (step_count >= 3).then(|| {
+                serde_json::json!({
+                    "hint": format!(
+                        "{step_count} steps ran deterministically. If this is a task someone will repeat, \
+                         save it as a flow: write these steps to a v1 JSON file (typed text → named input), \
+                         `flow validate`, then phone_flow_publish (with the user's go-ahead) so the next run \
+                         is one phone_flow_run call. Check phone_flow_list first: it may already exist."
+                    )
+                })
+            });
+            return with_structure(
                 CallToolResult::success(vec![Content::text(crate::registry::attach_hint(
                     body, "registry", hint,
-                ))])
-            }
-            Err(error) => CallToolResult::error(vec![Content::text(format!(
-                "multi-step sequence failed: {error:#}"
-            ))]),
+                ))]),
+                &response,
+            );
         }
+
+        if response.explicit_refusal() {
+            // The daemon's own result, whole: status, failed_step, per-step
+            // observations, and its own `retry_safe` judgement.
+            return with_structure(
+                CallToolResult::error(vec![Content::text(response.body().to_string())]),
+                &response,
+            );
+        }
+
+        // Neither a confirmation nor a refusal: the request was answered, but
+        // nothing in the answer says what happened to the phone.
+        unknown_action_result(
+            if response.too_large {
+                "response_too_large"
+            } else if response.json.is_none() {
+                "unparseable_response"
+            } else {
+                "no_verdict_in_response"
+            },
+            format!("HTTP {}: {}", response.status.as_u16(), response.preview()),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -665,15 +763,41 @@ impl PhoneHandler {
     )]
     async fn phone_tap_element(
         &self,
-        Parameters(TapElementParams { element, snapshot }): Parameters<TapElementParams>,
+        Parameters(TapElementParams {
+            element,
+            snapshot,
+            observe,
+        }): Parameters<TapElementParams>,
     ) -> CallToolResult {
-        match self.daemon.tap_element(element, &snapshot).await {
-            Ok(()) => CallToolResult::success(vec![Content::text(format!(
-                "tapped element #{element} from the supplied snapshot"
-            ))]),
-            Err(e) => CallToolResult::error(vec![Content::text(format!(
-                "tap_element #{element} failed: {e:#}"
-            ))]),
+        let observe = observe.unwrap_or(false);
+        // Refused here, before anything is sent: this is the one case where a
+        // retry is provably safe, so it is reported as such rather than as an
+        // unknown outcome.
+        if snapshot.trim().is_empty() {
+            return not_sent_result(
+                "missing_snapshot",
+                "no request was sent: tap_element needs the snapshot token from the \
+                 phone_elements response the index came from."
+                    .to_string(),
+            );
+        }
+        // The snapshot is the caller's. This never substitutes one of its own,
+        // so the daemon's staleness check runs against the tree the caller
+        // actually read.
+        match self
+            .daemon
+            .tap_element_observed(element, &snapshot, observe)
+            .await
+        {
+            Ok(response) => daemon_action_result(
+                &response,
+                observe,
+                &format!("tapped element #{element} from the supplied snapshot"),
+            ),
+            Err(e) => unknown_action_result(
+                "transport_error",
+                format!("tap_element #{element} failed: {e:#}."),
+            ),
         }
     }
 
@@ -689,15 +813,23 @@ impl PhoneHandler {
         phone_elements and call phone_tap_element with that response's snapshot.")]
     async fn phone_tap_label(
         &self,
-        Parameters(TapLabelParams { label }): Parameters<TapLabelParams>,
+        Parameters(TapLabelParams { label, observe }): Parameters<TapLabelParams>,
     ) -> CallToolResult {
-        match self.daemon.tap_label(&label).await {
-            Ok(()) => {
-                CallToolResult::success(vec![Content::text(format!("tapped element: {label}"))])
+        let observe = observe.unwrap_or(false);
+        // The snapshot comes from the element read this call performs — never
+        // a cached or borrowed baseline.
+        match self.daemon.tap_label_observed(&label, observe).await {
+            Ok(response) => {
+                daemon_action_result(&response, observe, &format!("tapped element: {label}"))
             }
-            Err(e) => CallToolResult::error(vec![Content::text(format!(
-                "tap_label '{label}' failed: {e:#}"
-            ))]),
+            // `tap_label` reads the element tree before it taps. A failure in
+            // that read means no tap was sent; a failure after it is unknown.
+            // The two are not distinguishable from here, so this reports the
+            // conservative answer rather than guessing from the message text.
+            Err(e) => unknown_action_result(
+                "transport_error",
+                format!("tap_label '{label}' failed: {e:#}."),
+            ),
         }
     }
 
@@ -857,62 +989,71 @@ impl PhoneHandler {
         if let Err(e) = crate::flow::check_input_map(&inputs, &flow.inputs) {
             return CallToolResult::error(vec![Content::text(format!("{e:#}"))]);
         }
-        let compat = match crate::flow::compat_gate(&flow, &self.daemon, force).await {
-            Ok(report) => report,
+        let (compat, _installed) = match crate::flow::compat_gate(&flow, &self.daemon, force).await
+        {
+            Ok(gate) => gate,
             Err(e) => return CallToolResult::error(vec![Content::text(format!("{e:#}"))]),
         };
-        match crate::flow::execute_flow(&flow, &inputs, &self.daemon, confirm).await {
-            Ok(body) => {
-                let result = serde_json::from_str::<serde_json::Value>(&body)
-                    .unwrap_or(serde_json::Value::String(body));
-                let mut summary = serde_json::json!({
-                    "flow": id,
-                    "verified": flow.meta.verified(),
-                    "risk": flow.meta.risk_label(),
-                    "compat": compat,
-                    "result": result,
-                });
-                if compat.compat == crate::compat::Compat::UntestedNewer {
-                    summary["hint"] = serde_json::json!(
-                        "the installed app is newer than this flow's last verification — if the phone ended where \
-                         the flow promised, publish an updated verified_on (phone_flow_publish) so others get compat=verified"
-                    );
-                } else if !flow.meta.verified() {
-                    summary["hint"] = serde_json::json!(
-                        "this flow had no hardware verification yet — if the phone is now where the flow \
-                         promised, tell the user and offer to add verified_on via phone_flow_publish"
-                    );
-                }
-                CallToolResult::success(vec![Content::text(summary.to_string())])
-            }
+        // One shared execution path with the CLI: the daemon's failure body is
+        // kept whole and diagnosed, never reverse-parsed out of an error
+        // string. An agent driving through MCP sees exactly what a human at
+        // the CLI sees.
+        let run = match crate::flow::execute_and_diagnose(&flow, &inputs, &self.daemon, confirm)
+            .await
+        {
+            Ok(run) => run,
+            // Nothing came back at all — a transport failure, or the flow was
+            // refused before dispatch. There is no result to diagnose.
             Err(e) => {
-                // The daemon's structured result is inside the error chain for
-                // HTTP 4xx/5xx; keep whatever JSON we can find for the report.
-                let text = format!("{e:#}");
-                let result = text.find('{').and_then(|start| {
-                    serde_json::from_str::<serde_json::Value>(&text[start..]).ok()
-                });
-                let status = self
-                    .daemon
-                    .status()
-                    .await
-                    .ok()
-                    .and_then(|s| serde_json::to_value(s).ok());
-                self.remember_flow_failure(crate::contrib::ReportContext {
-                    id: id.clone(),
-                    result,
-                    status,
-                    application: None,
-                    note: None,
-                });
-                CallToolResult::error(vec![Content::text(format!(
-                    "flow {id} did not complete: {text}. Next: read phone_elements to see where the phone \
-                     stopped; if the flow itself is wrong (label changed, app updated), call \
-                     phone_flow_report(id=\"{id}\", confirm=true) with the user's go-ahead — the failure \
-                     details are already captured. Do NOT replay the flow blindly."
+                return CallToolResult::error(vec![Content::text(format!(
+                    "flow {id} did not run: {e:#}. Nothing was recorded; check phone_status and                      do NOT replay blindly."
                 ))])
             }
+        };
+        let mut summary = serde_json::json!({
+            "flow": id,
+            "verified": flow.meta.verified(),
+            "risk": flow.meta.risk_label(),
+            "compat": compat,
+            "result": run.value,
+        });
+        if run.succeeded {
+            if compat.compat == crate::compat::Compat::UntestedNewer {
+                summary["hint"] = serde_json::json!(
+                    "the installed app is newer than this flow's last verification — if the phone ended where                      the flow promised, publish an updated verified_on (phone_flow_publish) so others get compat=verified"
+                );
+            } else if !flow.meta.verified() {
+                summary["hint"] = serde_json::json!(
+                    "this flow had no hardware verification yet — if the phone is now where the flow                      promised, tell the user and offer to add verified_on via phone_flow_publish"
+                );
+            }
+            return CallToolResult::success(vec![Content::text(summary.to_string())]);
         }
+
+        // The pre-flight status is already in hand. Asking again costs a
+        // round trip on a path that has just failed, and would describe the
+        // phone AFTER the failure rather than the run we are reporting.
+        let status = Some(run.preflight_status.clone());
+        self.remember_flow_failure(crate::contrib::ReportContext {
+            id: id.clone(),
+            result: Some(summary["result"].clone()),
+            status,
+            application: None,
+            note: None,
+        });
+        summary["hint"] = serde_json::json!(format!(
+            "flow {id} did not complete ({}). `result.diagnosis` says whether the screen could \
+             be read and which candidates resemble the locator that failed; candidates are for \
+             review only — nothing was retried and the flow was not edited. If the flow itself is \
+             wrong (label changed, app updated), call phone_flow_report(id=\"{id}\", confirm=true) \
+             with the user's go-ahead. Do NOT replay the flow blindly.",
+            match run.status {
+                Some(code) => format!("HTTP {code}"),
+                None => "no answer from the daemon; the outcome is UNKNOWN, not \"never ran\""
+                    .to_string(),
+            }
+        ));
+        CallToolResult::error(vec![Content::text(summary.to_string())])
     }
 
     #[tool(
@@ -1470,16 +1611,492 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
 }
 
 /// Send a single input event and map daemon errors to MCP tool errors.
-async fn send_input(daemon: &DaemonClient, msg: &InputMsg) -> CallToolResult {
-    match daemon.input(msg).await {
-        Ok(()) => CallToolResult::success(vec![Content::text("ok")]),
-        Err(e) => CallToolResult::error(vec![Content::text(format!("input failed: {e:#}"))]),
+/// Attach the parsed JSON as structured content, keeping the text short.
+///
+/// The JSON goes in whole; the text is only a preview. Putting a large body
+/// in the text block is what truncates it — an element tree or a post-action
+/// delta is routinely past any display-sized cap, and a client that reads the
+/// text would then get unparseable, tail-truncated output.
+fn with_structure(
+    mut result: CallToolResult,
+    response: &crate::client::DaemonResponse,
+) -> CallToolResult {
+    // Objects only: MCP structured content is an object, so an array or a
+    // scalar must not be attached even when it parsed.
+    if let Some(json) = response
+        .json
+        .as_ref()
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        result.structured_content = Some(json);
+    }
+    result
+}
+
+/// A mutation whose result is not known, in the one form a caller can branch
+/// on. Never says "not sent": that is a claim about the phone we cannot make
+/// once the request left this process.
+fn unknown_action_result(reason: &str, detail: String) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![Content::text(format!(
+        "outcome unknown: {detail} Do NOT resend automatically — check phone_elements or \
+         phone_screenshot to see whether it took effect."
+    ))]);
+    result.structured_content = Some(serde_json::json!({
+        "ok": false,
+        "error": "outcome_unknown",
+        "outcome": "unknown",
+        "retry_safe": false,
+        "reason": reason,
+    }));
+    result
+}
+
+/// A mutation this process refused before anything left it. Here — and only
+/// here — re-sending is known to be safe, because nothing was sent.
+fn not_sent_result(reason: &str, detail: String) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![Content::text(detail)]);
+    result.structured_content = Some(serde_json::json!({
+        "ok": false,
+        "error": reason,
+        "outcome": "not_sent",
+        "retry_safe": true,
+        "reason": reason,
+    }));
+    result
+}
+
+/// The pre-JSON acknowledgement: `200` with the literal body `ok`.
+///
+/// The Mirror backend still answers this way after injecting a CGEvent, so
+/// treating every non-JSON 2xx as unknown would report every legitimate
+/// Mirror action as an uncertain outcome. Recognised EXACTLY — a 200 whose
+/// body is nothing but `ok` — so an HTML error page or a truncated body stays
+/// unknown.
+///
+/// It acknowledges that the daemon accepted and dispatched the event; it is
+/// NOT evidence that anything happened on screen, because that backend
+/// injects into a Mirroring window and nothing reports back.
+/// [`crate::client::DaemonResponse::confirms_action`] stays strict about
+/// JSON, and this compatibility branch lives only in these seven tools — the
+/// shared adapter and the flow verdicts must not learn it.
+fn is_legacy_ok_ack(response: &crate::client::DaemonResponse) -> bool {
+    response.status == reqwest::StatusCode::OK
+        && response.json.is_none()
+        && !response.too_large
+        && response.body().trim() == "ok"
+}
+
+/// Render one MUTATION's daemon response.
+///
+/// Success requires `confirms_action()`, not `ok()`: a 2xx whose body could
+/// not be read (unparseable, or past the read limit) proves the request was
+/// accepted, never that the phone did anything. Reporting that as a tool
+/// success is how an agent concludes a tap landed when nobody knows.
+///
+/// When there is no usable evidence the result is an error carrying
+/// `retry_safe: false` — "we cannot tell" must not read as "nothing was sent",
+/// because a blind resend is the one outcome that turns an uncertainty into a
+/// duplicate action on a real phone.
+fn daemon_action_result(
+    response: &crate::client::DaemonResponse,
+    observed: bool,
+    plain_success: &str,
+) -> CallToolResult {
+    if response.confirms_action() {
+        let text = if observed {
+            response.preview()
+        } else {
+            plain_success.to_string()
+        };
+        return with_structure(CallToolResult::success(vec![Content::text(text)]), response);
+    }
+    // Legacy plain-text acknowledgement (Mirror). Reported as success because
+    // the event was dispatched, but labelled so nobody mistakes it for a
+    // verified outcome.
+    if is_legacy_ok_ack(response) {
+        let mut result = if observed {
+            // Do not invent an observation this backend cannot produce, and do
+            // not turn "no observation" into a reason to send the action again.
+            CallToolResult::success(vec![Content::text(format!(
+                "{plain_success} (acknowledged, but this backend cannot observe the \
+                 result — check phone_screenshot; do NOT resend)"
+            ))])
+        } else {
+            CallToolResult::success(vec![Content::text(plain_success.to_string())])
+        };
+        result.structured_content = Some(serde_json::json!({
+            "ok": true,
+            "outcome": "acknowledged",
+            "verified": false,
+            "protocol": "legacy_text_ack",
+            "observation": if observed { "unavailable" } else { "not_requested" },
+            "note": "the daemon accepted and dispatched the event; this backend does not \
+                     report what happened on screen",
+        }));
+        return result;
+    }
+    // A refusal the daemon spelled out keeps its own fields — it knows what
+    // happened and said so. "Spelled out" means a body that explicitly says
+    // `ok:false`. Merely parsing is not enough: `500 []`, `500 42` and
+    // `500 {"unrelated":1}` all parse, none of them is the daemon telling us
+    // the action did not run, and treating them as refusals dropped both the
+    // structure (an array cannot be attached) and the unknown contract.
+    // Shared with the batch entry point so both agree on what counts.
+    if response.explicit_refusal() {
+        return with_structure(
+            CallToolResult::error(vec![Content::text(response.failure_summary())]),
+            response,
+        );
+    }
+    // Everything else — an unparseable 2xx, an oversized body, a 500 with an
+    // HTML error page — leaves the fate of the action unknown. A non-2xx does
+    // NOT imply the request never reached the phone: it can fail on the way
+    // back just as easily as on the way out.
+    unknown_action_result(
+        if response.too_large {
+            "response_too_large"
+        } else {
+            "unparseable_response"
+        },
+        format!(
+            "the daemon answered {} and the body could not be read ({}).",
+            response.status,
+            response.preview()
+        ),
+    )
+}
+
+/// Render one READ-ONLY daemon response.
+///
+/// A read has no side effect to be uncertain about, so `ok()` is the right
+/// question here — but a body that could not be parsed is still not data, so
+/// it is reported as a failure rather than handed back as if it were.
+fn daemon_read_result(response: &crate::client::DaemonResponse) -> CallToolResult {
+    if !response.ok() {
+        return with_structure(
+            CallToolResult::error(vec![Content::text(response.failure_summary())]),
+            response,
+        );
+    }
+    // MCP's structured content is an object. A body that parsed into an array
+    // or a scalar is not this endpoint's shape, and attaching it would emit
+    // something the protocol does not allow.
+    if !response.json.as_ref().is_some_and(serde_json::Value::is_object) {
+        return CallToolResult::error(vec![Content::text(format!(
+            "the daemon answered {} but the body was not a JSON object: {}",
+            response.status,
+            response.preview()
+        ))]);
+    }
+    with_structure(
+        CallToolResult::success(vec![Content::text(response.preview())]),
+        response,
+    )
+}
+
+async fn send_input_observed(
+    daemon: &DaemonClient,
+    msg: &InputMsg,
+    observe: Option<bool>,
+) -> CallToolResult {
+    let observe = observe.unwrap_or(false);
+    match daemon.input_observed(msg, observe).await {
+        Ok(response) => daemon_action_result(&response, observe, "ok"),
+        // The request may well have reached the phone before the transport
+        // broke, so this is unknown, not "not sent".
+        Err(e) => unknown_action_result("transport_error", format!("the call failed: {e:#}.")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Real tool calls against a scripted daemon.
+    // ---------------------------------------------------------------------
+
+    /// One-shot HTTP responder. Returns the URL and a join handle so a panic
+    /// inside it surfaces in the test.
+    fn scripted_daemon(status: &str, body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // Non-blocking with a deadline: a blocking `accept` that never gets a
+        // connection — because the test under it failed early — turns a joined
+        // handle into a hung suite.
+        listener.set_nonblocking(true).unwrap();
+        let status = status.to_string();
+        let task = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let mut request = [0_u8; 8_192];
+                        let _ = stream.read(&mut request);
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                        return;
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn handler_for(url: &str) -> PhoneHandler {
+        PhoneHandler::new(DaemonClient::new(url.to_string(), None))
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole point of `observe`: a real observation is far past any
+    /// display-sized cap, and its TAIL is where `settle` and `delta` live. The
+    /// structured content must carry it intact even though the text preview
+    /// is trimmed.
+    #[test]
+    fn an_observed_tap_returns_the_whole_observation_not_a_truncated_preview() {
+        let filler = "x".repeat(64 * 1024);
+        let body = format!(
+            r#"{{"ok":true,"transport":"wda","tree":"{filler}","snapshot":"snap-1","settle":{{"settled":true,"reason":"stable","captures":2}},"delta":{{"added":["搜索"]}}}}"#
+        );
+        assert!(body.len() > 64 * 1024);
+        let (url, task) = scripted_daemon("200 OK", body.into_bytes());
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_tap(Parameters(TapParams {
+            x: 0.5,
+            y: 0.5,
+            observe: Some(true),
+        })));
+        task.join().unwrap();
+
+        assert_ne!(result.is_error, Some(true), "{:?}", text_of(&result));
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("an observed action must return structured content");
+        assert_eq!(structured["settle"]["reason"], "stable");
+        assert_eq!(structured["settle"]["captures"], 2);
+        assert_eq!(structured["delta"]["added"][0], "搜索");
+        assert_eq!(structured["snapshot"], "snap-1");
+    }
+
+    /// Without `observe` the result stays the short string callers already
+    /// parse, and the request must not have asked for a delta.
+    #[test]
+    fn an_unobserved_tap_keeps_its_plain_result() {
+        let (url, task) = scripted_daemon(
+            "200 OK",
+            br#"{"ok":true,"transport":"wda"}"#.to_vec(),
+        );
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_tap(Parameters(TapParams {
+            x: 0.5,
+            y: 0.5,
+            observe: None,
+        })));
+        task.join().unwrap();
+
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(text_of(&result), "ok");
+    }
+
+    /// A refusal must arrive with the fields a caller decides on, not as prose.
+    #[test]
+    fn a_refused_action_keeps_outcome_and_retry_safety() {
+        let (url, task) = scripted_daemon(
+            "409 Conflict",
+            br#"{"ok":false,"error":"phone_owned","outcome":"not_sent","retry_safe":true}"#.to_vec(),
+        );
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_tap(Parameters(TapParams {
+            x: 0.5,
+            y: 0.5,
+            observe: None,
+        })));
+        task.join().unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("a structured refusal must survive");
+        assert_eq!(structured["error"], "phone_owned");
+        assert_eq!(structured["outcome"], "not_sent");
+        assert_eq!(structured["retry_safe"], true);
+        let text = text_of(&result);
+        assert!(text.contains("outcome=not_sent"), "{text}");
+    }
+
+    /// The dangerous case: HTTP said yes, the body says nothing. That is not a
+    /// success, and above all it is not a licence to resend.
+    #[test]
+    fn an_unreadable_success_is_reported_unknown_and_never_retry_safe() {
+        for body in [
+            b"not json at all".to_vec(),
+            vec![b'x'; 5 * 1024 * 1024], // past the read limit
+        ] {
+            let (url, task) = scripted_daemon("200 OK", body);
+            let handler = handler_for(&url);
+
+            let result = block(handler.phone_tap(Parameters(TapParams {
+                x: 0.5,
+                y: 0.5,
+                observe: None,
+            })));
+            task.join().unwrap();
+
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "an unreadable body was reported as a successful tap: {}",
+                text_of(&result)
+            );
+            let structured = result
+                .structured_content
+                .as_ref()
+                .expect("an unknown outcome must still be structured");
+            assert_eq!(structured["outcome"], "unknown");
+            assert_eq!(
+                structured["retry_safe"], false,
+                "an unknown outcome authorised a resend"
+            );
+            let text = text_of(&result);
+            assert!(text.contains("Do NOT resend"), "{text}");
+        }
+    }
+
+    /// A read that could not be parsed is not data, and must not be handed
+    /// back as though it were.
+    #[test]
+    fn capabilities_reports_an_unparseable_body_as_a_failure() {
+        let (url, task) = scripted_daemon("200 OK", b"<html>proxy error</html>".to_vec());
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_capabilities());
+        task.join().unwrap();
+
+        assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+        assert!(result.structured_content.is_none());
+
+        let (url, task) = scripted_daemon(
+            "200 OK",
+            br#"{"ok":true,"backend":"direct","supported":{"element_tree":true}}"#.to_vec(),
+        );
+        let handler = handler_for(&url);
+        let result = block(handler.phone_capabilities());
+        task.join().unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["supported"]["element_tree"],
+            true
+        );
+    }
+
+    /// Tool discovery, from the router the macro actually generates — the same
+    /// list an MCP client receives. Asserting a documented number in prose
+    /// would pass while the server exposed something else.
+    #[test]
+    fn tool_discovery_matches_the_documented_surface() {
+        let router = PhoneHandler::tool_router();
+        let tools = router.list_all();
+        let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        names.sort_unstable();
+
+        assert_eq!(
+            names.len(),
+            21,
+            "tool count changed; update README, the skill, and the CI assertion: {names:?}"
+        );
+        for required in [
+            "phone_capabilities",
+            "phone_status",
+            "phone_run_steps",
+            "phone_hold",
+            "phone_release_owner",
+        ] {
+            assert!(names.contains(&required), "{required} missing: {names:?}");
+        }
+
+        // Discovery must be free to call: no required arguments.
+        let capabilities = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "phone_capabilities")
+            .expect("phone_capabilities");
+        let required = capabilities
+            .input_schema
+            .get("required")
+            .and_then(|value| value.as_array());
+        assert!(
+            required.is_none_or(|list| list.is_empty()),
+            "capability discovery asks for arguments: {:?}",
+            capabilities.input_schema
+        );
+
+        // `observe` is opt-in on every single-step UI tool: in the schema,
+        // never required, so calls written before it keep working.
+        for name in [
+            "phone_tap",
+            "phone_scroll",
+            "phone_type",
+            "phone_key",
+            "phone_shortcut",
+            "phone_tap_element",
+            "phone_tap_label",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            let schema = &tool.input_schema;
+            let properties = schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap_or_else(|| panic!("{name} has no properties: {schema:?}"));
+            assert!(
+                properties.contains_key("observe"),
+                "{name} does not accept observe: {schema:?}"
+            );
+            let required = schema
+                .get("required")
+                .and_then(|value| value.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|value| value.as_str())
+                        .any(|field| field == "observe")
+                })
+                .unwrap_or(false);
+            assert!(!required, "{name} made observe mandatory: {schema:?}");
+        }
+    }
 
     #[test]
     fn multi_step_request_encodes_actions_and_semantic_waits() {

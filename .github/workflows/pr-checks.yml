@@ -1,0 +1,176 @@
+name: PR checks
+
+# The release workflow only runs on a tag, so until now nothing verified a
+# change before it was merged. This runs the parts a regression would show up
+# in: both crates' test suites, and a real MCP handshake against the built
+# binary.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pr-checks-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests and MCP tool discovery
+    # Same image as the release build, so a failure here means the code, not a
+    # different environment.
+    runs-on: macos-14
+    # A deadlocked test holds a macOS runner until GitHub's six-hour ceiling.
+    # This project has already had one: a mock server blocking on `accept` for
+    # a connection a failed test never made. The whole job finishes in a couple
+    # of minutes, so anything past this is stuck rather than slow.
+    timeout-minutes: 30
+
+    env:
+      CARGO_TERM_COLOR: always
+      # Nothing in this job may drive a phone or a Mirroring window: no device
+      # is attached, and reaching for one would hang rather than fail. Point
+      # the daemon URL at a port nothing listens on so any code that tried
+      # would fail fast and visibly.
+      PHONE_REMOTE_URL: http://127.0.0.1:1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      # `set -o pipefail` matters in every step below: a `cargo … | grep`
+      # reports the grep's status, so a compilation failure can otherwise be
+      # reported as a pass.
+      - name: cargo test -p server
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p server --locked
+
+      - name: cargo test -p iphone-use-mcp
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p iphone-use-mcp --locked
+
+      - name: Build the MCP binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p iphone-use-mcp --locked
+
+      # Discovery over the real protocol, against the binary this PR builds.
+      # A documented tool count can drift from what the server exposes; this
+      # cannot.
+      - name: MCP tools/list and schema
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          binary = "target/debug/iphone-use-mcp"
+          requests = "\n".join([
+              json.dumps({
+                  "jsonrpc": "2.0",
+                  "id": 1,
+                  "method": "initialize",
+                  "params": {
+                      "protocolVersion": "2025-06-18",
+                      "capabilities": {},
+                      "clientInfo": {"name": "pr-checks", "version": "0"},
+                  },
+              }),
+              json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+              json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+              "",
+          ])
+          completed = subprocess.run(
+              [binary],
+              input=requests,
+              text=True,
+              capture_output=True,
+              timeout=60,
+              check=True,
+          )
+          responses = [
+              json.loads(line) for line in completed.stdout.splitlines() if line.strip()
+          ]
+          listing = next(item for item in responses if item.get("id") == 2)
+          tools = listing["result"]["tools"]
+          names = sorted(tool["name"] for tool in tools)
+
+          assert len(names) == 21, names
+          for required in (
+              "phone_capabilities",
+              "phone_status",
+              "phone_run_steps",
+              "phone_hold",
+              "phone_release_owner",
+          ):
+              assert required in names, names
+
+          # Discovery must cost nothing to call.
+          capabilities = next(t for t in tools if t["name"] == "phone_capabilities")
+          assert not capabilities["inputSchema"].get("required"), capabilities
+
+          # `observe` is opt-in everywhere it exists: present, never required.
+          # A schema that quietly made it mandatory would break every existing
+          # caller while a text-matching check still passed.
+          for name in (
+              "phone_tap",
+              "phone_scroll",
+              "phone_type",
+              "phone_key",
+              "phone_shortcut",
+              "phone_tap_element",
+              "phone_tap_label",
+          ):
+              schema = next(t for t in tools if t["name"] == name)["inputSchema"]
+              assert "observe" in schema["properties"], (name, schema)
+              assert "observe" not in schema.get("required", []), (name, schema)
+
+          print(f"MCP exposes {len(names)} tools; observe is optional on all seven.")
+          PY
+
+      - name: Offline flow validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/iphone-use-mcp flow validate examples/flows/open-spotlight.json
+
+      - name: Shell and Python helper tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n scripts/setup-wda.sh
+          bash scripts/test-install-release-transaction.sh
+          bash scripts/test-setup-wda-warp-preflight.sh
+          bash scripts/test-setup-wda-lock-backoff.sh
+          bash scripts/test-setup-wda-icon-injection.sh
+          bash scripts/test-setup-wda-proxy-preflight.sh
+          python3 scripts/test-setup-wda-status.py
+          python3 scripts/test-setup-wda-runner-product.py
+          python3 scripts/test-setup-wda-asc-signing.py
+          python3 scripts/test-setup-wda-runner-cache.py
+          python3 scripts/test-auto-update.py
+          # The nightly re-verification canary decides whether an installed
+          # flow still works. Its verdict logic and its record-keeping are
+          # tested here unconditionally — a conditional "run if present" would
+          # let a rename turn "the canary is covered" into a silent skip.
+          python3 scripts/test-flow-reverify-verdicts.py
+          python3 scripts/test-flow-reverify-record.py

@@ -567,21 +567,613 @@ pub fn validate_command(target: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Run evidence (`--artifacts-dir`)
+// ---------------------------------------------------------------------------
+
+/// Version of the on-disk evidence shape. Bump when a reader would break.
+const EVIDENCE_SCHEMA: &str = "iphone-use/flow-run-evidence@1";
+
+/// A prepared, writable evidence directory.
+///
+/// Preparation happens BEFORE anything is sent to the phone: a directory that
+/// cannot be created is a problem worth failing on while nothing has happened
+/// yet. After the run, a write failure can no longer undo what the phone did,
+/// so it is reported alongside the result instead of replacing it.
+#[derive(Debug)]
+pub struct ArtifactsDir {
+    dir: std::path::PathBuf,
+}
+
+impl ArtifactsDir {
+    /// Prepare a private per-run directory under `base`. Call before the first
+    /// mutation.
+    ///
+    /// The base directory is the user's and is left exactly as they made it —
+    /// a `755` directory they already had is not silently tightened. What this
+    /// run writes goes into its own subdirectory, created EXCLUSIVELY with
+    /// mode 0700 at creation time. Creating with the mode (rather than
+    /// `exists()` + `create_dir_all` + `chmod`) leaves no window in which the
+    /// directory is readable by anyone else, and no check-then-create race.
+    pub fn prepare(base: &Path) -> Result<Self> {
+        std::fs::create_dir_all(base)
+            .with_context(|| format!("create artifacts directory {}", base.display()))?;
+        let mut last = None;
+        for _ in 0..8 {
+            let dir = base.join(format!("run-{}", unique_suffix()));
+            let created = {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new()
+                    .recursive(false)
+                    .mode(0o700)
+                    .create(&dir)
+            };
+            match created {
+                Ok(()) => return Ok(Self { dir }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last = Some((dir, error));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!("create private run directory under {}", base.display())
+                    });
+                }
+            }
+        }
+        let (dir, error) = last.expect("the loop only exits here after a collision");
+        Err(anyhow::Error::new(error))
+            .with_context(|| format!("create private run directory {}", dir.display()))
+    }
+
+    /// The directory this run writes into.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Write one run's evidence, created exclusively with mode 0600.
+    ///
+    /// `create_new` means this never overwrites existing evidence and never
+    /// follows a symlink someone planted at the target path — the file is
+    /// private from the moment it exists, rather than being written first and
+    /// tightened afterwards.
+    fn write(&self, evidence: &serde_json::Value, stem: &str) -> Result<std::path::PathBuf> {
+        let body = serde_json::to_vec_pretty(evidence).context("serialize run evidence")?;
+        let mut last_error = None;
+        for attempt in 0..8 {
+            let name = if attempt == 0 {
+                format!("{stem}.json")
+            } else {
+                format!("{stem}-{}.json", unique_suffix())
+            };
+            let path = self.dir.join(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    file.write_all(&body)
+                        .with_context(|| format!("write run evidence {}", path.display()))?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_error = Some((path, error));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error))
+                        .with_context(|| format!("write run evidence {}", path.display()));
+                }
+            }
+        }
+        let (path, error) = last_error.expect("the loop only exits here after a collision");
+        Err(anyhow::Error::new(error))
+            .with_context(|| format!("write run evidence {}", path.display()))
+    }
+}
+
+/// A short, monotonic-ish suffix that makes a filename unique within a second.
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+}
+
+/// Record where the evidence went — or why it did not get there.
+///
+/// The phone has already acted by the time this runs. A failure to WRITE that
+/// down cannot undo it and must not look like a failed run, so the outcome
+/// fields are left exactly as the daemon reported them and the problem is
+/// reported beside them as `artifact_error`.
+fn attach_artifact(value: &mut serde_json::Value, written: Result<std::path::PathBuf>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    match written {
+        Ok(path) => {
+            object.insert(
+                "artifact".into(),
+                serde_json::json!(path.display().to_string()),
+            );
+        }
+        Err(error) => {
+            object.insert(
+                "artifact_error".into(),
+                serde_json::json!(format!("{error:#}")),
+            );
+        }
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Assemble the machine-readable record of one run.
+///
+/// Only white-listed STRUCTURE goes in: the result passes through the same
+/// projection a public issue gets ([`crate::contrib::redact_result`]), so
+/// neither typed input nor screen text is written to disk by default. What a
+/// reader needs to reproduce or triage — the flow's identity and hash, the
+/// versions the run happened against, the outcome, and per-step structure — is
+/// all here.
+///
+/// A version that could not be read is reported as `unavailable`. It is never
+/// guessed, and nothing here starts or claims the device to find one out.
+#[allow(clippy::too_many_arguments)]
+fn build_evidence(
+    target: &str,
+    flow: &ValidatedFlow,
+    sha256: Option<&str>,
+    compat: &crate::compat::CompatReport,
+    installed: Option<&crate::compat::InstalledApps>,
+    daemon_version: Option<&str>,
+    result: &serde_json::Value,
+    started_at: u64,
+    duration_ms: u64,
+) -> serde_json::Value {
+    let unavailable = || serde_json::Value::String("unavailable".to_string());
+    serde_json::json!({
+        "schema": EVIDENCE_SCHEMA,
+        "flow": {
+            "target": target,
+            "name": flow.name(),
+            "steps": flow.meta.steps,
+            "risk": flow.meta.risk_label(),
+            "verified": flow.meta.verified(),
+            "sha256": sha256.map_or_else(unavailable, |sha| serde_json::json!(sha)),
+        },
+        "versions": {
+            "daemon": daemon_version.map_or_else(unavailable, |v| serde_json::json!(v)),
+            "app": compat
+                .installed_version
+                .as_deref()
+                .map_or_else(unavailable, |v| serde_json::json!(v)),
+            "ios": installed
+                .and_then(|apps| apps.ios.as_deref())
+                .map_or_else(unavailable, |v| serde_json::json!(v)),
+            "verified_up_to": compat
+                .verified_up_to
+                .as_deref()
+                .map_or_else(unavailable, |v| serde_json::json!(v)),
+            "compat": compat.compat.as_str(),
+        },
+        "run": {
+            "started_at_unix": started_at,
+            // Measured with a monotonic clock, not a difference of wall-clock
+            // seconds: a run under a second is not a run of zero.
+            "duration_ms": duration_ms,
+        },
+        // Structure only — same projection a public report gets.
+        "result": crate::contrib::redact_result(result),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Failure diagnosis (B1/B3)
+// ---------------------------------------------------------------------------
+
+/// How long the post-failure look at the screen may take. Deliberately short:
+/// the run is already over and its result is already decided, so diagnosis is
+/// a courtesy that must never become the reason a command hangs.
+const DIAGNOSIS_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// At most this many candidate elements are reported. A diagnosis is a lead,
+/// not a screen dump.
+const MAX_CANDIDATES: usize = 5;
+
+/// Locator fields the daemon matches on, in the order a reader scans them.
+const LOCATOR_FIELDS: [&str; 7] = [
+    "label",
+    "identifier",
+    "kind",
+    "value",
+    "focused",
+    "enabled",
+    "visible",
+];
+
+/// The locator a failed step was looking for, if it had one.
+///
+/// Deliberately conservative: only the shapes the daemon itself matches on are
+/// understood, and an unrecognised step yields `None` rather than a guess.
+fn failed_step_locator(
+    step: &serde_json::Value,
+    observation: Option<&serde_json::Value>,
+) -> Option<(serde_json::Value, &'static str)> {
+    let indices = |key: &str| -> Vec<usize> {
+        observation
+            .and_then(|observation| observation.get(key))
+            .and_then(serde_json::Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|index| index as usize)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(expect) = step.get("expect") {
+        // Which locator actually failed is in the daemon's own observation.
+        // Guessing "the first `present` one" describes a different failure
+        // whenever a later locator is the one that did not match.
+        let missing = indices("missing_present");
+        if let Some(locator) = missing
+            .first()
+            .and_then(|index| expect.get("present")?.as_array()?.get(*index))
+        {
+            return Some((locator.clone(), "present"));
+        }
+        let violated = indices("violated_absent");
+        if let Some(locator) = violated
+            .first()
+            .and_then(|index| expect.get("absent")?.as_array()?.get(*index))
+        {
+            return Some((locator.clone(), "absent"));
+        }
+        // No usable observation (the screen was never read): fall back to the
+        // first `present` locator, which is at least what the step asked for.
+        if let Some(locator) = expect
+            .get("present")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|present| present.first())
+        {
+            return Some((locator.clone(), "present"));
+        }
+        return None;
+    }
+    let action = step.get("action").unwrap_or(step);
+    if let Some(locator) = action.get("locator") {
+        return Some((locator.clone(), "locator"));
+    }
+    // A label-addressed tap is a one-field locator.
+    action
+        .get("label")
+        .map(|label| (serde_json::json!({ "label": label }), "locator"))
+}
+
+/// Container/decoration kinds — the same set the daemon calls `container_only`.
+const CONTAINER_KINDS: [&str; 4] = ["Application", "Window", "Other", "Image"];
+
+/// Rank a candidate by WHICH locator fields matched, not how many. Identity
+/// (`identifier`) outranks a human label, which outranks incidental booleans.
+fn locator_weight(matched: &[String]) -> u32 {
+    matched
+        .iter()
+        .map(|field| match field.as_str() {
+            "identifier" => 100,
+            "label" => 40,
+            "kind" => 10,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Score one element row against a locator: which fields matched, which
+/// differed. The basis is reported as FIELD NAMES, so a reader can see why a
+/// candidate is a candidate without the daemon having to explain itself.
+fn candidate_basis(row: &serde_json::Value, locator: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let (mut matched, mut differed) = (Vec::new(), Vec::new());
+    let Some(fields) = locator.as_object() else {
+        return (matched, differed);
+    };
+    for (key, expected) in fields {
+        if !LOCATOR_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        match row.get(key) {
+            Some(actual) if actual == expected => matched.push(key.clone()),
+            _ => differed.push(key.clone()),
+        }
+    }
+    (matched, differed)
+}
+
+/// Look at the screen ONCE after a failed run and say what is there.
+///
+/// Three rules this obeys, because a diagnosis that breaks them is worse than
+/// no diagnosis at all:
+///
+/// * It never re-sends anything. It reads the element tree; that is all.
+/// * It never changes the run's result. A diagnosis that fails is reported as
+///   `diagnosis.error`; `outcome`, `applied_actions` and `retry_safe` are
+///   already decided and are not touched.
+/// * It never silently substitutes a locator. Candidates are reported with the
+///   basis on which they were picked, for a human or agent to judge — the flow
+///   itself is not edited, and nothing is retried against a candidate.
+async fn diagnose_failure(
+    ran_steps: Option<&serde_json::Value>,
+    result: &serde_json::Value,
+    daemon: &DaemonClient,
+) -> Option<serde_json::Value> {
+    if result.get("ok").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    let failed_step = result.get("failed_step").and_then(serde_json::Value::as_u64)?;
+    let step = ran_steps
+        .and_then(serde_json::Value::as_array)
+        .and_then(|steps| steps.get(failed_step as usize))?;
+    let mut diagnosis = serde_json::json!({
+        // The daemon's own 0-based index, carried through unchanged.
+        "failed_step": failed_step,
+        "budget_ms": DIAGNOSIS_BUDGET.as_millis() as u64,
+    });
+    if let Some(kind) = step.get("kind").and_then(serde_json::Value::as_str) {
+        diagnosis["step_kind"] = serde_json::json!(kind);
+    }
+
+    let observation = result.get("observation");
+    let Some((locator, expectation)) = failed_step_locator(step, observation) else {
+        diagnosis["observable"] = serde_json::json!(false);
+        diagnosis["reason"] = serde_json::json!("step_has_no_locator");
+        return Some(diagnosis);
+    };
+    diagnosis["expectation"] = serde_json::json!(expectation);
+
+    let elements = match tokio::time::timeout(DIAGNOSIS_BUDGET, daemon.elements()).await {
+        Err(_) => {
+            diagnosis["observable"] = serde_json::json!(false);
+            diagnosis["reason"] = serde_json::json!("diagnosis_timeout");
+            return Some(diagnosis);
+        }
+        Ok(Err(error)) => {
+            diagnosis["observable"] = serde_json::json!(false);
+            diagnosis["reason"] = serde_json::json!("screen_unreadable");
+            diagnosis["error"] = serde_json::json!(format!("{error:#}"));
+            return Some(diagnosis);
+        }
+        Ok(Ok(body)) => body,
+    };
+    let tree = serde_json::from_str::<serde_json::Value>(&elements).ok();
+    // A tree we could not parse, that carries no `elements`, or that holds
+    // nothing to act on is NOT an observation. Saying `observable: true` here
+    // would be the same mistake as letting an empty tree prove absence.
+    let rows = match tree.as_ref().and_then(|tree| tree.get("elements")) {
+        Some(serde_json::Value::Array(rows)) if !rows.is_empty() => rows.clone(),
+        _ => {
+            diagnosis["observable"] = serde_json::json!(false);
+            diagnosis["reason"] = serde_json::json!("no_readable_tree");
+            return Some(diagnosis);
+        }
+    };
+    if rows.iter().all(|row| {
+        row.get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| CONTAINER_KINDS.contains(&kind))
+    }) {
+        diagnosis["observable"] = serde_json::json!(false);
+        diagnosis["reason"] = serde_json::json!("no_readable_tree");
+        diagnosis["rows"] = serde_json::json!(rows.len());
+        return Some(diagnosis);
+    }
+    diagnosis["observable"] = serde_json::json!(true);
+    diagnosis["rows"] = serde_json::json!(rows.len());
+
+    let mut scored: Vec<(u32, serde_json::Value)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let (matched, differed) = candidate_basis(row, &locator);
+            // Nothing in common is not a candidate, it is noise.
+            (!matched.is_empty()).then(|| {
+                (
+                    locator_weight(&matched),
+                    serde_json::json!({
+                        "index": row.get("index").cloned().unwrap_or(serde_json::json!(index)),
+                        "matched": matched,
+                        "differed": differed,
+                        // Screen text, for THIS authenticated response only.
+                        // It is not written to disk and not published: the
+                        // evidence file and any issue carry structure alone.
+                        "label": row.get("label").cloned().unwrap_or(serde_json::Value::Null),
+                        "kind": row.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                )
+            })
+        })
+        .collect();
+    // Identity beats resemblance: an `identifier` match outranks a `label`
+    // match, which outranks a pile of matching booleans.
+    scored.sort_by_key(|(weight, _)| std::cmp::Reverse(*weight));
+    let exact = scored
+        .iter()
+        .filter(|(_, candidate)| {
+            candidate["differed"]
+                .as_array()
+                .is_some_and(|differed| differed.is_empty())
+        })
+        .count();
+    diagnosis["reason"] = serde_json::json!(match (expectation, exact, scored.len()) {
+        // The element the flow wanted GONE is still here.
+        ("absent", _, _) if exact >= 1 => "still_present",
+        // The locator resolves NOW but did not during the run: a timing
+        // problem, not a wrong selector.
+        (_, 1, _) => "locator_matches_now",
+        (_, 0, 0) => "no_similar_element",
+        (_, 0, _) => "locator_no_match",
+        _ => "locator_ambiguous",
+    });
+    diagnosis["exact_matches"] = serde_json::json!(exact);
+    diagnosis["candidates"] = serde_json::Value::Array(
+        scored
+            .into_iter()
+            .take(MAX_CANDIDATES)
+            .map(|(_, candidate)| candidate)
+            .collect(),
+    );
+    diagnosis["hint"] = serde_json::json!(
+        "candidates are reported for review only; the flow was not edited and nothing was retried"
+    );
+    Some(diagnosis)
+}
+
+/// One executed flow, already turned into the value every entry point reports.
+pub struct DiagnosedRun {
+    /// The daemon's result body, plus `http_status` and, on failure, a
+    /// `diagnosis` block.
+    pub value: serde_json::Value,
+    pub succeeded: bool,
+    /// `None` when no answer arrived at all.
+    pub status: Option<u16>,
+    pub daemon_version: Option<String>,
+    /// The pre-flight `/agent/status` body, so a caller that wants device
+    /// context after a failure does not have to ask again.
+    pub preflight_status: serde_json::Value,
+}
+
+/// Execute a flow and, if it failed, look once at the screen to say why.
+///
+/// Shared by every entry point on purpose: the CLI and the MCP tool are the
+/// same job, and a diagnosis that only one of them can see is a diagnosis the
+/// agent doing the work never reads.
+pub async fn execute_and_diagnose(
+    flow: &ValidatedFlow,
+    inputs: &BTreeMap<String, String>,
+    daemon: &DaemonClient,
+    confirm: bool,
+) -> Result<DiagnosedRun> {
+    let run = execute_flow_run(flow, inputs, daemon, confirm).await?;
+    // An answer we could not read and an answer that never arrived are the
+    // same thing to a caller: the request went out and we do not know what the
+    // phone did. Both are reported as an unknown outcome that is not safe to
+    // retry, with no invented step and no invented count.
+    let unknown = |reason: &str, detail: serde_json::Value| {
+        serde_json::json!({
+            "ok": false,
+            "error": "outcome_unknown",
+            "outcome": "unknown",
+            "retry_safe": false,
+            "reason": reason,
+            "detail": detail,
+        })
+    };
+    let (status, succeeded, mut value) = match &run.outcome {
+        RunAnswer::Answered(response) => {
+            let status = response.status.as_u16();
+            // Success requires POSITIVE evidence, not merely a 2xx: the daemon
+            // answers `200 {"ok":false}` for refusals it wants read, and a 2xx
+            // whose body we could not parse proves the request was accepted,
+            // not that the phone did anything.
+            // Only two answers count as the daemon having spoken: an explicit
+            // confirmation, and an explicit refusal. A body that merely parses
+            // — `{}` , or `{"unrelated":1}` next to a 500 — told us nothing,
+            // and reading it as a verdict would invent one.
+            let value = if response.confirms_action() || response.explicit_refusal() {
+                response
+                    .json
+                    .clone()
+                    .expect("a confirmation or refusal has a body")
+            } else {
+                unknown(
+                    if response.too_large {
+                        "response_too_large"
+                    } else if response.json.is_none() {
+                        "unparseable_response"
+                    } else {
+                        "no_verdict_in_response"
+                    },
+                    serde_json::json!(response.preview()),
+                )
+            };
+            (Some(status), response.confirms_action(), value)
+        }
+        RunAnswer::Unknown { reason, detail } => {
+            (None, false, unknown(reason, serde_json::json!(detail)))
+        }
+    };
+    if let (Some(object), Some(status)) = (value.as_object_mut(), status) {
+        object.insert("http_status".into(), serde_json::json!(status));
+    }
+    // Reporting only: the run already happened and its verdict is fixed.
+    let ran_steps = run.request.get("steps").cloned();
+    if let Some(diagnosis) = diagnose_failure(ran_steps.as_ref(), &value, daemon).await {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("diagnosis".into(), diagnosis);
+        }
+    }
+    Ok(DiagnosedRun {
+        value,
+        succeeded,
+        status,
+        daemon_version: run.daemon_version,
+        preflight_status: run.preflight_status,
+    })
+}
+
 /// `flow run <file|id> [--input K=V]... [--confirm]`.
 pub async fn run_command(
     target: &str,
     assignments: &[String],
     confirm: bool,
     force: bool,
+    artifacts_dir: Option<&Path>,
 ) -> Result<()> {
     let path = registry::resolve_target(target)?;
-    let flow = load_flow(&path)?;
+    // Hash the EXACT bytes this run parses. An index entry describes what was
+    // downloaded once; it does not prove what is on disk now, and a local file
+    // run directly has no index entry at all.
+    let bytes = read_flow_bytes(&path)?;
+    let sha256 = registry::sha256_hex(&bytes);
+    let flow = parse_flow(&bytes, &path.display().to_string())?;
     let inputs = parse_input_assignments(assignments, &flow.inputs)?;
     let daemon = DaemonClient::from_env();
-    let report = compat_gate(&flow, &daemon, force).await?;
-    let result = execute_flow(&flow, &inputs, &daemon, confirm).await?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
+    // One lookup, reused for the evidence record: asking twice would be a
+    // second round trip purely to write down what we already knew.
+    let (report, installed) = compat_gate(&flow, &daemon, force).await?;
+    // Prepared BEFORE anything is sent: an unusable evidence directory is
+    // worth failing on while the phone has not moved yet.
+    let artifacts = artifacts_dir.map(ArtifactsDir::prepare).transpose()?;
+
+    let started_at = unix_seconds();
+    let clock = std::time::Instant::now();
+    let run = execute_and_diagnose(&flow, &inputs, &daemon, confirm).await?;
+    let duration_ms = clock.elapsed().as_millis() as u64;
+    let (succeeded, status) = (run.succeeded, run.status);
+    let mut value = run.value;
+
+    if let Some(artifacts) = &artifacts {
+        let evidence = build_evidence(
+            target,
+            &flow,
+            Some(&sha256),
+            &report,
+            installed.as_ref(),
+            run.daemon_version.as_deref(),
+            &value,
+            started_at,
+            duration_ms,
+        );
+        let written = artifacts.write(&evidence, "result");
+        attach_artifact(&mut value, written);
+    }
     if let Some(object) = value.as_object_mut() {
         object.insert("compat".into(), serde_json::to_value(&report)?);
         if report.compat == crate::compat::Compat::UntestedNewer {
@@ -594,6 +1186,22 @@ pub async fn run_command(
         }
     }
     println!("{value}");
+    if !succeeded {
+        // The machine-readable result is on stdout; the exit code still says
+        // the run failed. Recording evidence never turns a failure into a
+        // success, and an `artifact_error` never turns a success into failure.
+        bail!(
+            "flow {:?} did not succeed ({}); the full result is on stdout — never replay \
+             automatically",
+            flow.name(),
+            match status {
+                Some(code) => format!("HTTP {code}"),
+                // No answer came back. The request went out, so this is an
+                // unknown outcome — not "it never ran".
+                None => "no answer from the daemon; outcome unknown".to_string(),
+            }
+        );
+    }
     Ok(())
 }
 
@@ -603,7 +1211,7 @@ pub async fn compat_gate(
     flow: &ValidatedFlow,
     daemon: &DaemonClient,
     force: bool,
-) -> Result<crate::compat::CompatReport> {
+) -> Result<(crate::compat::CompatReport, Option<crate::compat::InstalledApps>)> {
     let installed = crate::compat::installed_apps(daemon).await;
     let report = crate::compat::compat_for(&flow.meta, installed.as_ref());
     if report.compat.blocks_run() && !force {
@@ -615,19 +1223,70 @@ pub async fn compat_gate(
             report.reason
         );
     }
-    Ok(report)
+    Ok((report, installed))
 }
 
 /// Execute one validated flow exactly once. `confirm` is the explicit
 /// acknowledgement a `risk:"side_effect"` flow requires; without it nothing is
 /// sent. Unverified flows still run (that is how they get verified) but the
 /// caller is expected to surface `verified:false` from the summary.
-pub async fn execute_flow(
+/// Whether this error proves the request never left this machine.
+///
+/// Only a connect failure does. A timeout or a broken read happens after the
+/// bytes went out, and the phone may well have acted on them.
+fn transport_never_sent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+    })
+}
+
+/// One executed flow: the daemon's answer, plus what we learned on the way in.
+/// What came back from a dispatched batch — or the fact that nothing did.
+///
+/// A request that was written to the socket and then lost its answer is NOT
+/// the same as a request that never left. The first is an unknown outcome the
+/// caller must not retry; the second is genuinely "nothing was sent". Only the
+/// connect phase can honestly claim the latter.
+#[derive(Debug)]
+pub enum RunAnswer {
+    Answered(crate::client::DaemonResponse),
+    /// The request went out; the answer did not come back.
+    Unknown {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct FlowRun {
+    pub outcome: RunAnswer,
+    /// The pre-flight status body, kept so nothing has to re-ask for it.
+    pub preflight_status: serde_json::Value,
+    /// The exact request body the daemon ran, inputs already substituted.
+    /// Diagnosis reads the steps from here, never from the templates: a
+    /// parameterized template still holds a placeholder, and looking for a
+    /// placeholder on screen finds nothing.
+    pub request: serde_json::Value,
+    /// Daemon version from the pre-flight status — already fetched, so no
+    /// second round trip after the run just to record a version.
+    pub daemon_version: Option<String>,
+}
+
+/// Execute one validated flow exactly once and keep the daemon's answer whole,
+/// including a FAILURE answer.
+///
+/// A failed flow is a non-2xx status with a complete JSON body — `failed_step`,
+/// `outcome`, `applied_actions`, `retry_safe`, per-step results. That body is
+/// the whole point of running a flow that then fails, so it is carried back
+/// rather than collapsed into an error string.
+pub async fn execute_flow_run(
     flow: &ValidatedFlow,
     inputs: &BTreeMap<String, String>,
     daemon: &DaemonClient,
     confirm: bool,
-) -> Result<String> {
+) -> Result<FlowRun> {
     if flow.meta.risk == Some(FlowRisk::SideEffect) && !confirm {
         bail!(
             "flow {:?} is declared risk=side_effect (sends, publishes, pays, or deletes); \
@@ -638,29 +1297,53 @@ pub async fn execute_flow(
     }
     let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs))?;
     let request = phone_steps_request(steps).map_err(anyhow::Error::msg)?;
-    let status = daemon
-        .status()
+    let status_body = daemon
+        .get_text("/agent/status")
         .await
         .context("preflight GET /agent/status before flow execution")?;
-    if status.backend.as_deref() != Some("direct") {
+    let status: serde_json::Value =
+        serde_json::from_str(&status_body).context("parse /agent/status")?;
+    if status.get("backend").and_then(serde_json::Value::as_str) != Some("direct") {
         bail!(
             "flow execution requires backend=direct; daemon reported {:?}",
-            status.backend
+            status.get("backend")
         );
     }
-    if status.drivable != Some(true) {
+    if status.get("drivable").and_then(serde_json::Value::as_bool) != Some(true) {
         bail!(
             "phone is not drivable; no flow action was sent (state={:?}, hint={:?})",
-            status.device_state,
-            status.hint
+            status.get("device_state"),
+            status.get("hint")
         );
     }
-
-    let result = daemon
-        .actions(&request)
-        .await
-        .with_context(|| format!("run flow {:?}; never replay automatically", flow.name()))?;
-    Ok(result)
+    let daemon_version = status
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let outcome = match daemon.actions_outcome(&request).await {
+        Ok(response) => RunAnswer::Answered(response),
+        // A connection that never opened means nothing reached the phone, and
+        // saying so is safe. Anything later — the request was already on the
+        // wire — leaves us not knowing what the phone did.
+        Err(error) if transport_never_sent(&error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "flow {:?} was not sent: the daemon could not be reached",
+                    flow.name()
+                )
+            });
+        }
+        Err(error) => RunAnswer::Unknown {
+            reason: "transport_error",
+            detail: format!("{error:#}"),
+        },
+    };
+    Ok(FlowRun {
+        outcome,
+        request,
+        daemon_version,
+        preflight_status: status,
+    })
 }
 
 #[cfg(test)]
@@ -892,7 +1575,7 @@ mod tests {
         }"#;
         let (url, task, requests) = mock_daemon_sequence(&[("200 OK", status)]);
 
-        let error = execute_flow(
+        let error = execute_flow_run(
             &flow,
             &BTreeMap::new(),
             &DaemonClient::new(url, None),
@@ -909,6 +1592,425 @@ mod tests {
         assert!(requests.try_recv().is_err());
     }
 
+    // -----------------------------------------------------------------
+    // Failure diagnosis
+    // -----------------------------------------------------------------
+
+    fn failing_result(step: u64) -> serde_json::Value {
+        serde_json::json!({
+            "ok": false,
+            "error": "expectation_timeout",
+            "failed_step": step,
+            "outcome": "not_sent",
+            "applied_actions": 2,
+            "retry_safe": true,
+            "observation": {"read": true, "sparse": false, "missing_present": [0]}
+        })
+    }
+
+    /// The steps as the daemon received them, inputs already substituted.
+    fn ran_steps(flow: &ValidatedFlow, inputs: &BTreeMap<String, String>) -> serde_json::Value {
+        let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs)).unwrap();
+        phone_steps_request(steps).unwrap()["steps"].clone()
+    }
+
+    #[tokio::test]
+    async fn diagnosis_reports_candidates_with_the_basis_it_picked_them_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.json");
+        fs::write(&path, valid_flow()).unwrap();
+        let flow = load_flow(&path).unwrap();
+        // Step 3 waits for a TextField. The screen has one, plus a button that
+        // shares nothing with the locator.
+        let elements = r#"{"ok":true,"snapshot":"S","elements":[
+            {"index":0,"kind":"Button","label":"取消"},
+            {"index":1,"kind":"TextField","label":"搜索"}
+        ]}"#;
+        let (url, task, requests) = mock_daemon_sequence(&[("200 OK", elements)]);
+
+        let steps = ran_steps(&flow, &BTreeMap::new());
+        let diagnosis = diagnose_failure(
+            Some(&steps),
+            &failing_result(3),
+            &DaemonClient::new(url, None),
+        )
+        .await
+        .expect("a failed run is diagnosed");
+        task.join().unwrap();
+
+        assert_eq!(diagnosis["failed_step"], 3, "the daemon's 0-based index is carried through");
+        assert_eq!(diagnosis["step_kind"], "wait_for");
+        assert_eq!(diagnosis["observable"], true);
+        assert_eq!(diagnosis["rows"], 2);
+        // The locator resolves NOW: a timing problem, not a wrong selector.
+        assert_eq!(diagnosis["reason"], "locator_matches_now");
+        assert_eq!(diagnosis["exact_matches"], 1);
+        let candidates = diagnosis["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "the unrelated button is noise, not a candidate");
+        assert_eq!(candidates[0]["index"], 1);
+        assert_eq!(candidates[0]["matched"], serde_json::json!(["kind"]));
+        assert_eq!(candidates[0]["differed"], serde_json::json!([]));
+
+        // Exactly one read, and it is a read.
+        let request = requests.recv().unwrap();
+        assert!(request.starts_with("GET /agent/elements"), "{request}");
+        assert!(requests.try_recv().is_err(), "diagnosis must not send anything else");
+    }
+
+    /// Diagnosis is a courtesy. When the screen cannot be read it says so, and
+    /// the run's own result is not affected in any way.
+    #[tokio::test]
+    async fn an_unreadable_screen_is_reported_without_touching_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.json");
+        fs::write(&path, valid_flow()).unwrap();
+        let flow = load_flow(&path).unwrap();
+        let (url, task, _requests) =
+            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"wda_source_failed"}"#)]);
+
+        let result = failing_result(3);
+        let steps = ran_steps(&flow, &BTreeMap::new());
+        let diagnosis = diagnose_failure(Some(&steps), &result, &DaemonClient::new(url, None))
+            .await
+            .unwrap();
+        task.join().unwrap();
+
+        assert_eq!(diagnosis["observable"], false);
+        assert_eq!(diagnosis["reason"], "screen_unreadable");
+        // Untouched.
+        assert_eq!(result["outcome"], "not_sent");
+        assert_eq!(result["applied_actions"], 2);
+        assert_eq!(result["retry_safe"], true);
+    }
+
+    #[tokio::test]
+    async fn a_successful_run_is_not_diagnosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.json");
+        fs::write(&path, valid_flow()).unwrap();
+        let flow = load_flow(&path).unwrap();
+        // No mock daemon at all: a passing run must not read the screen.
+        let steps = ran_steps(&flow, &BTreeMap::new());
+        let diagnosis = diagnose_failure(
+            Some(&steps),
+            &serde_json::json!({"ok": true, "completed": 4}),
+            &DaemonClient::new("http://127.0.0.1:1".to_string(), None),
+        )
+        .await;
+        assert!(diagnosis.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Run evidence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_unusable_artifacts_directory_fails_before_anything_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where a directory would have to be.
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"x").unwrap();
+        let error = ArtifactsDir::prepare(&blocker.join("runs")).unwrap_err();
+        assert!(
+            error.to_string().contains("create artifacts directory"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn evidence_is_written_private_and_carries_structure_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let flow_dir = tempfile::tempdir().unwrap();
+        let path = flow_dir.path().join("flow.json");
+        fs::write(&path, valid_flow()).unwrap();
+        let flow = load_flow(&path).unwrap();
+
+        let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
+        // The per-run directory is private from the moment it exists.
+        assert_eq!(
+            fs::metadata(artifacts.dir()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let compat = crate::compat::compat_for(&flow.meta, None);
+        let result = serde_json::json!({
+            "ok": false,
+            "error": "expectation_timeout",
+            "failed_step": 3,
+            "outcome": "not_sent",
+            "applied_actions": 2,
+            "observation": {"read": true, "sparse": false, "application": "招商银行"},
+            "steps": [{"index": 0, "kind": "action", "action": {"type": "text", "text": "私密内容"}}]
+        });
+        let evidence = build_evidence(
+            "health/open",
+            &flow,
+            Some("abc123"),
+            &compat,
+            None,
+            None,
+            &result,
+            1_700_000_000,
+            12_345,
+        );
+        let written = artifacts.write(&evidence, "result").unwrap();
+
+        assert_eq!(
+            fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "run evidence must not be world-readable"
+        );
+        assert!(written.ends_with("result.json"), "{written:?}");
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&written).unwrap()).unwrap();
+        assert_eq!(stored["schema"], EVIDENCE_SCHEMA);
+        assert_eq!(stored["flow"]["sha256"], "abc123");
+        assert_eq!(stored["flow"]["steps"], 4);
+        // A version nobody could read is said to be unavailable, never guessed.
+        assert_eq!(stored["versions"]["daemon"], "unavailable");
+        assert_eq!(stored["versions"]["app"], "unavailable");
+        assert_eq!(stored["run"]["started_at_unix"], 1_700_000_000_u64);
+        assert_eq!(stored["run"]["duration_ms"], 12_345);
+        assert_eq!(stored["versions"]["ios"], "unavailable");
+        // Structure survives; screen text and typed input do not.
+        assert_eq!(stored["result"]["error"], "expectation_timeout");
+        assert_eq!(stored["result"]["observation"]["read"], true);
+        let text = String::from_utf8(fs::read(&written).unwrap()).unwrap();
+        assert!(!text.contains("招商银行"), "{text}");
+        assert!(!text.contains("私密内容"), "{text}");
+    }
+
+    /// The phone has already acted by the time evidence is written. A write
+    /// that fails must not rewrite that, and must not look like a failed run.
+    #[test]
+    fn a_write_failure_after_the_run_keeps_the_result_intact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
+        let dir = artifacts.dir().to_path_buf();
+        // The directory stops being writable AFTER the run — exactly the case
+        // where the phone has already acted.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut value = serde_json::json!({
+            "ok": true,
+            "completed": 4,
+            "applied_actions": 2,
+            "outcome": "applied",
+            "retry_safe": false
+        });
+        let written = artifacts.write(&serde_json::json!({"schema": EVIDENCE_SCHEMA}), "result");
+        // Restore before the assertions so the tempdir can clean itself up.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(written.is_err(), "the write must actually fail");
+        attach_artifact(&mut value, written);
+
+        assert!(value["artifact_error"].is_string(), "{value}");
+        assert!(value["artifact"].is_null());
+        // The run's own verdict is untouched.
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["outcome"], "applied");
+        assert_eq!(value["applied_actions"], 2);
+        assert_eq!(value["retry_safe"], false);
+    }
+
+    /// Two runs in the same second are two runs. Neither may overwrite the
+    /// other's evidence just because the names would collide.
+    #[test]
+    fn two_runs_in_the_same_second_keep_both_records() {
+        let home = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
+
+        let first = artifacts.write(&serde_json::json!({"run": 1}), "result").unwrap();
+        let second = artifacts.write(&serde_json::json!({"run": 2}), "result").unwrap();
+
+        assert_ne!(first, second);
+        let first: serde_json::Value =
+            serde_json::from_slice(&fs::read(&first).unwrap()).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_slice(&fs::read(&second).unwrap()).unwrap();
+        assert_eq!(first["run"], 1, "the first record survived the second run");
+        assert_eq!(second["run"], 2);
+    }
+
+    /// Nothing already sitting at the evidence path is touched — not a plain
+    /// file, and not a symlink pointing somewhere else entirely.
+    #[test]
+    fn an_existing_file_or_symlink_at_the_target_is_never_written_through() {
+        let home = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
+        let dir = artifacts.dir().to_path_buf();
+
+        // Something precious, reachable through a symlink at the target name.
+        let precious = home.path().join("precious.txt");
+        fs::write(&precious, b"do not clobber").unwrap();
+        std::os::unix::fs::symlink(&precious, dir.join("result.json")).unwrap();
+
+        let written = artifacts
+            .write(&serde_json::json!({"schema": EVIDENCE_SCHEMA}), "result")
+            .unwrap();
+
+        assert_ne!(written, dir.join("result.json"));
+        assert_eq!(
+            fs::read_to_string(&precious).unwrap(),
+            "do not clobber",
+            "the symlink target must be untouched"
+        );
+    }
+
+    /// A directory the user already had is theirs; recording a run does not
+    /// quietly tighten its permissions.
+    #[test]
+    fn an_existing_directory_keeps_its_own_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("mine");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let artifacts = ArtifactsDir::prepare(&dir).unwrap();
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the base directory the user made is left as they made it"
+        );
+        assert_eq!(
+            fs::metadata(artifacts.dir()).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "but this run's own directory is private"
+        );
+    }
+
+    /// A failure body survives as a RESULT, with everything a caller needs to
+    /// decide what to do next. (The path that raised such a body as an error —
+    /// and forced callers to reverse-parse JSON out of a message — is gone.)
+    #[tokio::test]
+    async fn a_failure_body_comes_back_as_a_result_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.json");
+        fs::write(&path, valid_flow()).unwrap();
+        let flow = load_flow(&path).unwrap();
+        let status = r#"{"ok":true,"backend":"direct","drivable":true}"#;
+        let failure = r#"{"ok":false,"error":"expectation_timeout","failed_step":3,"applied_actions":2}"#;
+
+        let (url, task, _requests) =
+            mock_daemon_sequence(&[("200 OK", status), ("409 Conflict", failure)]);
+        let run = execute_flow_run(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), false)
+            .await
+            .expect("a failed flow is a result, not an error");
+        task.join().unwrap();
+
+        let RunAnswer::Answered(response) = run.outcome else {
+            panic!("a 409 IS an answer");
+        };
+        assert!(!response.ok());
+        assert!(response.explicit_refusal(), "the daemon said no, explicitly");
+        assert_eq!(response.status.as_u16(), 409);
+        let body = response.json.expect("the daemon's JSON body is kept");
+        assert_eq!(body["failed_step"], 3);
+        assert_eq!(body["applied_actions"], 2, "what the phone did is not lost");
+    }
+
+    /// The whole CLI path on the failure that matters    /// The whole CLI path on the failure that matters: the daemon answers 409
+    /// with a complete body, and the run has already applied actions.
+    ///
+    /// Before the structured result path existed, `actions()` raised that 409
+    /// as an error, `run_command` returned early, and the diagnosis and the
+    /// evidence file never happened at all — on precisely the runs they exist
+    /// for.
+    #[tokio::test]
+    async fn a_failing_run_still_reports_diagnoses_and_records() {
+        let home = tempfile::tempdir().unwrap();
+        let flow_path = home.path().join("flow.json");
+        fs::write(&flow_path, valid_flow()).unwrap();
+        let runs = home.path().join("runs");
+
+        let status = r#"{"ok":true,"backend":"direct","drivable":true,"version":"0.6.4"}"#;
+        // A real failure: two steps applied, the third expectation never met.
+        let failure = r#"{"ok":false,"error":"expectation_timeout","failed_step":3,
+            "completed":3,"applied_actions":2,"outcome":"not_sent","retry_safe":true,
+            "observation":{"read":true,"sparse":false,"missing_present":[0]}}"#;
+        let elements = r#"{"ok":true,"snapshot":"S","elements":[
+            {"index":0,"kind":"TextField","label":"搜索"}
+        ]}"#;
+        let (url, task, requests) = mock_daemon_sequence(&[
+            // compat lookup: no apps, and no udid to fall back on
+            ("200 OK", "{}"),
+            ("200 OK", r#"{"ok":true}"#),
+            // the run itself
+            ("200 OK", status),
+            ("409 Conflict", failure),
+            // the one diagnostic read
+            ("200 OK", elements),
+        ]);
+        let store = tempfile::tempdir().unwrap();
+        std::env::set_var("PHONE_REMOTE_URL", &url);
+        std::env::set_var(registry::STORE_ENV, store.path());
+
+        let error = run_command(
+            flow_path.to_str().unwrap(),
+            &[],
+            false,
+            true, // --force: compat is not what this test is about
+            Some(&runs),
+        )
+        .await
+        .expect_err("a failed flow must still exit non-zero");
+        task.join().unwrap();
+        std::env::remove_var("PHONE_REMOTE_URL");
+        std::env::remove_var(registry::STORE_ENV);
+
+        assert!(error.to_string().contains("did not succeed (HTTP 409)"), "{error:#}");
+
+        // Exactly one mutation, and exactly one read after it.
+        assert!(requests.recv().unwrap().starts_with("GET /agent/apps"));
+        assert!(requests.recv().unwrap().starts_with("GET /agent/status"));
+        assert!(requests.recv().unwrap().starts_with("GET /agent/status"));
+        let action = requests.recv().unwrap();
+        assert!(action.starts_with("POST /agent/actions"), "{action}");
+        let read = requests.recv().unwrap();
+        assert!(read.starts_with("GET /agent/elements"), "{read}");
+        assert!(requests.try_recv().is_err(), "nothing may be re-sent");
+
+        // The evidence file exists and kept the failure verbatim.
+        let run_dirs: Vec<_> = fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(run_dirs.len(), 1, "{run_dirs:?}");
+        let written: Vec<_> = fs::read_dir(&run_dirs[0])
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(written.len(), 1, "{written:?}");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&written[0]).unwrap()).unwrap();
+        assert_eq!(stored["result"]["error"], "expectation_timeout");
+        assert_eq!(stored["result"]["failed_step"], 3);
+        assert_eq!(
+            stored["result"]["applied_actions"], 2,
+            "what the phone actually did must survive: {stored}"
+        );
+        assert_eq!(stored["result"]["outcome"], "not_sent");
+        assert_eq!(stored["versions"]["daemon"], "0.6.4");
+        // The hash is of the bytes this run parsed, not of an index entry.
+        assert_eq!(
+            stored["flow"]["sha256"],
+            registry::sha256_hex(&fs::read(&flow_path).unwrap())
+        );
+        assert!(stored["run"]["duration_ms"].is_u64());
+    }
+
     #[tokio::test]
     async fn run_posts_one_guarded_batch_after_a_drivable_preflight() {
         let dir = tempfile::tempdir().unwrap();
@@ -919,7 +2021,7 @@ mod tests {
         let result = r#"{"ok":true,"completed":4,"applied_actions":2}"#;
         let (url, task, requests) = mock_daemon_sequence(&[("200 OK", status), ("200 OK", result)]);
 
-        let body = execute_flow(
+        let body = execute_flow_run(
             &flow,
             &BTreeMap::new(),
             &DaemonClient::new(url, None),
@@ -929,7 +2031,10 @@ mod tests {
         .unwrap();
         task.join().unwrap();
 
-        assert_eq!(body, result);
+        let RunAnswer::Answered(response) = body.outcome else {
+            panic!("the daemon answered");
+        };
+        assert_eq!(response.body(), result);
         assert!(requests.recv().unwrap().starts_with("GET /agent/status "));
         let action = requests.recv().unwrap();
         assert!(action.starts_with("POST /agent/actions "));
@@ -943,7 +2048,7 @@ mod tests {
         fs::write(&path, parameterized_flow()).unwrap();
         let flow = load_flow(&path).unwrap();
 
-        let error = execute_flow(
+        let error = execute_flow_run(
             &flow,
             &BTreeMap::new(),
             &DaemonClient::new("http://127.0.0.1:9".to_string(), None),
@@ -1013,7 +2118,7 @@ mod tests {
         .unwrap();
         let flow = load_flow(&path).unwrap();
         let unreachable = DaemonClient::new("http://127.0.0.1:9".to_string(), None);
-        let error = execute_flow(&flow, &BTreeMap::new(), &unreachable, false)
+        let error = execute_flow_run(&flow, &BTreeMap::new(), &unreachable, false)
             .await
             .unwrap_err()
             .to_string();
@@ -1024,10 +2129,13 @@ mod tests {
         let result = r#"{"ok":true,"completed":1,"applied_actions":1}"#;
         let (url, task, _requests) =
             mock_daemon_sequence(&[("200 OK", status), ("200 OK", result)]);
-        let body = execute_flow(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), true)
+        let body = execute_flow_run(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), true)
             .await
             .unwrap();
         task.join().unwrap();
-        assert_eq!(body, result);
+        let RunAnswer::Answered(response) = body.outcome else {
+            panic!("the daemon answered");
+        };
+        assert_eq!(response.body(), result);
     }
 }

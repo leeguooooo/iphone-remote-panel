@@ -183,14 +183,46 @@ jobs:
           listing = next(item for item in responses if item.get("id") == 2)
           tools = listing["result"]["tools"]
           names = [tool["name"] for tool in tools]
-          assert len(names) == 20, names
-          for required in ("phone_run_steps", "phone_hold", "phone_release_owner", "phone_status"):
+          assert len(names) == 21, names
+          for required in (
+              "phone_run_steps",
+              "phone_hold",
+              "phone_release_owner",
+              "phone_status",
+              "phone_capabilities",
+          ):
               assert required in names, names
           run_steps = next(
               tool for tool in tools if tool["name"] == "phone_run_steps"
           )
           assert "steps" in run_steps["inputSchema"]["properties"], run_steps
-          print("Bundled MCP exposes 20 tools including phone_run_steps and phone_hold.")
+
+          # Discovery must cost nothing: no arguments to supply.
+          capabilities = next(
+              tool for tool in tools if tool["name"] == "phone_capabilities"
+          )
+          assert not capabilities["inputSchema"].get("required"), capabilities
+
+          # `observe` is opt-in on every single-step UI tool: present in the
+          # schema, never required, so existing callers keep working.
+          observing = (
+              "phone_tap",
+              "phone_scroll",
+              "phone_type",
+              "phone_key",
+              "phone_shortcut",
+              "phone_tap_element",
+              "phone_tap_label",
+          )
+          for name in observing:
+              tool = next(item for item in tools if item["name"] == name)
+              schema = tool["inputSchema"]
+              assert "observe" in schema["properties"], (name, schema)
+              assert "observe" not in schema.get("required", []), (name, schema)
+          print(
+              "Bundled MCP exposes 21 tools; observe is optional on "
+              f"{len(observing)} single-step UI tools."
+          )
 
           flow = subprocess.run(
               [

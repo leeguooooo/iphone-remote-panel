@@ -72,6 +72,11 @@ enum FlowCommand {
         /// Run even when compat is broken/incompatible for the installed app version.
         #[arg(long)]
         force: bool,
+        /// Write a machine-readable record of this run into DIR (created 0700,
+        /// files 0600). Structure only: typed input and screen text are never
+        /// written. Checked for writability before anything is sent.
+        #[arg(long = "artifacts-dir", value_name = "DIR")]
+        artifacts_dir: Option<std::path::PathBuf>,
     },
     /// Show the app versions installed on the phone that compat is computed from.
     Apps {
@@ -171,7 +176,17 @@ async fn main() -> anyhow::Result<()> {
                 inputs,
                 confirm,
                 force,
-            } => flow::run_command(&target, &inputs, confirm, force).await,
+                artifacts_dir,
+            } => {
+                flow::run_command(
+                    &target,
+                    &inputs,
+                    confirm,
+                    force,
+                    artifacts_dir.as_deref(),
+                )
+                .await
+            }
             FlowCommand::Apps { json } => {
                 let daemon = client::DaemonClient::from_env();
                 match compat::installed_apps(&daemon).await {

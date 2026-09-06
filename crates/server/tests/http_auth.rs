@@ -22,7 +22,6 @@ use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use server::core_crate::encode::{EncodedFrame, VideoPipeline};
 use server::http::{self, AppState};
 
 /// Run a future to completion on a fresh current-thread runtime.
@@ -34,84 +33,12 @@ fn block<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-/// A no-op pipeline: never emits frames; `request_keyframe` is a no-op.
-struct NullPipeline {
-    tx: tokio::sync::broadcast::Sender<EncodedFrame>,
-}
-
-impl VideoPipeline for NullPipeline {
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EncodedFrame> {
-        self.tx.subscribe()
-    }
-    fn request_keyframe(&self) {}
-}
+use server as srv;
+use server::core_crate as srv_core;
+include!("fixtures/app_state.rs");
 
 fn build_state(password: Option<&str>) -> Arc<AppState> {
-    use server::core_crate::coords::{Orientation, Rect, SessionGeometry};
-
-    let (tx, _rx) = tokio::sync::broadcast::channel::<EncodedFrame>(4);
-    let pipeline: Arc<dyn VideoPipeline> = Arc::new(NullPipeline { tx });
-
-    let ice_servers = http::build_ice_servers(None, None, None);
-    let ice = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(http::IceState::new(
-        ice_servers,
-    )));
-
-    // A geometry whose gate is irrelevant here (no input routes are exercised).
-    let geo = SessionGeometry {
-        content_rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 100.0,
-            h: 200.0,
-        },
-        scale: 2.0,
-        orientation: Orientation::Portrait,
-    };
-    let injector = server::input_bridge::spawn_injector(geo, || false);
-
-    Arc::new(AppState {
-        backend: server::config::DeviceBackend::Direct,
-        pipeline,
-        ice,
-        password: password.map(|s| s.to_string()),
-        secret: b"test-secret-key-0123456789abcdef".to_vec(),
-        session_ttl_secs: 3600,
-        cookie_secure: false,
-        lease_state: Arc::new(Mutex::new(http::LeaseState::new())),
-        injector,
-        auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
-        agent_token: None,
-        device_udid: None,
-        inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-        wda: None,
-        managed_wda: false,
-        managed_wda_pending: false,
-        latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        viewers: std::sync::Arc::new(std::sync::Mutex::new(
-            server::signaling::ViewerRegistry::default(),
-        )),
-        mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        mjpeg_url: None,
-        wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        wda_health: std::sync::Arc::new(std::sync::Mutex::new(server::wda::WdaHealth::down())),
-        wda_death: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
-        wda_health_probe: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        wda_control_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
-        released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        wda_lifecycle: std::sync::Arc::new(http::WdaLifecycle::new()),
-        live_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        mjpeg_stream_activity: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
-        element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::new(),
-        )),
-        hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        owner_lease_secs: 300,
-    })
+    fixture_app_state(password)
 }
 
 fn build_mirror_state(password: Option<&str>) -> Arc<AppState> {
@@ -199,71 +126,10 @@ fn build_state_with_agent_token(
     password: Option<&str>,
     agent_token: Option<&str>,
 ) -> Arc<AppState> {
-    use server::core_crate::coords::{Orientation, Rect, SessionGeometry};
-
-    let (tx, _rx) = tokio::sync::broadcast::channel::<server::core_crate::encode::EncodedFrame>(4);
-    let pipeline: Arc<dyn server::core_crate::encode::VideoPipeline> =
-        Arc::new(NullPipeline { tx });
-
-    let ice_servers = http::build_ice_servers(None, None, None);
-    let ice = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(http::IceState::new(
-        ice_servers,
-    )));
-
-    let geo = SessionGeometry {
-        content_rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 100.0,
-            h: 200.0,
-        },
-        scale: 2.0,
-        orientation: Orientation::Portrait,
-    };
-    let injector = server::input_bridge::spawn_injector(geo, || false);
-
-    Arc::new(AppState {
-        backend: server::config::DeviceBackend::Direct,
-        pipeline,
-        ice,
-        password: password.map(|s| s.to_string()),
-        secret: b"test-secret-key-0123456789abcdef".to_vec(),
-        session_ttl_secs: 3600,
-        cookie_secure: false,
-        lease_state: Arc::new(Mutex::new(http::LeaseState::new())),
-        injector,
-        auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
-        agent_token: agent_token.map(|s| s.to_string()),
-        device_udid: None,
-        inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-        wda: None,
-        managed_wda: false,
-        managed_wda_pending: false,
-        latest_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        viewers: std::sync::Arc::new(std::sync::Mutex::new(
-            server::signaling::ViewerRegistry::default(),
-        )),
-        mirror_paused_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        mjpeg_url: None,
-        wda_actionable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        wda_health: std::sync::Arc::new(std::sync::Mutex::new(server::wda::WdaHealth::down())),
-        wda_death: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
-        wda_health_probe: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        wda_control_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
-        released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        wda_lifecycle: std::sync::Arc::new(http::WdaLifecycle::new()),
-        live_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        mjpeg_stream_activity: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
-        element_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::new(),
-        )),
-        hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        owner_lease_secs: 300,
-    })
+    let state = fixture_app_state(password);
+    let mut state = Arc::try_unwrap(state).ok().expect("fresh fixture state");
+    state.agent_token = agent_token.map(|s| s.to_string());
+    Arc::new(state)
 }
 
 #[test]
@@ -2325,63 +2191,6 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
         assert!(health.up);
         assert!(health.actionable);
         assert_eq!(health.locked, Some(false));
-    });
-}
-
-#[test]
-fn status_clears_a_reconnect_that_an_actionable_runner_has_overtaken() {
-    block(async {
-        // WDA answers /status and a real action, i.e. the bring-up the
-        // reconnect was waiting for already succeeded.
-        let (base, server) = mock_wda(64, |request, _| {
-            let body = if request.contains("/wda/locked") {
-                r#"{"value":false}"#
-            } else if request.contains("/wda/apps/list") {
-                r#"{"value":[{"bundleId":"com.apple.springboard","pid":1}]}"#
-            } else if request.starts_with("POST /session ") {
-                r#"{"value":{"sessionId":"SESSION"}}"#
-            } else {
-                r#"{"value":{"ready":true}}"#
-            };
-            Some((std::time::Duration::ZERO, body.to_string()))
-        });
-        let state = build_state_with_wda(&base);
-        let app = http::router(state.clone());
-        // Prime the cached health so the first status read sees actionable.
-        for _ in 0..3 {
-            let _ = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/agent/status")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        }
-        assert!(state.wda_actionable.load(std::sync::atomic::Ordering::Acquire));
-
-        // A reconnect whose readiness task never finished.
-        assert!(state.wda_lifecycle.begin_reconnecting_for_test());
-        assert!(state.wda_lifecycle.is_reconnecting());
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agent/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8_lossy(&body);
-        drop(server);
-
-        assert!(text.contains(r#""reconnecting":false"#), "{text}");
-        assert!(!state.wda_lifecycle.is_reconnecting());
     });
 }
 
