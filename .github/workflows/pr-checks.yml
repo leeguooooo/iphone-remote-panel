@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-checks-${{ github.head_ref || github.ref }}
+  # A branch name alone is not unique: two forks can both push `fix/typo`, and
+  # their runs would then cancel one another. Key on the pull request when
+  # there is one (its number is unique per repository) and fall back to the
+  # source repository plus ref otherwise.
+  group: >-
+    pr-checks-${{ github.event.pull_request.number
+      || format('{0}-{1}', github.event.pull_request.head.repo.full_name || github.repository, github.ref) }}
   cancel-in-progress: true
 
 permissions:
