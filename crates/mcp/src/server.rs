@@ -1758,14 +1758,20 @@ fn daemon_action_result(
     // HTML error page — leaves the fate of the action unknown. A non-2xx does
     // NOT imply the request never reached the phone: it can fail on the way
     // back just as easily as on the way out.
+    // Same three reasons the batch entry point reports, so a caller can branch
+    // on `reason` without knowing which tool produced it. A body that parsed
+    // but carries no verdict is NOT "unparseable": we read it fine, it simply
+    // did not say what happened.
     unknown_action_result(
         if response.too_large {
             "response_too_large"
-        } else {
+        } else if response.json.is_none() {
             "unparseable_response"
+        } else {
+            "no_verdict_in_response"
         },
         format!(
-            "the daemon answered {} and the body could not be read ({}).",
+            "the daemon answered {} and the result did not say what happened ({}).",
             response.status,
             response.preview()
         ),
@@ -1839,6 +1845,15 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).ok();
+                        // The accept deadline does not cover the socket: a
+                        // peer that connects and stays silent would park this
+                        // thread in `read`.
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                            .ok();
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                            .ok();
                         let mut request = [0_u8; 8_192];
                         let _ = stream.read(&mut request);
                         let head = format!(

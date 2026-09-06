@@ -495,6 +495,11 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   A failure includes <code>failed_step</code>, the completed/applied counts,
   completed <code>steps</code>, the last failed wait <code>observation</code> when
   available, <code>outcome</code>, and <code>retry_safe</code>. A read-only
+  <code>wait_for</code> rebuilds one stale WDA source session within its existing
+  deadline. <code>retry_safe</code> describes replaying the <em>whole batch</em>:
+  once an earlier action landed it is false, even when the step that failed was
+  itself never sent.
+</p>
 <h4>The <code>observation</code> block on a failed <code>wait_for</code></h4>
 <p>
   A failing step reports what was actually seen, because "the condition was not
@@ -512,12 +517,6 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   one is listed in <code>absent_unproven</code> and the step does NOT match:
   an unreadable screen is not evidence something is gone. <code>rows</code>,
   <code>attempts</code> and <code>reads</code> carry the raw counts.
-</p>
-
-  <code>wait_for</code> rebuilds one stale WDA source session within its existing
-  deadline. The retry flag describes replaying
-  the <em>whole batch</em>: once an earlier action landed, it is false even when the
-  current failed step itself was not sent.
 </p>
 <aside class="note">
   <strong>This is not permission to batch guesses.</strong> Discover a changing or

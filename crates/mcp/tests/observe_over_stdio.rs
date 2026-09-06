@@ -39,6 +39,12 @@ impl ScriptedDaemon {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).ok();
+                        // A bounded `accept` still leaves `read` and
+                        // `write_all` able to park this thread forever: a peer
+                        // that connects and says nothing, or stops reading
+                        // mid-response. Both sides get a deadline.
+                        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
                         let mut buffer = [0_u8; 8_192];
                         let _ = stream.read(&mut buffer);
                         let head = format!(
@@ -220,6 +226,7 @@ fn an_unreadable_success_reaches_the_client_as_unknown() {
     let structured = &result["structuredContent"];
     assert_eq!(structured["outcome"], "unknown", "{reply}");
     assert_eq!(structured["retry_safe"], false, "{reply}");
+    assert_eq!(structured["reason"], "unparseable_response", "{reply}");
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
     assert!(text.contains("Do NOT resend"), "{text}");
 }
@@ -377,6 +384,9 @@ fn only_the_exact_legacy_ack_is_accepted() {
 /// Parsing is not the same as being told. A body that happens to be valid
 /// JSON but is not the daemon saying `ok:false` leaves the outcome unknown —
 /// including the shapes that cannot even be attached as structured content.
+/// The `reason` must distinguish "we read it and it said nothing" from "we
+/// could not read it", because a caller diagnosing a failure needs to know
+/// which of the two happened.
 #[test]
 fn a_parseable_but_meaningless_failure_is_still_unknown() {
     for body in [
@@ -400,6 +410,13 @@ fn a_parseable_but_meaningless_failure_is_still_unknown() {
         assert_eq!(
             structured["retry_safe"], false,
             "{shape} authorised a resend: {reply}"
+        );
+        // Read but silent, not unreadable — the same vocabulary the batch
+        // entry point uses, so a caller can branch on `reason` without
+        // knowing which tool produced it.
+        assert_eq!(
+            structured["reason"], "no_verdict_in_response",
+            "{shape} was reported as unreadable: {reply}"
         );
     }
 }
