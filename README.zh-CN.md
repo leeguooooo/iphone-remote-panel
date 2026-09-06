@@ -245,7 +245,8 @@ PHONE_REMOTE_TOKEN=… "$MCP" flow run health/export-all-zh-cn --artifacts-dir .
 执行失败时结果里会多一个 **`diagnosis`** 块：daemon 原始的 0-based
 `failed_step`、屏幕当时能不能读（`observable`）、原因（`locator_matches_now`、
 `locator_no_match`、`locator_ambiguous`、`still_present`、`no_similar_element`、
-`no_readable_tree`、`screen_unreadable`、`diagnosis_timeout`），以及最多五
+`no_readable_tree`、`screen_unreadable`、`diagnosis_timeout`、
+`step_has_no_locator`），以及最多五
 个候选元素，附上它们是按哪些定位字段 `matched` / `differed` 挑出来的（身份
 字段 `identifier` 优先于 `label`）。这是执行结束后一次有界（4 秒）的只读：
 不重发任何动作，不静默改写 flow，也不改动本次执行的 `outcome` /
