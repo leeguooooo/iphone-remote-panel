@@ -6372,7 +6372,11 @@ fn agent_actions_invalid(detail: impl Into<String>) -> Response {
             "ok": false,
             "error": "invalid_actions_request",
             "detail": detail.into(),
+            // Refused locally, before the first step: no step ran, so the
+            // batch verdict is not merely inferable, it is certain.
             "outcome": "not_sent",
+            "failed_step_outcome": "not_sent",
+            "batch_outcome": "nothing_applied",
             "retry_safe": true
         }),
     )
@@ -7019,6 +7023,31 @@ async fn agent_wait_elements(
     }
 }
 
+/// What the WHOLE batch did, given what its failed step did.
+///
+/// `outcome` has always described the failed STEP, which reads as a verdict on
+/// the batch when it sits at the top level: hardware acceptance found
+/// `applied_actions: 2` next to `outcome: "not_sent"`, which is true of the
+/// step and false of the batch.
+///
+/// Three values, deliberately: an unrecognised step outcome, and any step
+/// whose own result is `unknown`, both collapse to `unknown` — not to
+/// `partially_applied`, which would assert that the earlier actions are known
+/// to have landed while the last one is not. `nothing_applied` is claimed only
+/// when the count says so. This decides nothing on its own; `retry_safe`
+/// remains the only authorisation to send a batch again.
+fn batch_outcome_for(failed_step_outcome: &str, applied_actions: usize) -> &'static str {
+    match failed_step_outcome {
+        // `applied` alongside a count of zero contradicts itself: a step that
+        // applied is counted. Rather than pick which half to believe, say we
+        // do not know.
+        "applied" if applied_actions == 0 => "unknown",
+        "not_sent" | "applied" | "no_effect" if applied_actions == 0 => "nothing_applied",
+        "not_sent" | "applied" | "no_effect" => "partially_applied",
+        _ => "unknown",
+    }
+}
+
 // Keeping all failure evidence in one builder prevents individual early-return
 // branches from silently omitting the at-most-once fields callers rely on.
 #[allow(clippy::too_many_arguments)]
@@ -7039,7 +7068,12 @@ fn agent_actions_failure(
         "failed_step": failed_step,
         "completed": completed,
         "applied_actions": applied_actions,
+        // Frozen for compatibility: existing callers read this and it keeps
+        // describing the FAILED STEP. `failed_step_outcome` is the same value
+        // under a name that says so; `batch_outcome` is the batch verdict.
         "outcome": outcome,
+        "failed_step_outcome": outcome,
+        "batch_outcome": batch_outcome_for(outcome, applied_actions),
         "retry_safe": retry_safe,
         "steps": steps
     });
@@ -7099,7 +7133,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "batch_requires_direct_wda",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true
             }),
         );
@@ -7115,7 +7152,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "device_not_drivable",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true,
                 "hint": "check /agent/status, reconnect the canonical Direct target if instructed, then retry only after drivable=true"
             }),
@@ -7127,7 +7167,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "wda_not_configured",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true
             }),
         );
@@ -9974,6 +10017,32 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Batch outcome: the failed step is not the batch ---
+
+    /// Every value `agent_actions_failure` is actually called with, mapped
+    /// deliberately rather than by accident.
+    #[test]
+    fn batch_outcome_covers_every_failed_step_outcome_in_use() {
+        // The four `outcome` strings the call sites pass today.
+        assert_eq!(batch_outcome_for("not_sent", 0), "nothing_applied");
+        assert_eq!(batch_outcome_for("not_sent", 2), "partially_applied");
+        assert_eq!(batch_outcome_for("no_effect", 0), "nothing_applied");
+        assert_eq!(batch_outcome_for("no_effect", 2), "partially_applied");
+        assert_eq!(batch_outcome_for("applied", 2), "partially_applied");
+        // An unknown step is unknown for the batch at ANY count — never a
+        // partial, which would claim the earlier actions are settled and only
+        // the last one in doubt.
+        assert_eq!(batch_outcome_for("unknown", 0), "unknown");
+        assert_eq!(batch_outcome_for("unknown", 5), "unknown");
+        // Contradictory input: a step that applied is counted, so a zero count
+        // disagrees with itself. Do not pick a half to believe.
+        assert_eq!(batch_outcome_for("applied", 0), "unknown");
+        // A value added later and not yet mapped here must fall to the
+        // conservative side rather than be guessed into a known state.
+        assert_eq!(batch_outcome_for("some_future_outcome", 0), "unknown");
+        assert_eq!(batch_outcome_for("some_future_outcome", 3), "unknown");
+    }
 
     // --- Semantic intents channel ---
 

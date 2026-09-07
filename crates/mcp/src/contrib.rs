@@ -613,6 +613,17 @@ pub fn redact_result(value: &serde_json::Value) -> serde_json::Value {
             ("outcome", |v| {
                 one_of(v, &["applied", "not_sent", "unknown", "no_effect"])
             }),
+            // Same closed enum as `outcome`, under the name that says which
+            // thing it describes.
+            ("failed_step_outcome", |v| {
+                one_of(v, &["applied", "not_sent", "unknown", "no_effect"])
+            }),
+            // The batch verdict is its own, smaller enum. Projected through
+            // `one_of` like the others so an unexpected value is dropped
+            // rather than published.
+            ("batch_outcome", |v| {
+                one_of(v, &["nothing_applied", "partially_applied", "unknown"])
+            }),
             ("retry_safe", flag),
             ("failed_step", count),
             ("completed", count),
@@ -809,6 +820,45 @@ mod tests {
         assert!(body.contains("iPhone 17 Pro Max · iOS 26"));
         assert!(body.contains("ran twice"));
         assert!(!body.contains("Not yet run"));
+    }
+
+    #[test]
+    /// The two new batch fields are closed enums, and the projection has to
+    /// treat them as such: a known value survives, anything else — including a
+    /// screen label smuggled into the same key — is dropped rather than
+    /// published into a public issue.
+    #[test]
+    fn the_batch_outcome_fields_are_projected_as_enums_not_free_text() {
+        let kept = redact_result(&serde_json::json!({
+            "ok": false,
+            "outcome": "not_sent",
+            "failed_step_outcome": "not_sent",
+            "batch_outcome": "partially_applied",
+            "applied_actions": 2,
+            "retry_safe": false,
+        }));
+        assert_eq!(kept["failed_step_outcome"], "not_sent");
+        assert_eq!(kept["batch_outcome"], "partially_applied");
+
+        let dropped = redact_result(&serde_json::json!({
+            "ok": false,
+            // Not members of either enum: one is a plausible-looking value
+            // from the wrong enum, one is screen text.
+            "failed_step_outcome": "partially_applied",
+            "batch_outcome": "SCREEN-LABEL-CANARY",
+        }));
+        assert!(
+            dropped.get("failed_step_outcome").is_none(),
+            "a value from the wrong enum must not be published: {dropped}"
+        );
+        assert!(
+            dropped.get("batch_outcome").is_none(),
+            "free text must never reach a public issue: {dropped}"
+        );
+        assert!(
+            !dropped.to_string().contains("SCREEN-LABEL-CANARY"),
+            "{dropped}"
+        );
     }
 
     #[test]
