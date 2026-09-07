@@ -5888,6 +5888,44 @@ fn element_resolution_response(body: &'static str) -> Response {
     )
 }
 
+/// Reject a single-step body whose `type` is missing, empty, or not a
+/// single-step action name, before any WDA work happens.
+///
+/// The catalogue is `CAPABILITY_SINGLE_STEP_ACTIONS`, the same list
+/// `/agent/capabilities` advertises and
+/// `capability_catalogue_matches_the_dispatchers` pins to the dispatchers — so
+/// this gate cannot drift into rejecting an action the device can actually
+/// perform. Per-field validation stays exactly where it was: this only decides
+/// whether the action has a name the server knows.
+fn reject_unknown_single_step_action(value: &serde_json::Value) -> Result<(), Response> {
+    let named = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|typ| !typ.is_empty());
+    let error = match named {
+        None => serde_json::json!({
+            "ok": false,
+            "error": "invalid_action",
+            "detail": "action needs a non-empty string field \"type\"",
+            "outcome": "not_sent",
+            "retry_safe": true,
+            "supported": CAPABILITY_SINGLE_STEP_ACTIONS,
+        }),
+        Some(typ) if !CAPABILITY_SINGLE_STEP_ACTIONS.contains(&typ) => serde_json::json!({
+            "ok": false,
+            "error": "invalid_action",
+            "detail": format!("unknown action type \"{typ}\""),
+            "outcome": "not_sent",
+            "retry_safe": true,
+            "supported": CAPABILITY_SINGLE_STEP_ACTIONS,
+        }),
+        Some(_) => return Ok(()),
+    };
+    Err(with_security_headers(
+        (StatusCode::BAD_REQUEST, axum::Json(error)).into_response(),
+    ))
+}
+
 /// Execute one Direct agent action exactly once.
 ///
 /// Locator and geometry reads may precede the mutation, but once a mutating WDA
@@ -8027,6 +8065,15 @@ async fn agent_input(
                 );
             }
         };
+        // A malformed request is the caller's problem, not the device's. Name
+        // the action BEFORE the WDA guard is taken: an unknown or missing
+        // `type` used to fall through to the dispatcher, whose catch-all
+        // `Unsupported` is rendered as `wda_unavailable_or_unsupported` — a
+        // 503 blaming a perfectly healthy phone for a typo. Answer 400 here
+        // and never touch WDA.
+        if let Err(response) = reject_unknown_single_step_action(&value) {
+            return response;
+        }
         let Some(wda) = &state.wda else {
             return with_security_headers(
                 Response::builder()

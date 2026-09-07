@@ -1976,6 +1976,42 @@ mod tests {
         assert!(text.contains("outcome=not_sent"), "{text}");
     }
 
+    /// A 400 the daemon spelled out is still a spelled-out refusal.
+    ///
+    /// `invalid_action` is newer than this renderer. Nothing here keeps a list
+    /// of known error codes, and this test is what keeps it that way: an
+    /// unfamiliar `ok:false` body must reach the caller with its own
+    /// `outcome`/`retry_safe` intact, NOT be flattened into `unknown` — which
+    /// would strip the very fact that makes it safe to fix and resend.
+    #[test]
+    fn an_unfamiliar_refusal_code_is_passed_through_not_downgraded() {
+        let (url, task) = scripted_daemon(
+            "400 Bad Request",
+            br#"{"ok":false,"error":"invalid_action","detail":"unknown action type \"teleport\"","outcome":"not_sent","retry_safe":true}"#.to_vec(),
+        );
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_tap(Parameters(TapParams {
+            x: 0.5,
+            y: 0.5,
+            observe: None,
+        })));
+        task.join().unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("a structured refusal must survive");
+        assert_eq!(structured["error"], "invalid_action");
+        assert_ne!(
+            structured["outcome"], "unknown",
+            "a spelled-out refusal must not be downgraded: {structured}"
+        );
+        assert_eq!(structured["outcome"], "not_sent");
+        assert_eq!(structured["retry_safe"], true);
+    }
+
     /// The dangerous case: HTTP said yes, the body says nothing. That is not a
     /// success, and above all it is not a licence to resend.
     #[test]
