@@ -551,25 +551,22 @@ impl WdaClient {
     }
 
     /// Force-press an element (`POST .../wda/element/:id/forceTouch`). WDA
-    /// treats `pressure` and `duration` as a pair, so a caller providing
-    /// either gets both (defaults: pressure 1.0, duration 0.5 s); providing
-    /// neither sends the plain default force press.
+    /// treats `pressure` and `duration` as a required pair: an empty body is
+    /// answered with `400 Bad Request` on WDA 9.15.3 (issue #57), so a caller
+    /// that omits either — or both — still gets explicit defaults
+    /// (pressure 1.0, duration 0.5 s) on the wire.
     pub async fn force_touch_element(
         &mut self,
         element_id: &str,
         pressure: Option<f64>,
         duration_s: Option<f64>,
     ) -> Result<()> {
-        let body = if pressure.is_some() || duration_s.is_some() {
-            serde_json::json!({
-                "pressure": pressure.unwrap_or(1.0),
-                "duration": duration_s.unwrap_or(0.5),
-            })
-        } else {
-            serde_json::json!({})
-        };
-        self.post_element_gesture(element_id, "forceTouch", body)
-            .await
+        self.post_element_gesture(
+            element_id,
+            "forceTouch",
+            force_touch_body(pressure, duration_s),
+        )
+        .await
     }
 
     /// Move a picker wheel one notch (`POST .../wda/pickerwheel/:id/select`).
@@ -1764,11 +1761,63 @@ fn parse_element_id(body: &str) -> Result<String> {
     Err(anyhow!("no element id in WDA response: {body}"))
 }
 
+/// The body a force press puts on the wire. WDA 9.15.3 rejects `{}` outright,
+/// so both fields are always present; an omitted one falls back to WDA's own
+/// documented default rather than to no field at all.
+fn force_touch_body(pressure: Option<f64>, duration_s: Option<f64>) -> serde_json::Value {
+    serde_json::json!({
+        "pressure": pressure.unwrap_or(1.0),
+        "duration": duration_s.unwrap_or(0.5),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Issue #57: a force press with no explicit pressure/duration used to send
+    // an empty body, which WDA 9.15.3 answers with 400 Bad Request.
+    #[test]
+    fn force_touch_always_sends_pressure_and_duration() {
+        assert_eq!(
+            force_touch_body(None, None),
+            serde_json::json!({"pressure": 1.0, "duration": 0.5})
+        );
+        assert_eq!(
+            force_touch_body(Some(2.5), None),
+            serde_json::json!({"pressure": 2.5, "duration": 0.5})
+        );
+        assert_eq!(
+            force_touch_body(None, Some(1.25)),
+            serde_json::json!({"pressure": 1.0, "duration": 1.25})
+        );
+    }
+
+    #[test]
+    fn force_touch_request_body_is_never_empty() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        let (base, task) = mock_wda(2, move |request| {
+            if request.starts_with("POST /session ") {
+                return r#"{"sessionId":"S-1","value":{}}"#.to_string();
+            }
+            if request.contains("forceTouch") {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                *recorder.lock().unwrap() = body;
+            }
+            r#"{"value":null}"#.to_string()
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        block(client.force_touch_element("42", None, None)).unwrap();
+        task.join().unwrap();
+        let body = seen.lock().unwrap().clone();
+        assert!(
+            body.contains("\"pressure\":1.0") && body.contains("\"duration\":0.5"),
+            "force press must carry explicit parameters, got: {body}"
+        );
+    }
 
     #[test]
     fn touch_move_duration_is_bounded() {
