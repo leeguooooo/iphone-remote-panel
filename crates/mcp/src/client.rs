@@ -334,12 +334,18 @@ impl DaemonClient {
         } else {
             "/agent/input"
         };
-        let req = self
+        let mut req = self
             .auth(self.client.post(self.url(path)))
             .header("x-phone-control", "1")
             .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(json);
+        if observe {
+            // Same arithmetic as `input_observed`: an observing request costs
+            // the action deadline plus the observation budget. Abandoning it at
+            // the ordinary 30s is how a caller stops knowing what happened.
+            req = req.timeout(OBSERVE_TIMEOUT);
+        }
         read_response(req.send().await?).await
     }
 
@@ -353,10 +359,23 @@ impl DaemonClient {
         &self,
         label: &str,
         observe: bool,
-    ) -> anyhow::Result<DaemonResponse> {
-        let body = self.elements().await?;
-        let (element, snapshot) = unique_label_target(&body, label)?;
-        self.tap_element_observed(element, &snapshot, observe).await
+    ) -> Result<DaemonResponse, TapLabelFailure> {
+        // Resolution is READ-ONLY: an element read and a label lookup. A
+        // failure here means no MUTATION was dispatched — the GET did reach
+        // the phone, so "nothing reached the phone" would be false — and a
+        // retry is therefore safe.
+        let body = self
+            .elements()
+            .await
+            .map_err(TapLabelFailure::BeforeDispatch)?;
+        let (element, snapshot) =
+            unique_label_target(&body, label).map_err(TapLabelFailure::BeforeDispatch)?;
+        // Past this point the tap has been dispatched. Whether it was
+        // delivered is exactly what we cannot say, so a failure here is
+        // unknown rather than "not sent".
+        self.tap_element_observed(element, &snapshot, observe)
+            .await
+            .map_err(TapLabelFailure::AfterDispatch)
     }
 }
 
@@ -1092,6 +1111,198 @@ mod tests {
         assert!(error.contains("no action was sent"));
     }
 
+    /// A label that resolves to nothing (or to two things) fails BEFORE any
+    /// tap goes out. The count is the proof: one GET, zero POSTs.
+    #[tokio::test]
+    async fn a_label_that_does_not_resolve_sends_no_tap() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "取消"}]
+        })
+        .to_string();
+        let (url, task, requests) = mock_daemon_sequence(&[("200 OK", &elements)]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("an unresolvable label is a failure");
+        task.join().unwrap();
+
+        assert!(
+            matches!(failure, TapLabelFailure::BeforeDispatch(_)),
+            "no mutation was dispatched, and the phase says so: {failure}"
+        );
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(sent.len(), 1, "exactly one request: {sent:?}");
+        assert!(sent[0].starts_with("GET /agent/elements"), "{sent:?}");
+        assert!(
+            !sent.iter().any(|request| request.starts_with("POST")),
+            "no mutation may be dispatched when the label did not resolve: {sent:?}"
+        );
+    }
+
+    /// The element read itself failing is also before dispatch.
+    #[tokio::test]
+    async fn an_unreadable_tree_fails_before_any_tap() {
+        let (url, task, requests) =
+            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"wda_source_failed"}"#)]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("an unreadable tree is a failure");
+        task.join().unwrap();
+
+        assert!(matches!(failure, TapLabelFailure::BeforeDispatch(_)), "{failure}");
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert!(
+            !sent.iter().any(|request| request.starts_with("POST")),
+            "{sent:?}"
+        );
+    }
+
+    /// Losing the answer AFTER the tap went out is the other phase: exactly
+    /// one POST happened, and what the phone did is unknown.
+    #[tokio::test]
+    async fn a_lost_answer_after_the_tap_is_reported_after_dispatch() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "发布", "identifier": "publish-button"}]
+        })
+        .to_string();
+        // The second response is never sent: the connection closes with the
+        // tap already on the wire.
+        let (url, task, requests) = mock_daemon_script(&[
+            ("200 OK", Some(elements.as_str()), Duration::ZERO),
+            ("200 OK", None, Duration::ZERO),
+        ]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("a lost answer is a failure");
+        task.join().unwrap();
+
+        assert!(
+            matches!(failure, TapLabelFailure::AfterDispatch(_)),
+            "the tap was already dispatched: {failure}"
+        );
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(
+            sent.iter().filter(|r| r.starts_with("POST")).count(),
+            1,
+            "dispatched once, and never re-dispatched: {sent:?}"
+        );
+    }
+
+    /// The timeout that observing requests actually get, exercised rather than
+    /// asserted as a constant.
+    ///
+    /// An observing tap costs the daemon's action deadline plus its observation
+    /// budget. Under the ordinary 30s timeout this request is abandoned while
+    /// the daemon still holds the phone — and abandoning it is exactly how a
+    /// caller stops knowing what happened. The daemon here answers after 33s:
+    /// past the old limit, inside the observing one.
+    ///
+    /// Deliberately slow (~33s). It is the only way to test a timeout without
+    /// asserting the constant back to itself.
+    #[tokio::test]
+    async fn an_observing_tap_waits_past_the_ordinary_timeout() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "发布", "identifier": "publish-button"}]
+        })
+        .to_string();
+        let (url, task, _requests) = mock_daemon_script(&[
+            ("200 OK", Some(elements.as_str()), Duration::ZERO),
+            (
+                "200 OK",
+                Some(r#"{"ok":true,"settle":{"settled":true,"reason":"stable","captures":2}}"#),
+                Duration::from_secs(33),
+            ),
+        ]);
+
+        // Through tap_label, so this covers the label path reaching the same
+        // request builder as a direct element tap.
+        let response = DaemonClient::new(url, None)
+            .tap_label_observed("发布", true)
+            .await
+            .expect("an observing tap must outlast the ordinary 30s timeout");
+        task.join().unwrap();
+
+        assert!(response.confirms_action());
+        assert_eq!(
+            response.json.as_ref().and_then(|json| json["settle"]["reason"].as_str()),
+            Some("stable"),
+            "the observation survived the wait, rather than the client giving up"
+        );
+    }
+
+    /// One scripted response: status, an optional body (`None` closes the
+    /// connection with the request already sent), and a delay before answering.
+    type ScriptedResponse<'a> = (&'a str, Option<&'a str>, Duration);
+
+    /// A scripted daemon that always terminates.
+    ///
+    /// Every wait is bounded: `accept` polls with an overall deadline, reads
+    /// have a timeout, and the thread stops when the script runs out or the
+    /// deadline passes. An earlier version of this file grew mocks that could
+    /// block forever on `accept`, which turns any mistake in a test into a hung
+    /// suite rather than a failing one.
+    fn mock_daemon_script(
+        responses: &[ScriptedResponse<'_>],
+    ) -> (String, std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<(String, Option<String>, Duration)> = responses
+            .iter()
+            .map(|(status, body, delay)| {
+                (status.to_string(), body.map(str::to_string), *delay)
+            })
+            .collect();
+        // Generous enough for the slowest scripted delay, finite regardless.
+        let overall = Duration::from_secs(90);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + overall;
+            for (status, body, delay) in responses {
+                let mut stream = loop {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buffer = [0_u8; 8_192];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let Some(body) = body else {
+                    continue; // the request was sent; the answer never comes
+                };
+                std::thread::sleep(delay);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), task, rx)
+    }
+
     #[tokio::test]
     async fn tap_label_reads_then_submits_snapshot_bound_index() {
         let elements = serde_json::json!({
@@ -1150,5 +1361,36 @@ mod tests {
                 .is_some_and(reqwest::Error::is_timeout),
             "{error:#}"
         );
+    }
+}
+
+/// Which phase of a label-addressed tap failed.
+///
+/// `tap_label` resolves a label to an element (reads only) and then taps it.
+/// Those two halves fail in ways that call for opposite responses, and the
+/// difference is structural — it is known at the call site. Recovering it by
+/// inspecting an error message would be guessing, and guessing wrong in the
+/// safe-looking direction means re-tapping a phone that already acted.
+#[derive(Debug)]
+pub enum TapLabelFailure {
+    /// The element read or the label lookup failed. No mutation was
+    /// dispatched (the read itself was a GET), so a retry is safe.
+    BeforeDispatch(anyhow::Error),
+    /// The tap was already dispatched. Whether it was delivered, and what the
+    /// phone did with it, is unknown.
+    AfterDispatch(anyhow::Error),
+}
+
+impl TapLabelFailure {
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::BeforeDispatch(error) | Self::AfterDispatch(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for TapLabelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error())
     }
 }
