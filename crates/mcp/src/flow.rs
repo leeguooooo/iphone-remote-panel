@@ -1618,6 +1618,8 @@ mod tests {
             "error": "expectation_timeout",
             "failed_step": step,
             "outcome": "not_sent",
+            "failed_step_outcome": "not_sent",
+            "batch_outcome": "partially_applied",
             "applied_actions": 2,
             "retry_safe": true,
             "observation": {"read": true, "sparse": false, "missing_present": [0]}
@@ -1754,8 +1756,12 @@ mod tests {
 
         assert_eq!(diagnosis["observable"], false);
         assert_eq!(diagnosis["reason"], "screen_unreadable");
-        // Untouched.
+        // Untouched — including fields this diagnosis path knows nothing
+        // about. Diagnosis annotates a failure; it never rewrites the daemon's
+        // account of what happened.
         assert_eq!(result["outcome"], "not_sent");
+        assert_eq!(result["failed_step_outcome"], "not_sent");
+        assert_eq!(result["batch_outcome"], "partially_applied");
         assert_eq!(result["applied_actions"], 2);
         assert_eq!(result["retry_safe"], true);
     }

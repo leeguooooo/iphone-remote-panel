@@ -138,7 +138,7 @@ daemon 每天检查一次 GitHub，在 `/agent/status` 里报 `version` / `lates
 | `GET` | `/agent/elements` | 扁平化的辅助功能树，带一次性 `snapshot` 令牌、`ax_stats` 可用性块，以及系统弹窗在场时的 `alert` 块。`?since=<snapshot>` 只返回 `delta`。WDA 缺失或繁忙 `503`，source 失败 `502`，不会用空数组伪装 `200`。 |
 | `GET` | `/agent/mjpeg` | 鉴权后的实时 MJPEG。 |
 | `POST` | `/agent/input` | 一个动作：点按、拖动、长按、滚动、文字、按键、`home` / `spotlight`、`launch_app`、`set_value`、`perform`、`alert`。`?return=delta` 会在动作后于预算内反复采样元素树并返回其变化，以及一个 `settle` 块（`settled`、`reason`：`stable` / `budget_exhausted` / `observation_failed`、`waited_ms`、`captures`、`budget_ms`，必要时还有 `sparse` / `stale`）。观察是尽力而为的：读取慢或失败绝不会把已经生效的动作降级成未知结果。 |
-| `POST` | `/agent/actions` | 最多 24 个 `action` / `wait_for` / `pause` 步骤，整批预校验，一把 WDA 锁，首个失败即停。返回 `completed`、`applied_actions`、`failed_step`、`outcome`、`retry_safe`。 |
+| `POST` | `/agent/actions` | 最多 24 个 `action` / `wait_for` / `pause` 步骤，整批预校验，一把 WDA 锁，首个失败即停。返回 `completed`、`applied_actions`、`failed_step`、`outcome`（失败步骤的结果）、`failed_step_outcome`、`batch_outcome`（`nothing_applied` / `partially_applied` / `unknown`）、`retry_safe`（整批语义，也是唯一授权重跑的字段）。 |
 | `POST` | `/agent/mode` | `{"mode":"agent"}` 重启已配置的 Direct 目标。不换后端，不换 UDID。 |
 | `POST` | `/agent/hold` | `{"secs":N}`（0 清除，上限 14400）在人工暂停期间阻止空闲释放。释放已经开始时返回 `503 device_release_in_progress`。 |
 | `POST` | `/agent/owner` | `{"release":true}` 提前归还 owner 租约。 |

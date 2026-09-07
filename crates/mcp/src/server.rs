@@ -1976,6 +1976,50 @@ mod tests {
         assert!(text.contains("outcome=not_sent"), "{text}");
     }
 
+    /// A partial batch must reach the caller as a partial batch.
+    ///
+    /// The hardware shape: two actions applied, the step that failed never
+    /// sent. `outcome` describes that step, so on its own it reads as "nothing
+    /// happened" — which is why the batch verdict travels beside it. All three
+    /// fields, and `retry_safe`, must arrive intact and unrewritten.
+    #[test]
+    fn a_partial_batch_keeps_the_batch_verdict_beside_the_step_outcome() {
+        let (url, task) = scripted_daemon(
+            "409 Conflict",
+            br#"{"ok":false,"error":"expectation_timeout","failed_step":2,"completed":2,"applied_actions":2,"outcome":"not_sent","failed_step_outcome":"not_sent","batch_outcome":"partially_applied","retry_safe":false,"steps":[]}"#.to_vec(),
+        );
+        let handler = handler_for(&url);
+
+        let result = block(handler.phone_run_steps(Parameters(RunStepsParams {
+            steps: vec![PhoneStep::Tap {
+                x: 0.5,
+                y: 0.5,
+                after_ms: 0,
+            }],
+        })));
+        task.join().unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("a structured batch refusal must survive");
+        assert_eq!(structured["applied_actions"], 2);
+        assert_eq!(
+            structured["outcome"], "not_sent",
+            "the legacy field keeps describing the failed step: {structured}"
+        );
+        assert_eq!(structured["failed_step_outcome"], "not_sent", "{structured}");
+        assert_eq!(
+            structured["batch_outcome"], "partially_applied",
+            "two actions reached the phone; the batch is not `nothing_applied`: {structured}"
+        );
+        assert_eq!(
+            structured["retry_safe"], false,
+            "the only authorisation to replay must survive untouched: {structured}"
+        );
+    }
+
     /// A 400 the daemon spelled out is still a spelled-out refusal.
     ///
     /// `invalid_action` is newer than this renderer. Nothing here keeps a list

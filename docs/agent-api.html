@@ -504,11 +504,29 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   <code>completed</code>, <code>applied_actions</code>, and compact per-step results.
   A failure includes <code>failed_step</code>, the completed/applied counts,
   completed <code>steps</code>, the last failed wait <code>observation</code> when
-  available, <code>outcome</code>, and <code>retry_safe</code>. A read-only
+  available, <code>outcome</code>, <code>failed_step_outcome</code>,
+  <code>batch_outcome</code>, and <code>retry_safe</code>. A read-only
   <code>wait_for</code> rebuilds one stale WDA source session within its existing
   deadline. <code>retry_safe</code> describes replaying the <em>whole batch</em>:
   once an earlier action landed it is false, even when the step that failed was
   itself never sent.
+</p>
+<p>
+  <code>outcome</code> describes the step that FAILED, not the batch, and keeps
+  that meaning for compatibility: a body can carry <code>applied_actions: 2</code>
+  next to <code>outcome: "not_sent"</code>, and both are true of different
+  things. <code>failed_step_outcome</code> is the same value under a name that
+  says which. <code>batch_outcome</code> is the batch's own verdict:
+</p>
+<table>
+  <tr><th>Value</th><th>What it means</th></tr>
+  <tr><td><code>nothing_applied</code></td><td>No action reached the phone.</td></tr>
+  <tr><td><code>partially_applied</code></td><td>At least one action reached the phone before the batch stopped.</td></tr>
+  <tr><td><code>unknown</code></td><td>The failed step's own outcome is unknown, so what the batch did cannot be stated. This is never downgraded to <code>partially_applied</code>, which would claim the earlier actions are settled and only the last one in doubt.</td></tr>
+</table>
+<p>
+  None of the three authorises a retry. <code>retry_safe</code> remains the only
+  field that does, and it is not inferable from these.
 </p>
 <h4>The <code>observation</code> block on a failed <code>wait_for</code></h4>
 <p>
