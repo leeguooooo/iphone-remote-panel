@@ -388,7 +388,8 @@ PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret ./target/release/iphone-u
 ## `*-use` 家族
 
 一组小而互相独立的 CLI，各自把 agent 的手伸到一个真实的东西上。装法都一样：
-`curl … install.sh | sh` 装命令，`npx skills add leeguooooo/<name>` 教会 agent，输出都是 JSON。
+`curl … install.sh | sh` 装命令，输出都是 JSON，并各自配一个 skill 教会 agent 使用
+——skill 怎么装以各仓库自己的 README 与对应发行版说明为准，各项目、各版本并不相同。
 
 | 仓库 | 给 agent 的能力 |
 |---|---|

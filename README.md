@@ -590,8 +590,9 @@ user's consent) when the API misleads them, and to send flow problems to the
 ## The `*-use` family
 
 Small, composable CLIs that give an AI agent hands on one real thing. Same shape
-everywhere: `curl … install.sh | sh` to install, `npx skills add leeguooooo/<name>`
-to teach your agent, JSON on stdout.
+everywhere: `curl … install.sh | sh` to install, JSON on stdout, and a companion
+skill that teaches your agent to drive it — each repo's own README says how to
+install its skill, since the right way differs per project and per release.
 
 | Repo | Gives your agent |
 |---|---|
