@@ -302,7 +302,7 @@ pub struct PhoneElementLocator {
 }
 
 fn default_phone_wait_ms() -> u64 {
-    5_000
+    15_000
 }
 
 fn default_phone_longpress_ms() -> u64 {
@@ -1243,7 +1243,7 @@ fn phone_locator_has_condition(locator: &PhoneElementLocator) -> bool {
 pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::Value, String> {
     const MAX_STEPS: usize = 24;
     const MAX_AFTER_MS: u64 = 3_000;
-    const MAX_WAIT_MS: u64 = 10_000;
+    const MAX_WAIT_MS: u64 = 30_000;
     const MAX_DECLARED_WAIT_MS: u64 = 60_000;
 
     if steps.is_empty() {
@@ -2299,18 +2299,33 @@ mod tests {
 
     #[test]
     fn multi_step_request_rejects_invalid_waits_and_empty_locators_offline() {
+        // The ceiling is 30s — sized for an element read that can cost six or
+        // seven seconds on real hardware. One millisecond over is still
+        // refused, and refused before anything is sent.
         let invalid_timeout = phone_steps_request(vec![PhoneStep::WaitFor {
             expect: PhoneUiExpectation {
                 application: Some("设置".to_string()),
                 present: vec![],
                 absent: vec![],
             },
-            timeout_ms: 10_001,
+            timeout_ms: 30_001,
             poll_ms: 100,
         }])
         .unwrap_err();
         assert!(invalid_timeout.contains("timeout_ms"));
         assert!(invalid_timeout.contains("no action was sent"));
+
+        // And the ceiling itself is accepted.
+        phone_steps_request(vec![PhoneStep::WaitFor {
+            expect: PhoneUiExpectation {
+                application: Some("设置".to_string()),
+                present: vec![],
+                absent: vec![],
+            },
+            timeout_ms: 30_000,
+            poll_ms: 100,
+        }])
+        .expect("the ceiling is a valid wait");
 
         let empty_locator = phone_steps_request(vec![PhoneStep::WaitFor {
             expect: PhoneUiExpectation {

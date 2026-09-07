@@ -162,9 +162,13 @@ happened; that judgment stays yours.
 
 `settle_ms`, `budget_ms` and `waited_ms` all describe the TREE read only; the
 `alert` probe is separate and hard-capped at 1.5s. Tune with `settle_ms`
-(default 1200, max 5000): raise it for a screen with a
-push transition, drop it to `0` for a step you are going to verify by
-screenshot anyway.
+(default 15000, max 20000): drop it to `0` for a step you are going to verify
+by screenshot anyway. How long a read takes varies with the device and the
+screen — on one phone with a large tree it was measured at 6–7s — so the
+default leaves room for two reads rather than assuming a fast one. It is a
+ceiling, not a wait: reading stops as soon as two reads match. If you set a
+budget shorter than a single read on that screen, expect `captures: 0`;
+`budget_ms` in the answer tells you what it had to work with.
 
 **A failed `wait_for` tells you whether anyone could see the screen.** Its
 `observation` block distinguishes three things you must not conflate:

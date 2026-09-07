@@ -283,3 +283,52 @@ fn a_first_read_that_hangs_reports_never_read_with_a_timeout_reason() {
             .is_some_and(|hint| hint.contains("absent")));
     });
 }
+
+/// The `wait_for` ceiling moved for the same reason the observation budget
+/// did — one element read can cost six or seven seconds, so a 10s ceiling left
+/// room for a single poll. What did NOT move is the cumulative cap: a longer
+/// single wait must not let a batch run longer overall.
+#[test]
+fn a_single_wait_may_now_be_thirty_seconds_but_the_batch_cap_holds() {
+    block(async {
+        let wda = scripted(OTHER_SCREEN);
+
+        // 30s exactly: accepted.
+        let (status, json) = run_actions(
+            wda.url(),
+            r#"{"steps":[{"kind":"wait_for",
+                "expect":{"absent":[{"kind":"Button","label":"搜索"}]},
+                "timeout_ms":30000,"poll_ms":100}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "30s must be accepted: {json}");
+
+        // One millisecond over: refused, and nothing is sent.
+        let (status, json) = run_actions(
+            wda.url(),
+            r#"{"steps":[{"kind":"wait_for",
+                "expect":{"absent":[{"kind":"Button","label":"搜索"}]},
+                "timeout_ms":30001,"poll_ms":100}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["outcome"], "not_sent");
+
+        // Three 30s waits declare 90s, over the unchanged 60s cumulative cap.
+        let (status, json) = run_actions(
+            wda.url(),
+            r#"{"steps":[
+                {"kind":"wait_for","expect":{"present":[{"kind":"Button"}]},"timeout_ms":30000,"poll_ms":100},
+                {"kind":"wait_for","expect":{"present":[{"kind":"Button"}]},"timeout_ms":30000,"poll_ms":100},
+                {"kind":"wait_for","expect":{"present":[{"kind":"Button"}]},"timeout_ms":30000,"poll_ms":100}
+            ]}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a longer single wait must not lengthen a batch: {json}"
+        );
+        assert_eq!(json["outcome"], "not_sent");
+    });
+}
