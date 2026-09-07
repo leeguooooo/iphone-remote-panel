@@ -44,6 +44,7 @@ jobs:
           bash scripts/test-setup-wda-warp-preflight.sh
           bash scripts/test-setup-wda-lock-backoff.sh
           bash scripts/test-setup-wda-icon-injection.sh
+          bash scripts/test-setup-wda-probe-threshold.sh
           python3 scripts/test-setup-wda-status.py
           python3 scripts/test-setup-wda-runner-product.py
           python3 scripts/test-setup-wda-asc-signing.py
