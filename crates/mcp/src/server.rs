@@ -822,13 +822,25 @@ impl PhoneHandler {
             Ok(response) => {
                 daemon_action_result(&response, observe, &format!("tapped element: {label}"))
             }
-            // `tap_label` reads the element tree before it taps. A failure in
-            // that read means no tap was sent; a failure after it is unknown.
-            // The two are not distinguishable from here, so this reports the
-            // conservative answer rather than guessing from the message text.
-            Err(e) => unknown_action_result(
+            // `tap_label` resolves the label with reads and only then taps.
+            // Which half failed is known structurally, so it is reported
+            // exactly — not inferred from the text of an error, and not
+            // flattened into "unknown" for both. Note the read is itself a
+            // request to the phone: what the first arm can claim is that no
+            // MUTATION was dispatched, not that nothing was sent.
+            Err(crate::client::TapLabelFailure::BeforeDispatch(e)) => not_sent_result(
+                "label_lookup_failed",
+                format!(
+                    "tap_label '{label}' could not resolve a target: {e:#} No tap was \
+                     dispatched (only the element read), so retrying is safe."
+                ),
+            ),
+            Err(crate::client::TapLabelFailure::AfterDispatch(e)) => unknown_action_result(
                 "transport_error",
-                format!("tap_label '{label}' failed: {e:#}."),
+                format!(
+                    "tap_label '{label}' failed after the tap was dispatched: {e:#} Whether \
+                     the phone acted on it is unknown."
+                ),
             ),
         }
     }

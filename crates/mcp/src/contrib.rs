@@ -822,7 +822,6 @@ mod tests {
         assert!(!body.contains("Not yet run"));
     }
 
-    #[test]
     /// The two new batch fields are closed enums, and the projection has to
     /// treat them as such: a known value survives, anything else — including a
     /// screen label smuggled into the same key — is dropped rather than
