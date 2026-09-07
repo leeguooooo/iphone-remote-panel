@@ -1449,6 +1449,7 @@ install_pinned_skill() {
     validate_release_commit "$commit" \
         || die "Cannot install an agent skill without an exact release commit."
     raw_url="https://raw.githubusercontent.com/$REPO/$commit/skills/iphone-use/SKILL.md"
+    _ensure_skill_namespace
     SKILL_EXPECTED_DL="$(mktemp "$HOME/.iphone-use/skill-source.XXXXXX")" \
         || die "Could not stage the release-matched agent skill."
     info "Fetching the agent skill from release $ref commit $commit ..."
