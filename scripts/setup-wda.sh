@@ -3771,7 +3771,6 @@ printf '  Resume    : %s resume\n' "$SELF_INSTALL"
 printf '  WDA source: %s %s (exact checkout)\n' "$WDA_REF_LABEL" "$WDA_REF"
 printf '  Signing   : free Apple ID profiles may expire after 7 days; re-run setup when needed.\n'
 
-# In supervisor mode, stay alive while the runner and verified relay do. launchd
 # One health probe, and what it means. Returns 0 to keep holding, 1 to rebuild.
 #
 # A single unanswered probe cannot tell a transient busy period, a network
@@ -3793,6 +3792,7 @@ _keepalive_probe_verdict() {
     return 0
 }
 
+# In supervisor mode, stay alive while the runner and verified relay do. launchd
 # sees an exit as a failure and rebuilds incrementally after sleep/USB/tunnel
 # failures. Interactive setup returned above only after handing off to this job.
 if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then

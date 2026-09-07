@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# A busy WDA is not a broken one.
+# One unanswered probe is not proof that WDA is gone.
 #
 # The KeepAlive supervisor used to rebuild on a SINGLE unanswered `/status`
-# probe. WDA answers HTTP on the XCTest runner's own runloop, so one `/source`
-# over a large tree (6.1s measured for 444 KB) blocks the 4s probe — and the
-# supervisor tore down a healthy runner and both relays during exactly the
-# heavy reads the agent surface exists to perform.
+# probe, with a 4s timeout. A read of a large element tree was measured at 6.1s
+# on this hardware, so a probe issued during one may well go unanswered while
+# nothing is actually wrong — one 4s timeout cannot tell a brief non-answer
+# from a dead WDA, and the supervisor tore down a healthy runner and both
+# relays on the strength of it.
 #
 # These checks drive the production decision function directly (extracted the
 # same way the other setup-wda fixtures do), with `curl` stubbed. No phone, no
@@ -84,22 +85,61 @@ grep -q "runner and relays are alive" "$INFO_LOG" \
     || fail_test "the held probe did not report that the processes are alive"
 pass "holding is reported with the count, not as a verdict"
 
-# 5. The loop must still exit IMMEDIATELY when a process or listener is gone:
-#    those are unambiguous, and only the HTTP probe got a threshold.
-loop="$(awk '
-    /KeepAlive mode: holding/ { copying=1 }
+# 5. Process death and a missing listener must still exit AT ONCE. Driven by
+#    running the production loop under stubs, because grepping its source only
+#    shows the code is shaped right, not that it behaves right.
+awk '
+    /^    while :; do$/ { copying=1 }
     copying { print }
     copying && /^    done$/ { exit }
-' "$SETUP")"
-printf '%s\n' "$loop" | grep -q '_validate_pid_record .* runner || break' \
-    || fail_test "a dead runner no longer exits immediately"
-printf '%s\n' "$loop" | grep -q '_verify_loopback_listener .* relay "\$WDA_PORT" \\' \
-    || fail_test "a vanished relay listener no longer exits immediately"
-printf '%s\n' "$loop" | grep -q '_keepalive_probe_verdict || break' \
-    || fail_test "the HTTP probe is not going through the threshold"
-printf '%s\n' "$loop" | grep -q 'curl -fsS -m 4' \
-    && fail_test "the loop still probes inline, bypassing the threshold"
-pass "process death and a missing listener still exit at once"
+' "$SETUP" > "$TMP_ROOT/keepalive-loop.sh"
+grep -q "_keepalive_probe_verdict || break" "$TMP_ROOT/keepalive-loop.sh" \
+    || fail_test "could not extract the KeepAlive loop from setup-wda.sh"
+
+run_loop() {
+    # $1 runner alive, $2 relay listening, $3 mjpeg listening
+    (
+        RUNNER_OK="$1"; RELAY_OK="$2"; MJPEG_OK="$3"
+        PROBE_CALLS=0
+        VALIDATED_PID=1234
+        KEEPALIVE_PROBE_MAX_FAILURES=3
+        KEEPALIVE_PROBE_FAILURES=0
+        RUNNER_PID_FILE=; LEGACY_RUNNER_EXPECTED=; RELAY_PID_FILE=
+        LEGACY_RELAY_EXPECTED=; MJPEG_RELAY_PID_FILE=; LEGACY_MJPEG_EXPECTED=
+        WDA_PORT=8100; MJPEG_PORT=9100
+        info() { :; }
+        _validate_pid_record() { [ "$RUNNER_OK" = 1 ]; }
+        _verify_loopback_listener() {
+            case "$3" in
+                relay) [ "$RELAY_OK" = 1 ] ;;
+                mjpeg) [ "$MJPEG_OK" = 1 ] ;;
+                *) return 1 ;;
+            esac
+        }
+        _keepalive_probe_verdict() {
+            PROBE_CALLS=$((PROBE_CALLS + 1))
+            return 1   # would ask for a rebuild, so the loop cannot spin
+        }
+        sleep() { :; }
+        # shellcheck source=/dev/null
+        . "$TMP_ROOT/keepalive-loop.sh"
+        printf '%s %s\n' "$KEEPALIVE_EXIT_CAUSE" "$PROBE_CALLS"
+    )
+}
+
+result="$(run_loop 0 1 1)"
+[ "$result" = "runner 0" ] \
+    || fail_test "a dead runner did not exit at once with cause=runner (got '$result')"
+result="$(run_loop 1 0 1)"
+[ "$result" = "relay 0" ] \
+    || fail_test "a missing relay listener did not exit at once with cause=relay (got '$result')"
+result="$(run_loop 1 1 0)"
+[ "$result" = "relay 0" ] \
+    || fail_test "a missing mjpeg listener did not exit at once (got '$result')"
+result="$(run_loop 1 1 1)"
+[ "$result" = "unreachable 1" ] \
+    || fail_test "a healthy set of processes did not reach the HTTP probe (got '$result')"
+pass "process death and a missing listener exit before any HTTP probe is made"
 
 # 6. The rebuild message reports the observation and does not assert a cause.
 verdict="$(awk '
