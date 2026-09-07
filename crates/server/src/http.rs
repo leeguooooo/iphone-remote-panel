@@ -8124,7 +8124,6 @@ async fn agent_input(
             ));
             // A system alert is the one thing the settled tree may not show;
             // report it alongside so the agent never has to screenshot for it.
-            // It obeys the same remaining-budget rule: no time left, no probe.
             // Bounded by its own hard 1.5s cap (see `probe_alert`), which is
             // what the client's timeout budgets for on top of the action
             // deadline and the observation budget.
