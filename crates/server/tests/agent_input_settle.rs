@@ -692,3 +692,80 @@ fn a_sample_cut_off_by_the_budget_marks_the_returned_tree_stale() {
         assert!(json["settle"]["error"].is_null(), "nothing broke: {json}");
     });
 }
+
+/// The failure this whole budget rework exists for, reproduced without a phone.
+///
+/// On the candidate hardware one element read costs 6–7 seconds. Under the old
+/// ceiling (settle_ms max 5000) the DEFAULT observation could never finish even
+/// one read: every caller got `captures: 0` and a bare `budget_exhausted`, with
+/// nothing in the answer to say the budget was simply too small for this phone.
+///
+/// With a 15s default the same phone gets two reads — so the default call can
+/// still reach `stable`, which is the point: the fix is a budget that matches
+/// real hardware, not a feature that gives up on observing.
+#[test]
+fn a_seven_second_read_still_settles_on_the_default_budget() {
+    block(async {
+        let wda = mock_wda(move |request, _| {
+            if is_session(request) {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if is_mutation(request) {
+                return Some((Duration::ZERO, r#"{"value":null}"#.to_string()));
+            }
+            if is_source(request) {
+                // The measured cost on the phone that exposed this.
+                return Some((Duration::from_millis(6_500), simple_tree("搜索")));
+            }
+            None
+        });
+
+        let started = std::time::Instant::now();
+        let (status, json, _) = press_home(wda.url(), "?return=delta").await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["settle"]["captures"], 2,
+            "two reads of a slow tree must fit the default budget: {json}"
+        );
+        assert_eq!(json["settle"]["settled"], true, "{json}");
+        assert_eq!(json["settle"]["reason"], "stable");
+        assert!(json["snapshot"].is_string());
+        // It really did take the reads, rather than answering from nothing.
+        assert!(elapsed >= Duration::from_millis(13_000), "{elapsed:?}");
+    });
+}
+
+/// A slow ACTION must not eat the observation. The two deadlines compose:
+/// dispatch is bounded by the action deadline, and the observation's clock
+/// starts once the action is confirmed.
+#[test]
+fn a_slow_action_still_gets_its_own_observation_window() {
+    block(async {
+        let wda = mock_wda(move |request, _| {
+            if is_session(request) {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if is_mutation(request) {
+                // Most of the action deadline spent before we can even look.
+                return Some((Duration::from_millis(11_000), r#"{"value":null}"#.to_string()));
+            }
+            if is_source(request) {
+                return Some((Duration::from_millis(1_000), simple_tree("搜索")));
+            }
+            None
+        });
+
+        let (status, json, _) = press_home(wda.url(), "?return=delta").await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["settle"]["captures"], 2,
+            "the observation window is not what is left of the action's: {json}"
+        );
+        assert_eq!(json["settle"]["reason"], "stable");
+    });
+}

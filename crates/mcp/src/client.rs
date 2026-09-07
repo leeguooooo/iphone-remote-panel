@@ -14,6 +14,15 @@ const DEFAULT_URL: &str = "http://127.0.0.1:44321";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
+/// Only for a request that asks the daemon to OBSERVE after acting.
+///
+/// Such a request costs the action deadline plus the observation budget, and
+/// those compose rather than share: 15s of dispatch, then up to 20s of
+/// looking, plus the alert probe and serialising. The ordinary 30s would abandon
+/// the request while the daemon still held the phone — and abandoning it is
+/// precisely how a caller ends up not knowing what happened. Non-observing
+/// requests keep the shorter timeout.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_BODY_CHARS: usize = 2_048;
@@ -222,12 +231,15 @@ impl DaemonClient {
         } else {
             "/agent/input"
         };
-        let req = self
+        let mut req = self
             .auth(self.client.post(self.url(path)))
             .header("x-phone-control", "1")
             .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(msg.to_json());
+        if observe {
+            req = req.timeout(OBSERVE_TIMEOUT);
+        }
         read_response(req.send().await?).await
     }
 

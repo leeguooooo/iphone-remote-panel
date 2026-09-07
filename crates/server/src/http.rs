@@ -5728,7 +5728,15 @@ const DIRECT_CONTROL_MAX_TTL_MS: u64 = 2500;
 const AGENT_INPUT_WDA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const AGENT_ACTIONS_MAX_BODY_BYTES: usize = 64 * 1024;
 const AGENT_ACTIONS_MAX_STEPS: usize = 24;
-const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 10_000;
+/// Longest a single `wait_for` may be given.
+///
+/// Raised from 10s for the same reason as the observation budget: one element
+/// read can cost six or seven seconds on real hardware, so a 10s ceiling left
+/// room for a single poll and made a genuine wait impossible to express. The
+/// cumulative cap ([`AGENT_ACTIONS_MAX_DECLARED_WAIT_MS`]) and the batch
+/// deadline ([`AGENT_ACTIONS_DEADLINE`]) are deliberately unchanged, so a
+/// longer single wait cannot lengthen a batch.
+const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 30_000;
 const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
 const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
@@ -6348,7 +6356,7 @@ struct AgentElementLocator {
 }
 
 fn default_agent_actions_wait_ms() -> u64 {
-    5_000
+    15_000
 }
 
 fn default_agent_actions_poll_ms() -> u64 {
@@ -7536,12 +7544,21 @@ struct AgentInputQuery {
     settle_ms: Option<u64>,
 }
 
-const AGENT_INPUT_SETTLE_DEFAULT_MS: u64 = 1_200;
-const AGENT_INPUT_SETTLE_MAX_MS: u64 = 5_000;
-/// Slack kept between the observation's deadline and the endpoint's own action
-/// deadline, so serializing and answering always fits inside what the MCP
-/// client is still waiting for.
-const AGENT_INPUT_OBSERVATION_MARGIN: std::time::Duration = std::time::Duration::from_secs(3);
+/// Default observation budget, and its ceiling.
+///
+/// Both were previously sized on a fast development machine (1.2s / 5s). On a
+/// phone where one `/source` takes six or seven seconds that was not "we
+/// sometimes miss the screen" — it made the post-action observation
+/// structurally impossible: every caller got `captures: 0` and an empty
+/// `budget_exhausted`, forever, with no way to tell why.
+///
+/// A read's cost varies with the device and the screen; on the hardware that
+/// exposed this it was measured in the 6–7s range for a large tree. 15s leaves
+/// room for two such reads, so the DEFAULT call can still reach `stable`
+/// there, and any phone returns as soon as two reads match rather than waiting
+/// out the budget.
+const AGENT_INPUT_SETTLE_DEFAULT_MS: u64 = 15_000;
+const AGENT_INPUT_SETTLE_MAX_MS: u64 = 20_000;
 
 /// A settled tree read is best-effort *observation*, never part of the action
 /// result. `Stable` means two consecutive reads hashed identically over a tree
@@ -8135,13 +8152,18 @@ async fn agent_input(
         let mut settled = None;
         let mut alert = None;
         if want_delta && outcome == WdaControlOutcome::Applied {
-            let remaining = agent_wda_deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .saturating_sub(AGENT_INPUT_OBSERVATION_MARGIN);
-            let budget = std::cmp::min(
-                std::time::Duration::from_millis(settle_budget_ms),
-                remaining,
-            );
+            // The observation's clock starts HERE, after the action is
+            // confirmed — it is not carved out of what the action left of its
+            // own deadline. Otherwise a slow action silently eats the
+            // observation: 15s of dispatch would leave nothing to look with,
+            // and the caller would be told `captures: 0` as though the screen
+            // were unreadable rather than never looked at.
+            //
+            // The two deadlines therefore compose rather than compete:
+            // dispatch is bounded by `agent_wda_deadline`, observation by this
+            // budget, and the client's timeout has to cover their sum (see
+            // `OBSERVE_TIMEOUT` in the MCP client).
+            let budget = std::time::Duration::from_millis(settle_budget_ms);
             let (observed, report) = settle_and_read_elements(&mut client, budget).await;
             settled = Some((
                 observed.map(|(snapshot, rows)| (snapshot, Arc::new(rows))),
@@ -8150,11 +8172,10 @@ async fn agent_input(
             // A system alert is the one thing the settled tree may not show;
             // report it alongside so the agent never has to screenshot for it.
             // It obeys the same remaining-budget rule: no time left, no probe.
-            if agent_wda_deadline.saturating_duration_since(tokio::time::Instant::now())
-                > AGENT_INPUT_OBSERVATION_MARGIN
-            {
-                alert = probe_alert(&mut client).await;
-            }
+            // Bounded by its own hard 1.5s cap (see `probe_alert`), which is
+            // what the client's timeout budgets for on top of the action
+            // deadline and the observation budget.
+            alert = probe_alert(&mut client).await;
         }
         drop(client);
         return match outcome {
