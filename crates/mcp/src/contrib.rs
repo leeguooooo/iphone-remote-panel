@@ -395,22 +395,251 @@ pub struct ReportOutcome {
     pub issue_url: String,
 }
 
-/// Strip fields that can carry runtime text or private screen content before
-/// a result is pasted into a public issue.
-pub fn redact_result(value: &serde_json::Value) -> serde_json::Value {
-    const DROP: [&str; 6] = ["text", "value", "label", "labels", "candidates", "elements"];
-    match value {
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.iter()
-                .filter(|(key, _)| !DROP.contains(&key.as_str()))
-                .map(|(key, inner)| (key.clone(), redact_result(inner)))
-                .collect(),
-        ),
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(redact_result).collect())
+/// Every `error` code the daemon's agent surface can emit, gathered from its
+/// JSON responses. A public report shows a code only if it is on this list.
+///
+/// A shape check (lowercase snake_case, short) is NOT enough: `secret123` and
+/// `my_private_token` both satisfy it. Only an explicit set can promise that
+/// what gets published is a daemon-authored code and not something that
+/// arrived from elsewhere.
+///
+/// When the daemon grows a code and this list has not caught up, the report
+/// says [`UNKNOWN_ERROR`] rather than dropping the field — you can still see
+/// that there WAS an error, and the original never leaves the local response.
+const DAEMON_ERROR_CODES: &[&str] = &[
+    "adjust_no_effect",
+    "ambiguous_element_label",
+    "backend_is_direct",
+    "backend_is_mirror",
+    "batch_deadline",
+    "batch_deadline_after_action",
+    "batch_requires_direct_wda",
+    "device_locked",
+    "device_not_drivable",
+    "device_release_in_progress",
+    "device_transition_in_progress",
+    "element_not_found",
+    "expectation_timeout",
+    "intent_args_too_large",
+    "intent_bridge_unavailable",
+    "intent_dispatch_failed",
+    "intent_invalid_request",
+    "intent_not_found",
+    "intent_requires_operator_confirmation",
+    "intent_timeout",
+    "invalid_actions_request",
+    "invalid_control_deadline",
+    "invalid_control_message",
+    "invalid_element_snapshot",
+    "invalid_element_target",
+    "invalid_hold",
+    "invalid_owner",
+    "invalid_owner_request",
+    "invalid_value",
+    "legacy_mirror_uses_webrtc",
+    "lifecycle_busy",
+    "missing_control_header",
+    "no_alert",
+    "not_sent",
+    "outcome_unknown",
+    "phone_handed_to_human",
+    "phone_owned",
+    "reconnect_in_progress",
+    "serialization_failed",
+    "stale_element_snapshot",
+    "target_change_requires_restart",
+    "target_not_configured",
+    "target_required",
+    "unauthorized",
+    "unsupported_control",
+    "unsupported_perform_action",
+    "wda_batch_failed",
+    "wda_is_externally_managed",
+    "wda_not_configured",
+    "wda_pre_dispatch_failed",
+    "wda_source_failed",
+    "wda_source_timeout",
+    "wda_unavailable_or_unsupported",
+];
+
+/// Stand-in for an `error` code that is not (yet) in [`DAEMON_ERROR_CODES`].
+/// Deliberately not the original text.
+const UNKNOWN_ERROR: &str = "unknown_error";
+
+/// Step kinds `/agent/actions` accepts.
+const STEP_KINDS: &[&str] = &["action", "wait_for", "pause"];
+
+/// An `error` field: a known daemon code, or a fixed placeholder. Never the
+/// original string.
+fn error_code(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = value.as_str()?;
+    Some(serde_json::Value::String(
+        if DAEMON_ERROR_CODES.contains(&text) {
+            text.to_string()
+        } else {
+            UNKNOWN_ERROR.to_string()
+        },
+    ))
+}
+
+fn one_of(value: &serde_json::Value, allowed: &[&str]) -> Option<serde_json::Value> {
+    let text = value.as_str()?;
+    allowed
+        .contains(&text)
+        .then(|| serde_json::Value::String(text.to_string()))
+}
+
+fn count(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value.as_u64().map(serde_json::Value::from)
+}
+
+fn flag(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value.as_bool().map(serde_json::Value::Bool)
+}
+
+/// An array of element indices — numbers only, never a bare string.
+fn indices(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let items = value.as_array()?;
+    Some(serde_json::Value::Array(
+        items.iter().filter_map(|item| item.as_u64().map(serde_json::Value::from)).collect(),
+    ))
+}
+
+/// One field's type check: `Some` keeps the projected value, `None` drops it.
+type Projection = fn(&serde_json::Value) -> Option<serde_json::Value>;
+
+/// Build an object from `(key, projection)` pairs, dropping anything the
+/// projection rejects and anything the source does not have.
+fn project(source: &serde_json::Value, fields: &[(&str, Projection)]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (key, projection) in fields {
+        if let Some(value) = source.get(*key).and_then(projection) {
+            out.insert((*key).to_string(), value);
         }
-        other => other.clone(),
     }
+    serde_json::Value::Object(out)
+}
+
+fn project_observation(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value.is_object().then(|| {
+        project(
+            value,
+            &[
+                ("read", flag),
+                ("reads", count),
+                ("attempts", count),
+                ("stale", flag),
+                ("sparse", flag),
+                ("rows", count),
+                ("application_matches", flag),
+                ("missing_present", indices),
+                ("violated_absent", indices),
+                ("absent_unproven", indices),
+            ],
+        )
+    })
+}
+
+fn project_settle(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value.is_object().then(|| {
+        project(
+            value,
+            &[
+                ("settled", flag),
+                (
+                    "reason",
+                    |v| one_of(v, &["stable", "budget_exhausted", "observation_failed"]),
+                ),
+                ("waited_ms", count),
+                ("captures", count),
+                ("budget_ms", count),
+                ("sparse", flag),
+                ("stale", flag),
+                // NOTE: `settle.error` is deliberately absent. It is
+                // `format!("{error:#}")` of a WDA failure and embeds URLs,
+                // hosts and ports. The structured `reason` says everything a
+                // public report needs.
+            ],
+        )
+    })
+}
+
+fn project_step(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value.is_object().then(|| {
+        let mut step = project(
+            value,
+            &[
+                ("index", count),
+                ("kind", |v| one_of(v, STEP_KINDS)),
+                ("ok", flag),
+                ("attempts", count),
+            ],
+        );
+        // A step's own `observation` gets the same treatment as the top-level
+        // one; its `action` payload (typed text, labels) never survives.
+        if let Some(observation) = value.get("observation").and_then(project_observation) {
+            step["observation"] = observation;
+        }
+        step
+    })
+}
+
+fn project_steps(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let items = value.as_array()?;
+    Some(serde_json::Value::Array(
+        items.iter().filter_map(project_step).collect(),
+    ))
+}
+
+/// Project a daemon result down to publishable structure before it is pasted
+/// into a PUBLIC issue.
+///
+/// This is a typed projection, not a key filter. Two properties matter:
+///
+/// * **Allow-list, not deny-list.** A field the daemon grows later is absent
+///   from a report until someone adds it here. Forgetting costs a diagnostic;
+///   with a deny-list, forgetting publishes private screen content.
+/// * **Path- and type-aware.** `error` at the top level is a machine code;
+///   `settle.error` is free text holding a WDA URL. A key-name rule cannot
+///   tell them apart, so every field is projected at its own path and checked
+///   for its own type. Strings survive only where the value is a machine code
+///   or a known enum — never as free text.
+pub fn redact_result(value: &serde_json::Value) -> serde_json::Value {
+    let mut out = project(
+        value,
+        &[
+            ("ok", flag),
+            ("error", error_code),
+            ("outcome", |v| {
+                one_of(v, &["applied", "not_sent", "unknown", "no_effect"])
+            }),
+            // Same closed enum as `outcome`, under the name that says which
+            // thing it describes.
+            ("failed_step_outcome", |v| {
+                one_of(v, &["applied", "not_sent", "unknown", "no_effect"])
+            }),
+            // The batch verdict is its own, smaller enum. Projected through
+            // `one_of` like the others so an unexpected value is dropped
+            // rather than published.
+            ("batch_outcome", |v| {
+                one_of(v, &["nothing_applied", "partially_applied", "unknown"])
+            }),
+            ("retry_safe", flag),
+            ("failed_step", count),
+            ("completed", count),
+            ("applied_actions", count),
+        ],
+    );
+    if let Some(steps) = value.get("steps").and_then(project_steps) {
+        out["steps"] = steps;
+    }
+    if let Some(observation) = value.get("observation").and_then(project_observation) {
+        out["observation"] = observation;
+    }
+    if let Some(settle) = value.get("settle").and_then(project_settle) {
+        out["settle"] = settle;
+    }
+    out
 }
 
 pub fn issue_title(context: &ReportContext) -> String {
@@ -421,12 +650,14 @@ pub fn issue_title(context: &ReportContext) -> String {
         .and_then(|v| v.as_u64())
         .map(|n| format!(" at step {n}"))
         .unwrap_or_default();
+    // Through the same projection as the body: an issue TITLE is just as
+    // public, and `error` is only safe because it is a machine code.
     let error = context
         .result
         .as_ref()
         .and_then(|r| r.get("error"))
-        .and_then(|v| v.as_str())
-        .map(|e| format!(" ({e})"))
+        .and_then(error_code)
+        .and_then(|code| code.as_str().map(|code| format!(" ({code})")))
         .unwrap_or_default();
     format!("{} failed{step}{error}", context.id)
 }
@@ -591,6 +822,44 @@ mod tests {
         assert!(!body.contains("Not yet run"));
     }
 
+    /// The two new batch fields are closed enums, and the projection has to
+    /// treat them as such: a known value survives, anything else — including a
+    /// screen label smuggled into the same key — is dropped rather than
+    /// published into a public issue.
+    #[test]
+    fn the_batch_outcome_fields_are_projected_as_enums_not_free_text() {
+        let kept = redact_result(&serde_json::json!({
+            "ok": false,
+            "outcome": "not_sent",
+            "failed_step_outcome": "not_sent",
+            "batch_outcome": "partially_applied",
+            "applied_actions": 2,
+            "retry_safe": false,
+        }));
+        assert_eq!(kept["failed_step_outcome"], "not_sent");
+        assert_eq!(kept["batch_outcome"], "partially_applied");
+
+        let dropped = redact_result(&serde_json::json!({
+            "ok": false,
+            // Not members of either enum: one is a plausible-looking value
+            // from the wrong enum, one is screen text.
+            "failed_step_outcome": "partially_applied",
+            "batch_outcome": "SCREEN-LABEL-CANARY",
+        }));
+        assert!(
+            dropped.get("failed_step_outcome").is_none(),
+            "a value from the wrong enum must not be published: {dropped}"
+        );
+        assert!(
+            dropped.get("batch_outcome").is_none(),
+            "free text must never reach a public issue: {dropped}"
+        );
+        assert!(
+            !dropped.to_string().contains("SCREEN-LABEL-CANARY"),
+            "{dropped}"
+        );
+    }
+
     #[test]
     fn issue_body_redacts_screen_text_and_names_the_failed_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -600,7 +869,7 @@ mod tests {
             id: "health/open".into(),
             result: Some(serde_json::json!({
                 "ok": false, "failed_step": 0, "error": "element_not_found",
-                "observation": {"label": "私密内容", "candidates": ["a"], "missing_present": [0]},
+                "observation": {"label": "PRIVATE-TEXT-CANARY", "candidates": ["a"], "missing_present": [0]},
                 "steps": [{"action": {"type": "text", "text": "secret"}}]
             })),
             status: Some(serde_json::json!({"version": "0.5.4", "device_state": "ready"})),
@@ -615,10 +884,172 @@ mod tests {
         assert!(body.contains("### Failed step 0"));
         assert!(body.contains("com.apple.Health"));
         assert!(body.contains("missing_present"));
-        assert!(!body.contains("私密内容"));
+        assert!(!body.contains("PRIVATE-TEXT-CANARY"));
         assert!(!body.contains("secret"));
+        assert!(!body.contains("candidates"));
         assert!(body.contains("- version: `\"0.5.4\"`"));
         assert!(body.contains("sha256 `abcdef012345`"));
+    }
+
+    /// The redaction is an allow-list, so a daemon field nobody thought about
+    /// stays out of a public issue by default. A deny-list would publish it.
+    #[test]
+    fn a_daemon_field_nobody_allow_listed_is_not_published() {
+        let redacted = redact_result(&serde_json::json!({
+            "ok": false,
+            "error": "expectation_timeout",
+            "observation": {
+                "read": true,
+                "stale": true,
+                "missing_present": [0],
+                "hint": "no readable element tree was obtained",
+                "application": "SCREEN-LABEL-CANARY"
+            },
+            "future_diagnostic": "PRIVATE-TEXT-CANARY"
+        }));
+        let text = serde_json::to_string(&redacted).unwrap();
+
+        assert!(text.contains("expectation_timeout"), "{text}");
+        assert!(text.contains("missing_present"), "{text}");
+        assert!(text.contains("stale"), "{text}");
+        assert!(!text.contains("SCREEN-LABEL-CANARY"), "{text}");
+        assert!(!text.contains("future_diagnostic"), "{text}");
+        assert!(!text.contains("PRIVATE-TEXT-CANARY"), "{text}");
+    }
+
+    /// `error` means different things at different paths: a machine code at
+    /// the top, free text holding a WDA URL under `settle`. A key-name filter
+    /// cannot tell them apart — this projection must.
+    #[test]
+    fn free_text_error_fields_never_survive_at_any_depth() {
+        let redacted = redact_result(&serde_json::json!({
+            "ok": true,
+            "error": "wda_source_failed",
+            "settle": {
+                "settled": false,
+                "reason": "observation_failed",
+                "captures": 1,
+                "error": "GET /source: error sending request for url \
+                          (http://daemon.invalid:8100/source?format=json): PRIVATE-TEXT-CANARY"
+            },
+            "steps": [
+                {"index": 0, "kind": "action", "ok": true},
+                {"index": 1, "kind": "wait_for", "ok": false,
+                 "error": "GET /source failed at http://daemon.invalid:8100 for SCREEN-LABEL-CANARY",
+                 "observation": {"read": true, "sparse": false, "missing_present": [2],
+                                 "application": "SCREEN-LABEL-CANARY"}}
+            ]
+        }));
+        let text = serde_json::to_string(&redacted).unwrap();
+
+        // Machine codes and structure survive.
+        assert!(text.contains("wda_source_failed"), "{text}");
+        assert!(text.contains("observation_failed"), "{text}");
+        assert!(text.contains("wait_for"), "{text}");
+        assert!(text.contains("missing_present"), "{text}");
+        // Everything free-text does not, at any depth.
+        assert!(!text.contains("daemon.invalid"), "{text}");
+        assert!(!text.contains("8100"), "{text}");
+        assert!(!text.contains("PRIVATE-TEXT-CANARY"), "{text}");
+        assert!(!text.contains("SCREEN-LABEL-CANARY"), "{text}");
+        assert!(!text.contains("GET /source"), "{text}");
+    }
+
+    /// Values of the wrong type are dropped rather than passed through: a
+    /// free-text string parked on a field that should hold a count or an enum
+    /// must not become a publication channel.
+    #[test]
+    fn a_wrongly_typed_field_is_dropped_not_forwarded() {
+        let redacted = redact_result(&serde_json::json!({
+            "ok": "PRIVATE-TEXT-CANARY",
+            "failed_step": "http://daemon.invalid:8100",
+            "outcome": "SCREEN-LABEL-CANARY",
+            "observation": {"missing_present": ["PRIVATE-TEXT-CANARY"], "reads": true}
+        }));
+        let text = serde_json::to_string(&redacted).unwrap();
+
+        assert!(!text.contains("PRIVATE-TEXT-CANARY"), "{text}");
+        assert!(!text.contains("daemon.invalid"), "{text}");
+        assert!(!text.contains("SCREEN-LABEL-CANARY"), "{text}");
+        assert_eq!(redacted["observation"]["missing_present"], serde_json::json!([]));
+        assert!(redacted["observation"]["reads"].is_null(), "{text}");
+    }
+
+    /// A string that merely LOOKS like a machine code is not one. `secret123`
+    /// satisfies every shape rule and is exactly what a password or a pasted
+    /// token looks like, so only membership in the daemon's own code set may
+    /// put a string in a public report.
+    #[test]
+    fn a_string_shaped_like_a_code_is_still_not_published() {
+        let redacted = redact_result(&serde_json::json!({
+            "ok": false,
+            "error": "secret123",
+            "steps": [{"index": 0, "kind": "my_private_token", "ok": false}]
+        }));
+        let text = serde_json::to_string(&redacted).unwrap();
+
+        assert!(!text.contains("secret123"), "{text}");
+        assert!(!text.contains("my_private_token"), "{text}");
+        // Not dropped silently: the report still says an error happened.
+        assert_eq!(redacted["error"], "unknown_error");
+        assert!(redacted["steps"][0]["kind"].is_null(), "{text}");
+        assert_eq!(redacted["steps"][0]["index"], 0, "structure survives");
+    }
+
+    /// The other half of the same rule: real daemon codes must survive, or the
+    /// redaction would make reports useless.
+    #[test]
+    fn real_daemon_codes_survive() {
+        let redacted = redact_result(&serde_json::json!({
+            "ok": false,
+            "error": "expectation_timeout",
+            "outcome": "not_sent",
+            "steps": [
+                {"index": 0, "kind": "action", "ok": true},
+                {"index": 1, "kind": "wait_for", "ok": false},
+                {"index": 2, "kind": "pause", "ok": false}
+            ]
+        }));
+
+        assert_eq!(redacted["error"], "expectation_timeout");
+        assert_eq!(redacted["outcome"], "not_sent");
+        assert_eq!(redacted["steps"][0]["kind"], "action");
+        assert_eq!(redacted["steps"][1]["kind"], "wait_for");
+        assert_eq!(redacted["steps"][2]["kind"], "pause");
+    }
+
+    /// A code-shaped secret must not reach the issue TITLE either.
+    #[test]
+    fn a_code_shaped_secret_never_reaches_the_issue_title() {
+        let context = ReportContext {
+            id: "health/open".into(),
+            result: Some(serde_json::json!({"failed_step": 0, "error": "secret123"})),
+            status: None,
+            application: None,
+            note: None,
+        };
+        let title = issue_title(&context);
+        assert_eq!(title, "health/open failed at step 0 (unknown_error)");
+        assert!(!title.contains("secret123"));
+    }
+
+    /// The title is as public as the body and goes through the same check.
+    #[test]
+    fn a_free_text_error_never_reaches_the_issue_title() {
+        let context = ReportContext {
+            id: "health/open".into(),
+            result: Some(serde_json::json!({
+                "failed_step": 1,
+                "error": "GET /source failed at http://daemon.invalid:8100 for SCREEN-LABEL-CANARY"
+            })),
+            status: None,
+            application: None,
+            note: None,
+        };
+        let title = issue_title(&context);
+        assert_eq!(title, "health/open failed at step 1 (unknown_error)");
+        assert!(!title.contains("daemon.invalid"));
+        assert!(!title.contains("SCREEN-LABEL-CANARY"));
     }
 
     /// End-to-end publish against a local bare repo with a stub `gh`.

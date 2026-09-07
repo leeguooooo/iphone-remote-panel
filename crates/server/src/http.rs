@@ -194,78 +194,167 @@ enum WdaLifecycleTransition {
     Reconnecting = 2,
 }
 
+/// Proof that its holder is the current owner of one lifecycle transition.
+///
+/// A bare phase is not enough to finish a transition: after
+/// Reconnecting→Active→Reconnecting the phase byte is identical, so a late
+/// finish from the first round would silently end the second one (classic
+/// ABA). The generation makes each round distinguishable, and only its own
+/// token can end it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WdaTransitionToken {
+    generation: u64,
+    phase: WdaLifecycleTransition,
+}
+
 /// Single-owner arbitration for managed WDA start/stop transitions.
 ///
 /// Release and reconnect are mutually exclusive device lifecycle operations.
 /// Keeping them in one atomic state means they cannot both win after stale
 /// prechecks and concurrently stop/bootstrap the same launchd supervisor.
+///
+/// The state packs a generation with the phase: `generation << 8 | phase`.
+/// Every successful begin bumps the generation, so a token identifies exactly
+/// one round of one transition.
 #[derive(Debug)]
 pub struct WdaLifecycle {
-    transition: std::sync::atomic::AtomicU8,
+    state: std::sync::atomic::AtomicU64,
+    /// Serialises phase changes with evidence published under a token.
+    ///
+    /// Checking ownership and then writing shared health is a TOCTOU: the
+    /// handover can land between the two, so a superseded task would still
+    /// publish its round's observation into the next round. Every begin,
+    /// every finish, and every token-scoped publish takes this gate, so those
+    /// three are mutually exclusive and ownership cannot change mid-publish.
+    gate: Mutex<()>,
 }
+
+const WDA_LIFECYCLE_PHASE_MASK: u64 = 0xff;
 
 impl WdaLifecycle {
     pub fn new() -> Self {
         Self {
-            transition: std::sync::atomic::AtomicU8::new(WdaLifecycleTransition::Active as u8),
+            state: std::sync::atomic::AtomicU64::new(WdaLifecycleTransition::Active as u64),
+            gate: Mutex::new(()),
         }
     }
 
-    fn current(&self) -> WdaLifecycleTransition {
-        match self.transition.load(std::sync::atomic::Ordering::Acquire) {
-            value if value == WdaLifecycleTransition::Active as u8 => {
+    fn decode(state: u64) -> (u64, WdaLifecycleTransition) {
+        let generation = state >> 8;
+        let phase = match state & WDA_LIFECYCLE_PHASE_MASK {
+            value if value == WdaLifecycleTransition::Active as u64 => {
                 WdaLifecycleTransition::Active
             }
-            value if value == WdaLifecycleTransition::Releasing as u8 => {
+            value if value == WdaLifecycleTransition::Releasing as u64 => {
                 WdaLifecycleTransition::Releasing
             }
-            value if value == WdaLifecycleTransition::Reconnecting as u8 => {
+            value if value == WdaLifecycleTransition::Reconnecting as u64 => {
                 WdaLifecycleTransition::Reconnecting
             }
             _ => unreachable!("WDA lifecycle state is private and always valid"),
+        };
+        (generation, phase)
+    }
+
+    fn encode(generation: u64, phase: WdaLifecycleTransition) -> u64 {
+        (generation << 8) | phase as u64
+    }
+
+    fn current(&self) -> WdaLifecycleTransition {
+        Self::decode(self.state.load(std::sync::atomic::Ordering::Acquire)).1
+    }
+
+    fn try_begin(&self, transition: WdaLifecycleTransition) -> Option<WdaTransitionToken> {
+        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
+        let mut observed = self.state.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let (generation, phase) = Self::decode(observed);
+            if phase != WdaLifecycleTransition::Active {
+                return None;
+            }
+            let next_generation = generation.wrapping_add(1);
+            match self.state.compare_exchange_weak(
+                observed,
+                Self::encode(next_generation, transition),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(WdaTransitionToken {
+                        generation: next_generation,
+                        phase: transition,
+                    })
+                }
+                Err(current) => observed = current,
+            }
         }
     }
 
-    fn try_begin(&self, transition: WdaLifecycleTransition) -> bool {
-        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
-        self.transition
+    /// End the transition this token owns. Returns false — without panicking —
+    /// when the token is no longer current, which is a normal outcome for a
+    /// task that was superseded or that raced another observer. The generation
+    /// is preserved so the next begin still produces a fresh token.
+    fn finish(&self, token: WdaTransitionToken) -> bool {
+        debug_assert_ne!(token.phase, WdaLifecycleTransition::Active);
+        let finished = self
+            .state
             .compare_exchange(
-                WdaLifecycleTransition::Active as u8,
-                transition as u8,
+                Self::encode(token.generation, token.phase),
+                Self::encode(token.generation, WdaLifecycleTransition::Active),
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if !finished {
+            tracing::debug!(
+                generation = token.generation,
+                "ignored a lifecycle finish from a superseded owner"
+            );
+        }
+        finished
     }
 
-    fn finish(&self, transition: WdaLifecycleTransition) {
-        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
-        let result = self.transition.compare_exchange(
-            transition as u8,
-            WdaLifecycleTransition::Active as u8,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
-        debug_assert!(
-            result.is_ok(),
-            "only the current WDA lifecycle owner may finish its transition"
-        );
+    /// Whether this token still owns the current transition.
+    fn owns(&self, token: WdaTransitionToken) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire)
+            == Self::encode(token.generation, token.phase)
     }
 
-    fn try_begin_releasing(&self) -> bool {
+    /// Run `publish` only while `token` still owns the transition, with the
+    /// gate held so ownership cannot change while it runs. Returns `None`
+    /// when the token has been superseded and nothing was published.
+    fn publish_if_current<R>(
+        &self,
+        token: WdaTransitionToken,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _gate = recover(self.gate.lock());
+        if !self.owns(token) {
+            return None;
+        }
+        Some(publish())
+    }
+
+    fn try_begin_releasing(&self) -> Option<WdaTransitionToken> {
+        let _gate = recover(self.gate.lock());
         self.try_begin(WdaLifecycleTransition::Releasing)
     }
 
-    fn finish_releasing(&self) {
-        self.finish(WdaLifecycleTransition::Releasing);
+    fn finish_releasing(&self, token: WdaTransitionToken) -> bool {
+        debug_assert_eq!(token.phase, WdaLifecycleTransition::Releasing);
+        let _gate = recover(self.gate.lock());
+        self.finish(token)
     }
 
-    fn try_begin_reconnecting(&self) -> bool {
+    fn try_begin_reconnecting(&self) -> Option<WdaTransitionToken> {
+        let _gate = recover(self.gate.lock());
         self.try_begin(WdaLifecycleTransition::Reconnecting)
     }
 
-    fn finish_reconnecting(&self) {
-        self.finish(WdaLifecycleTransition::Reconnecting);
+    fn finish_reconnecting(&self, token: WdaTransitionToken) -> bool {
+        debug_assert_eq!(token.phase, WdaLifecycleTransition::Reconnecting);
+        let _gate = recover(self.gate.lock());
+        self.finish(token)
     }
 
     pub fn is_releasing(&self) -> bool {
@@ -274,38 +363,6 @@ impl WdaLifecycle {
 
     pub fn is_reconnecting(&self) -> bool {
         self.current() == WdaLifecycleTransition::Reconnecting
-    }
-
-    /// End a reconnect that reality has already overtaken.
-    ///
-    /// The readiness task normally clears the flag when its probe succeeds,
-    /// but it is one `tokio::spawn` away from the truth: if it is starved of
-    /// the WDA mutex, cancelled, or otherwise never reaches its epilogue, the
-    /// flag stays set forever. `drivable` is false while it is, so a
-    /// completely healthy runner reads as "still reconnecting" — the browser
-    /// shows a spinner and every agent action is refused, with nothing to
-    /// recover from.
-    ///
-    /// Observed on hardware 2026-09-06: WDA up and action-level actionable for
-    /// 7+ minutes with `reconnecting:true` and `drivable:false`.
-    ///
-    /// Only a Reconnecting→Active transition is attempted, so a release in
-    /// progress is never disturbed and a concurrent finish just loses the CAS.
-    /// Test-only: enter the Reconnecting state without a bring-up.
-    #[doc(hidden)]
-    pub fn begin_reconnecting_for_test(&self) -> bool {
-        self.try_begin_reconnecting()
-    }
-
-    fn finish_reconnect_if_stale(&self) -> bool {
-        self.transition
-            .compare_exchange(
-                WdaLifecycleTransition::Reconnecting as u8,
-                WdaLifecycleTransition::Active as u8,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
     }
 
     fn is_transitioning(&self) -> bool {
@@ -872,6 +929,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/intent", post(agent_intent))
         .route("/agent/hold", post(agent_hold))
         .route("/agent/owner", post(agent_owner))
+        .route("/agent/capabilities", get(agent_capabilities))
         .with_state(state)
 }
 
@@ -1501,91 +1559,276 @@ fn apply_wda_health_probe_tracked(
     health.actionable
 }
 
-fn finish_wda_readiness_wait(lifecycle: &WdaLifecycle) {
-    lifecycle.finish_reconnecting();
+/// Why a readiness wait ended. Every reconnect ends with exactly one of
+/// these, and each is logged, so a reconnect that goes quiet is a bug with a
+/// name rather than an unexplained flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WdaReadinessOutcome {
+    /// A real action succeeded — the phone is drivable.
+    Ready,
+    /// WDA answers but the phone is locked; only a person can clear that.
+    Locked,
+    /// setup-wda.sh published a prerequisite it cannot pass on its own.
+    SetupBlocked,
+    /// The bring-up budget ran out.
+    Deadline,
+    /// Another round took the lifecycle over; this task owns nothing.
+    Superseded,
+}
+
+impl WdaReadinessOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Locked => "locked",
+            Self::SetupBlocked => "setup_blocked",
+            Self::Deadline => "deadline",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// End the reconnect this token owns. A superseded task finishes nothing —
+/// the round it belonged to is already over, and the current one belongs to
+/// somebody else.
+fn finish_wda_readiness_wait(
+    lifecycle: &WdaLifecycle,
+    token: WdaTransitionToken,
+    outcome: WdaReadinessOutcome,
+) {
+    if outcome == WdaReadinessOutcome::Superseded {
+        tracing::debug!(
+            outcome = outcome.as_str(),
+            "readiness wait exited without owning the lifecycle"
+        );
+        return;
+    }
+    if !lifecycle.finish_reconnecting(token) {
+        tracing::debug!(
+            outcome = outcome.as_str(),
+            "readiness wait could not finish: the lifecycle moved on"
+        );
+    }
 }
 
 const WDA_READINESS_TIMEOUT_SECS: u64 = 420;
 
-fn spawn_wda_readiness_wait(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        // setup-wda.sh allows up to six minutes for xcodebuild to report the
-        // on-device server URL, and first startup after an Xcode update can use
-        // most of that budget. Ending the lifecycle after two minutes exposed
-        // `released` while launchd was still building, which invited a second
-        // reconnect against the same in-flight supervisor. Keep a small margin
-        // for prerequisite checks and relay verification.
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(WDA_READINESS_TIMEOUT_SECS);
-        let mut ready = false;
-        let mut locked = false;
-        let mut seen_up = false;
-        let mut setup_blocker = String::new();
-        while tokio::time::Instant::now() < deadline && !state.wda_lifecycle.is_releasing() {
-            // A concrete prerequisite failure is authoritative. Keeping the
-            // transition at `reconnecting` for the full two-minute WDA budget
-            // made an unplugged phone look like a slow-but-healthy startup and
-            // hid the actionable USB/trust/DDI message from clients.
-            // Lifecycle transitions must only trust the current helper's
-            // structured status. `read_setup_blocked_on` also has a narrow
-            // old-helper log fallback for display, but a stale log inference
-            // must never end an active reconnect and expose `released` while
-            // launchd is still rebuilding WDA.
-            setup_blocker = read_structured_setup_blocked_on();
-            if !setup_blocker.is_empty() {
-                break;
-            }
-            if let Some(wda) = &state.wda {
-                let _priority = state.begin_wda_control();
-                let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                    wda.lock().await.probe_health().await
-                })
-                .await;
-                if let Ok(health) = result {
-                    seen_up |= health.up;
-                    if apply_wda_health_probe(
+/// Time limits for one readiness wait. Production uses [`Self::default`];
+/// tests shrink it so the real loop can be driven to each outcome in
+/// milliseconds instead of minutes.
+#[derive(Debug, Clone, Copy)]
+struct WdaReadinessBudget {
+    /// Whole-wait budget.
+    total: std::time::Duration,
+    /// Ceiling for one probe. Also clamped to what is left of `total`, so a
+    /// slow probe cannot push the wait past its deadline.
+    probe: std::time::Duration,
+    /// Gap between probes while the bring-up is still in progress.
+    poll: std::time::Duration,
+}
+
+impl Default for WdaReadinessBudget {
+    fn default() -> Self {
+        Self {
+            total: std::time::Duration::from_secs(WDA_READINESS_TIMEOUT_SECS),
+            probe: std::time::Duration::from_secs(20),
+            poll: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+/// Guarantees the reconnect ends even if the readiness future is dropped.
+///
+/// A cancelled task (runtime shutdown, a future dropped by a caller) would
+/// otherwise leave `reconnecting` set with nobody left to clear it. Dropping
+/// this guard attempts the same finish the normal path performs; the token
+/// makes it a no-op when the round has already been superseded or finished.
+struct WdaReadinessOwnership {
+    lifecycle: Arc<WdaLifecycle>,
+    token: WdaTransitionToken,
+    resolved: bool,
+}
+
+impl WdaReadinessOwnership {
+    fn new(lifecycle: Arc<WdaLifecycle>, token: WdaTransitionToken) -> Self {
+        Self {
+            lifecycle,
+            token,
+            resolved: false,
+        }
+    }
+
+    /// Normal completion: end the round unless it was superseded (in which
+    /// case this task owns nothing and must leave the current round alone).
+    fn resolve(&mut self, outcome: WdaReadinessOutcome) {
+        self.resolved = true;
+        finish_wda_readiness_wait(&self.lifecycle, self.token, outcome);
+    }
+}
+
+impl Drop for WdaReadinessOwnership {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        if self.lifecycle.finish_reconnecting(self.token) {
+            tracing::warn!(
+                generation = self.token.generation,
+                "readiness wait was cancelled before finishing; its reconnect was ended by the drop guard"
+            );
+        }
+    }
+}
+
+/// Drive one readiness wait to an outcome. Contains no lifecycle bookkeeping
+/// so it can be awaited directly by tests with a short budget.
+async fn run_wda_readiness_wait(
+    state: &Arc<AppState>,
+    token: WdaTransitionToken,
+    budget: WdaReadinessBudget,
+    setup_status_path: &str,
+) -> WdaReadinessOutcome {
+    // setup-wda.sh allows up to six minutes for xcodebuild to report the
+    // on-device server URL, and first startup after an Xcode update can use
+    // most of that budget. Ending the lifecycle after two minutes exposed
+    // `released` while launchd was still building, which invited a second
+    // reconnect against the same in-flight supervisor.
+    let started = tokio::time::Instant::now();
+    let deadline = started + budget.total;
+    tracing::info!(
+        budget_secs = budget.total.as_secs(),
+        generation = token.generation,
+        "managed WDA readiness wait started"
+    );
+    let mut seen_up = false;
+    let mut setup_blocker = String::new();
+    let outcome = loop {
+        // Another round taking over means this task owns nothing: it must not
+        // publish evidence and must not finish anyone's transition.
+        if !state.wda_lifecycle.owns(token) {
+            break WdaReadinessOutcome::Superseded;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break WdaReadinessOutcome::Deadline;
+        }
+        // A concrete prerequisite failure is authoritative. Keeping the
+        // transition at `reconnecting` for the full WDA budget made an
+        // unplugged phone look like a slow-but-healthy startup and hid the
+        // actionable USB/trust/DDI message from clients. Lifecycle
+        // transitions must only trust the current helper's structured status.
+        setup_blocker = read_structured_setup_blocked_on_at(setup_status_path);
+        if !setup_blocker.is_empty() {
+            break WdaReadinessOutcome::SetupBlocked;
+        }
+        // `read_structured_setup_blocked_on` is a synchronous file read, so
+        // the budget must be re-read after it rather than before.
+        let probe_deadline = deadline.min(tokio::time::Instant::now() + budget.probe);
+        if tokio::time::Instant::now() >= deadline {
+            break WdaReadinessOutcome::Deadline;
+        }
+        if let Some(wda) = &state.wda {
+            let _priority = state.begin_wda_control();
+            // Absolute, so a probe cannot outlive the budget no matter how
+            // long the work before it took.
+            let result = tokio::time::timeout_at(probe_deadline, async {
+                wda.lock().await.probe_health().await
+            })
+            .await;
+            if let Ok(health) = result {
+                // A completion that lands after the budget is late evidence:
+                // it must not be published, and it must not report ready.
+                if tokio::time::Instant::now() >= deadline {
+                    break WdaReadinessOutcome::Deadline;
+                }
+                seen_up |= health.up;
+                // Publishing is gated on still owning this round, and the
+                // check and the write happen under the lifecycle gate, so a
+                // handover cannot slip between them and let this round's
+                // observation land in the next one.
+                let published = state.wda_lifecycle.publish_if_current(token, || {
+                    apply_wda_health_probe(
                         &state.wda_health,
                         &state.wda_actionable,
                         &state.released,
                         health,
-                    ) {
-                        ready = true;
-                        break;
-                    }
-                    if health.up && health.locked == Some(true) {
-                        // WDA is up and only the lock screen stands between it
-                        // and actions. That is the user's to clear, not the
-                        // daemon's, so the reconnect is complete: end the
-                        // lifecycle now instead of hiding the "unlock" hint
-                        // behind `reconnecting` for the rest of the budget.
-                        locked = true;
-                        break;
-                    }
+                    )
+                });
+                match published {
+                    None => break WdaReadinessOutcome::Superseded,
+                    Some(true) => break WdaReadinessOutcome::Ready,
+                    Some(false) => {}
+                }
+                if health.up && health.locked == Some(true) {
+                    // WDA is up and only the lock screen stands between it and
+                    // actions. That is the user's to clear, not the daemon's,
+                    // so the reconnect is complete: end the lifecycle now
+                    // instead of hiding the "unlock" hint behind
+                    // `reconnecting` for the rest of the budget.
+                    break WdaReadinessOutcome::Locked;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        if ready {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break WdaReadinessOutcome::Deadline;
+        }
+        tokio::time::sleep(budget.poll.min(remaining)).await;
+    };
+    match outcome {
+        WdaReadinessOutcome::Ready => {
             state.touch_activity();
-        } else if locked {
             tracing::info!(
-                "managed WDA is up but the iPhone is locked — reconnect complete, unlock to drive"
+                elapsed_secs = started.elapsed().as_secs(),
+                "managed WDA reconnect complete: the phone is drivable"
             );
-        } else if !setup_blocker.is_empty() {
-            tracing::warn!(
-                blocked_on = %setup_blocker,
-                "managed WDA reconnect stopped on a setup prerequisite"
-            );
-        } else if seen_up {
-            let health = *recover(state.wda_health.lock());
-            tracing::warn!(
-                locked = ?health.locked,
-                "managed WDA is running but did not become actionable before reconnect deadline"
-            );
-        } else {
-            tracing::warn!("managed WDA did not become actionable before reconnect deadline");
         }
-        finish_wda_readiness_wait(&state.wda_lifecycle);
+        WdaReadinessOutcome::Locked => tracing::info!(
+            "managed WDA is up but the iPhone is locked — reconnect complete, unlock to drive"
+        ),
+        WdaReadinessOutcome::SetupBlocked => tracing::warn!(
+            blocked_on = %setup_blocker,
+            "managed WDA reconnect stopped on a setup prerequisite"
+        ),
+        WdaReadinessOutcome::Deadline => {
+            if seen_up {
+                let health = *recover(state.wda_health.lock());
+                tracing::warn!(
+                    locked = ?health.locked,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "managed WDA is running but did not become actionable before reconnect deadline"
+                );
+            } else {
+                tracing::warn!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "managed WDA did not become actionable before reconnect deadline"
+                );
+            }
+        }
+        WdaReadinessOutcome::Superseded => tracing::debug!(
+            generation = token.generation,
+            "managed WDA readiness wait superseded by a newer round"
+        ),
+    }
+    outcome
+}
+
+fn spawn_wda_readiness_wait(state: Arc<AppState>, token: WdaTransitionToken) {
+    // Constructed BEFORE the spawn and moved in, so a future the runtime drops
+    // without ever polling it still releases its own generation. Building it
+    // inside the async body would leave that window unguarded.
+    let ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
+    tokio::spawn(async move {
+        let mut ownership = ownership;
+        let setup_status_path =
+            crate::instance::Instance::path_str(&crate::instance::current().status_file());
+        let outcome = run_wda_readiness_wait(
+            &state,
+            token,
+            WdaReadinessBudget::default(),
+            &setup_status_path,
+        )
+        .await;
+        ownership.resolve(outcome);
     });
 }
 
@@ -1655,21 +1898,6 @@ async fn agent_status(
     };
     let wda = health.up;
     let wda_actionable = health.actionable;
-    // An actionable runner means the bring-up this reconnect was waiting for
-    // has already succeeded. Clear a flag its own task failed to clear, so
-    // `drivable` below reflects the device instead of a lost bookkeeping
-    // update. Re-read the flag afterwards: the response must not claim a
-    // transition that no longer exists.
-    let reconnecting = if reconnecting && wda_actionable && !releasing {
-        if state.wda_lifecycle.finish_reconnect_if_stale() {
-            tracing::warn!(
-                "cleared a stale reconnect: WDA is actionable but the readiness task never finished"
-            );
-        }
-        state.wda_lifecycle.is_reconnecting()
-    } else {
-        reconnecting
-    };
     let wda_locked = match health.locked {
         Some(true) => "true",
         Some(false) => "false",
@@ -1969,10 +2197,24 @@ struct WdaSetupStatus {
 }
 
 fn read_structured_setup_status() -> Option<WdaSetupStatus> {
-    let status_path = crate::instance::Instance::path_str(&crate::instance::current().status_file());
+    read_structured_setup_status_at(&crate::instance::Instance::path_str(
+        &crate::instance::current().status_file(),
+    ))
+}
+
+/// [`read_structured_setup_status`] against an explicit path, so the readiness
+/// loop can be driven against a fixture instead of the operator's real state
+/// directory.
+fn read_structured_setup_status_at(status_path: &str) -> Option<WdaSetupStatus> {
     std::fs::read_to_string(status_path)
         .ok()
         .and_then(|txt| parse_setup_status(&txt, now_secs()))
+}
+
+fn read_structured_setup_blocked_on_at(status_path: &str) -> String {
+    read_structured_setup_status_at(status_path)
+        .map(|status| status.blocked_on)
+        .unwrap_or_default()
 }
 
 fn read_recent_setup_log_blocker(path: &str) -> String {
@@ -2927,16 +3169,16 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 // we were awaiting above, and this stop would bootout the
                 // supervisor it had just bootstrapped; with it, handlers fail
                 // fast on `releasing` and a reconnect cannot start underneath.
-                if !state.wda_lifecycle.try_begin_releasing() {
+                let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
                     continue;
-                }
+                };
                 if state.viewer_busy()
                     || state.held()
                     || state.idle_for() < window
                     || state.wda_control_pending.load(Ordering::Acquire) != 0
                     || setup_in_flight(&crate::instance::current().state_dir)
                 {
-                    state.wda_lifecycle.finish_releasing();
+                    state.wda_lifecycle.finish_releasing(release_token);
                     continue;
                 }
                 tracing::info!(
@@ -2967,7 +3209,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                         backoff.as_secs()
                     );
                 }
-                state.wda_lifecycle.finish_releasing();
+                state.wda_lifecycle.finish_releasing(release_token);
                 continue;
             }
             if !was_up {
@@ -3014,9 +3256,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if release_backoff_until.is_some_and(|until| std::time::Instant::now() < until) {
                 continue; // a recent stop did not take; wait out the backoff
             }
-            if !state.wda_lifecycle.try_begin_releasing() {
+            let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
                 continue;
-            }
+            };
             // Close the check→CAS race. Once `releasing=true`, request handlers
             // fail fast and cannot start a new device action.
             if state.viewer_busy()
@@ -3024,7 +3266,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 || state.idle_for() < window
                 || state.wda_control_pending.load(Ordering::Acquire) != 0
             {
-                state.wda_lifecycle.finish_releasing();
+                state.wda_lifecycle.finish_releasing(release_token);
                 continue;
             }
             tracing::info!(
@@ -3062,7 +3304,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     }
                 );
             }
-            state.wda_lifecycle.finish_releasing();
+            state.wda_lifecycle.finish_releasing(release_token);
         }
     });
 }
@@ -3081,6 +3323,289 @@ pub fn human_handoff_active() -> bool {
 /// phone over by other means).
 pub fn set_human_handoff(active: bool) {
     HUMAN_HANDOFF.store(active, std::sync::atomic::Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// Capability discovery (GET /agent/capabilities)
+// ---------------------------------------------------------------------------
+
+/// Single-step `type` values. `direct_agent_action` handles three itself and
+/// delegates the rest to `wda_control_with_client`, so the single-step surface
+/// is the union of both. Hand-kept and checked against those two dispatchers
+/// by `capability_catalogue_matches_the_dispatchers`.
+const CAPABILITY_SINGLE_STEP_ACTIONS: &[&str] = &[
+    "alert",
+    "back",
+    "drag",
+    "home",
+    "key",
+    "keyboard",
+    "launch_app",
+    "longpress",
+    "perform",
+    "picker",
+    "scroll",
+    "set_value",
+    "shortcut",
+    "swipe",
+    "tap",
+    "tap_locator",
+    "text",
+];
+
+/// Batch (`POST /agent/actions`) step types, from
+/// `validate_agent_action_value`. The batch layer is validated separately, so
+/// it is advertised separately rather than assumed equal to single-step.
+const CAPABILITY_BATCH_ACTIONS: &[&str] = &[
+    "alert",
+    "back",
+    "drag",
+    "home",
+    "key",
+    "keyboard",
+    "launch_app",
+    "longpress",
+    "perform",
+    "picker",
+    "scroll",
+    "set_value",
+    "shortcut",
+    "swipe",
+    "tap",
+    "tap_locator",
+    "text",
+];
+
+/// What the legacy Mirror backend can carry: the `ControlMsg` variants
+/// `decode_control` accepts, injected as Mac-side CGEvents. Everything
+/// element-shaped needs WDA and is refused on this backend
+/// (`/agent/elements` → `backend_is_mirror`, `/agent/actions` →
+/// `batch_requires_direct_wda`, element-bound `/agent/input` → invalid
+/// control message).
+const CAPABILITY_MIRROR_ACTIONS: &[&str] = &[
+    "down", "up", "tap", "longpress", "scroll", "shortcut", "text", "key",
+];
+
+/// How the caller's `X-Phone-Owner` relates to the current lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityOwnership {
+    /// No live lease: this caller would be admitted.
+    Free,
+    /// A live lease this caller already holds and would keep.
+    Same,
+    /// A live lease held by SOMEBODY ELSE that this caller's explicit
+    /// takeover would seize. The request would be admitted, but the phone is
+    /// not this caller's yet — reporting it as `self` would hide that
+    /// proceeding evicts the current holder.
+    TakeoverPermitted,
+    /// A live lease that would refuse this caller. An anonymous caller lands
+    /// here too — `arbitrate_owner` refuses `Anonymous` against a live lease,
+    /// so "we don't know who you are" is a refusal, not an unknown.
+    Refused,
+    /// A lease record exists but has expired — it blocks nobody.
+    Expired,
+}
+
+/// Read-only lease classification.
+///
+/// Rather than restate the admission rule (and drift from it), this runs the
+/// REAL [`arbitrate_owner`] against a CLONE of the lease. The clone is
+/// discarded, so nothing is claimed, extended or cleared — a capability probe
+/// must never take the phone from whoever holds it.
+fn capability_ownership(state: &AppState, headers: &HeaderMap) -> CapabilityOwnership {
+    let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+    let now = Instant::now();
+    let mut probe = recover(state.owner.lock()).clone();
+    let Some(current) = probe.clone() else {
+        return CapabilityOwnership::Free;
+    };
+    if now.saturating_duration_since(current.last_seen) >= lease {
+        return CapabilityOwnership::Expired;
+    }
+    let claim = match owner_claim_from_headers(headers) {
+        Ok(claim) => claim,
+        // A malformed header cannot be admitted either.
+        Err(_) => return CapabilityOwnership::Refused,
+    };
+    // A takeover against a DIFFERENT live holder is admitted by
+    // `arbitrate_owner`, but "admitted" is not "already mine": it succeeds by
+    // evicting the current owner. Separate the two before consulting the rule,
+    // or the caller is told `self` about somebody else's phone.
+    let seizes_another = matches!(claim, OwnerClaim::Takeover(name) if name != current.name);
+    match arbitrate_owner(&mut probe, claim, now, lease) {
+        Ok(()) if seizes_another => CapabilityOwnership::TakeoverPermitted,
+        Ok(()) => CapabilityOwnership::Same,
+        Err(_) => CapabilityOwnership::Refused,
+    }
+}
+
+/// Read-only, cache-only availability. Contacting WDA here would make a
+/// discovery call wake the phone, and taking the owner lease would make it
+/// steal the device — a capability probe must do neither.
+fn capability_availability(state: &AppState, headers: &HeaderMap) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+
+    let direct = state.backend == crate::config::DeviceBackend::Direct;
+    let released = state.released.load(Ordering::Acquire);
+    let releasing = state.wda_lifecycle.is_releasing();
+    let reconnecting = state.wda_lifecycle.is_reconnecting();
+    // Cached observations only. `wda_health` is whatever the last completed
+    // probe left behind; this function never starts one.
+    let health = *recover(state.wda_health.lock());
+    let actionable = state.wda_actionable.load(Ordering::Acquire);
+    let ownership = capability_ownership(state, headers);
+    let handoff = released && human_handoff_active();
+
+    // Ordered by what the caller must do about it. `ok: null` means the daemon
+    // has no evidence either way — never `false`, which would claim knowledge
+    // it does not have.
+    let (ok, blocked_by): (Option<bool>, Option<&str>) = if !direct {
+        (None, Some("backend_is_mirror"))
+    } else if handoff {
+        (Some(false), Some("human_handoff"))
+    } else if releasing {
+        (Some(false), Some("releasing"))
+    } else if reconnecting {
+        (Some(false), Some("reconnecting"))
+    } else if released {
+        (Some(false), Some("released"))
+    } else if health.locked == Some(true) {
+        (Some(false), Some("locked"))
+    } else if ownership == CapabilityOwnership::Refused {
+        (Some(false), Some("owned_by_other"))
+    } else if actionable {
+        (Some(true), None)
+    } else if health.up {
+        (Some(false), Some("not_actionable"))
+    } else {
+        (Some(false), Some("offline"))
+    };
+
+    serde_json::json!({
+        "ok": ok,
+        "blocked_by": blocked_by,
+        "evidence": "cache",
+        "detail": {
+            "released": released,
+            "releasing": releasing,
+            "reconnecting": reconnecting,
+            "human_handoff": handoff,
+            "wda_up": health.up,
+            "wda_actionable": actionable,
+            "wda_locked": health.locked,
+            "ownership": match ownership {
+                CapabilityOwnership::Free => "free",
+                CapabilityOwnership::Same => "self",
+                CapabilityOwnership::TakeoverPermitted => "takeover_permitted",
+                CapabilityOwnership::Refused => "refused",
+                CapabilityOwnership::Expired => "expired",
+            },
+            // An anonymous caller is refused by a live lease; naming itself is
+            // what would change the answer.
+            "needs_owner_identity": ownership == CapabilityOwnership::Refused
+                && owner_claim_from_headers(headers).is_ok_and(|claim| {
+                    matches!(claim, OwnerClaim::Anonymous)
+                }),
+        },
+    })
+}
+
+/// `GET /agent/capabilities` — what this build can do, and whether it can do
+/// it right now.
+///
+/// Two questions that used to be conflated. `supported` is static: it depends
+/// on the configured backend and the code in this binary, so a caller can plan
+/// against it. `available` is a cached snapshot of whether the phone can be
+/// driven this instant, and reading it costs no WDA connection and takes no
+/// owner lease — discovery must never wake or steal the device.
+///
+/// `recovery_owner: external` narrows only the *lifecycle* routes the daemon
+/// will drive; it does not narrow the control and observation this daemon can
+/// still perform against that endpoint.
+async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+
+    let direct = state.backend == crate::config::DeviceBackend::Direct;
+    let managed = direct && state.managed_wda;
+
+    // `mode` values this daemon would actually accept. Advertising one it
+    // answers 409 to is a false promise: Mirror refuses `agent`, Direct
+    // refuses `mirror`, and an externally managed endpoint refuses both
+    // lifecycle transitions because it does not own the supervisor.
+    let modes: Vec<&str> = if !direct {
+        vec!["mirror"]
+    } else if managed {
+        vec!["agent", "human"]
+    } else {
+        Vec::new()
+    };
+
+    // Element-shaped work is WDA-only. On Mirror the daemon carries just the
+    // CGEvent vocabulary, refuses the batch route outright
+    // (`batch_requires_direct_wda`) and refuses the element tree
+    // (`backend_is_mirror`), so it must not advertise either.
+    let (single_step, batch, perform): (&[&str], &[&str], &[&str]) = if direct {
+        (
+            CAPABILITY_SINGLE_STEP_ACTIONS,
+            CAPABILITY_BATCH_ACTIONS,
+            &PERFORM_ACTION_NAMES,
+        )
+    } else {
+        (CAPABILITY_MIRROR_ACTIONS, &[], &[])
+    };
+
+    let body = serde_json::json!({
+        "ok": true,
+        "backend": state.backend.as_str(),
+        "recovery_owner": if !direct {
+            "mirror"
+        } else if state.managed_wda {
+            "daemon"
+        } else if state.managed_wda_pending {
+            "unconfigured"
+        } else {
+            "external"
+        },
+        // Scope: this catalogue describes UI CONTROL and observation only. It
+        // deliberately says nothing about management surfaces such as app
+        // install/uninstall over CoreDevice — absence here is not a statement
+        // that those do not exist.
+        "scope": "ui_control",
+        "supported": {
+            "single_step_actions": single_step,
+            "batch_actions": batch,
+            // The closed set `direct_agent_action` checks before touching the
+            // device: an unlisted name is refused without reaching the phone.
+            "perform_actions": perform,
+            "element_tree": direct,
+            "observation": {
+                "return_delta": direct,
+                "settle_ms_max": if direct { AGENT_INPUT_SETTLE_MAX_MS } else { 0 },
+            },
+            "modes": modes,
+            "lifecycle_managed_here": managed,
+        },
+        "available": capability_availability(&state, &headers),
+    });
+
+    with_security_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 /// `POST /agent/mode` — recover the currently configured backend, or hand the
@@ -3284,7 +3809,7 @@ async fn agent_mode(
             //      the runner dies so launchd sees the exit and rebuilds.
             // ThrottleInterval caps the rebuild rate so a persistent killer
             // (WARP Always-On) thrashes harmlessly instead of hot-looping.
-            if !state.wda_lifecycle.try_begin_reconnecting() {
+            let Some(reconnect_token) = state.wda_lifecycle.try_begin_reconnecting() else {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -3295,7 +3820,7 @@ async fn agent_mode(
                         ))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
-            }
+            };
             let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
             let udid_env = udid.unwrap_or_default();
             // Taking the phone back is decided by this request, not by whether
@@ -3323,9 +3848,9 @@ async fn agent_mode(
                 state
                     .wda_actionable
                     .store(false, std::sync::atomic::Ordering::Release);
-                spawn_wda_readiness_wait(state.clone());
+                spawn_wda_readiness_wait(state.clone(), reconnect_token);
             } else {
-                state.wda_lifecycle.finish_reconnecting();
+                state.wda_lifecycle.finish_reconnecting(reconnect_token);
             }
             let body = format!(
                 r#"{{"ok":{spawned},"mode":"agent","starting":{spawned},"reconnecting":{spawned},"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — startup remains reconnecting until WDA can perform actions"}}"#
@@ -3361,7 +3886,7 @@ async fn agent_mode(
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
             }
-            if !state.wda_lifecycle.try_begin_releasing() {
+            let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -3372,7 +3897,7 @@ async fn agent_mode(
                         ))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
-            }
+            };
             let script = setup_sh.clone();
             let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
                 .await
@@ -3389,7 +3914,7 @@ async fn agent_mode(
                 HUMAN_HANDOFF.store(true, std::sync::atomic::Ordering::Release);
                 tracing::info!("phone handed to a human: managed WDA stopped on request");
             }
-            state.wda_lifecycle.finish_releasing();
+            state.wda_lifecycle.finish_releasing(release_token);
             #[cfg(target_os = "macos")]
             let mirroring_opened = stopped
                 && std::process::Command::new("open")
@@ -5203,7 +5728,15 @@ const DIRECT_CONTROL_MAX_TTL_MS: u64 = 2500;
 const AGENT_INPUT_WDA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const AGENT_ACTIONS_MAX_BODY_BYTES: usize = 64 * 1024;
 const AGENT_ACTIONS_MAX_STEPS: usize = 24;
-const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 10_000;
+/// Longest a single `wait_for` may be given.
+///
+/// Raised from 10s for the same reason as the observation budget: one element
+/// read can cost six or seven seconds on real hardware, so a 10s ceiling left
+/// room for a single poll and made a genuine wait impossible to express. The
+/// cumulative cap ([`AGENT_ACTIONS_MAX_DECLARED_WAIT_MS`]) and the batch
+/// deadline ([`AGENT_ACTIONS_DEADLINE`]) are deliberately unchanged, so a
+/// longer single wait cannot lengthen a batch.
+const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 30_000;
 const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
 const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
@@ -5361,6 +5894,44 @@ fn element_resolution_response(body: &'static str) -> Response {
             .body(Body::from(body))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
+}
+
+/// Reject a single-step body whose `type` is missing, empty, or not a
+/// single-step action name, before any WDA work happens.
+///
+/// The catalogue is `CAPABILITY_SINGLE_STEP_ACTIONS`, the same list
+/// `/agent/capabilities` advertises and
+/// `capability_catalogue_matches_the_dispatchers` pins to the dispatchers — so
+/// this gate cannot drift into rejecting an action the device can actually
+/// perform. Per-field validation stays exactly where it was: this only decides
+/// whether the action has a name the server knows.
+fn reject_unknown_single_step_action(value: &serde_json::Value) -> Result<(), Response> {
+    let named = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|typ| !typ.is_empty());
+    let error = match named {
+        None => serde_json::json!({
+            "ok": false,
+            "error": "invalid_action",
+            "detail": "action needs a non-empty string field \"type\"",
+            "outcome": "not_sent",
+            "retry_safe": true,
+            "supported": CAPABILITY_SINGLE_STEP_ACTIONS,
+        }),
+        Some(typ) if !CAPABILITY_SINGLE_STEP_ACTIONS.contains(&typ) => serde_json::json!({
+            "ok": false,
+            "error": "invalid_action",
+            "detail": format!("unknown action type \"{typ}\""),
+            "outcome": "not_sent",
+            "retry_safe": true,
+            "supported": CAPABILITY_SINGLE_STEP_ACTIONS,
+        }),
+        Some(_) => return Ok(()),
+    };
+    Err(with_security_headers(
+        (StatusCode::BAD_REQUEST, axum::Json(error)).into_response(),
+    ))
 }
 
 /// Execute one Direct agent action exactly once.
@@ -5785,7 +6356,7 @@ struct AgentElementLocator {
 }
 
 fn default_agent_actions_wait_ms() -> u64 {
-    5_000
+    15_000
 }
 
 fn default_agent_actions_poll_ms() -> u64 {
@@ -5809,7 +6380,11 @@ fn agent_actions_invalid(detail: impl Into<String>) -> Response {
             "ok": false,
             "error": "invalid_actions_request",
             "detail": detail.into(),
+            // Refused locally, before the first step: no step ran, so the
+            // batch verdict is not merely inferable, it is certain.
             "outcome": "not_sent",
+            "failed_step_outcome": "not_sent",
+            "batch_outcome": "nothing_applied",
             "retry_safe": true
         }),
     )
@@ -6321,6 +6896,15 @@ fn app_changed_json(
     (from != to).then(|| serde_json::json!({ "from": from, "to": to }))
 }
 
+/// Evaluate one `wait_for` expectation against one tree read.
+///
+/// The subtle failure this guards: an `absent` locator is "satisfied" by a tree
+/// that simply has nothing in it. WDA hands back an empty or container-only
+/// tree mid-transition and whenever the read path is degraded, so accepting
+/// that as proof of absence turns "I cannot see the screen" into "the thing is
+/// gone" — the single most misleading answer this endpoint could give. A sparse
+/// tree therefore never satisfies an `absent` expectation; the wait keeps
+/// polling and, if it runs out, says exactly why.
 fn agent_expectation_observation(
     rows: &[crate::wda::ElementRow],
     expect: &AgentUiExpectation,
@@ -6348,16 +6932,75 @@ fn agent_expectation_observation(
                 .then_some(index)
         })
         .collect();
-    let matches = application_matches && missing_present.is_empty() && violated_absent.is_empty();
+    // Empty or container-only: readable as a response, but not usable as
+    // evidence that something is NOT there.
+    let sparse = settle_tree_is_sparse(rows);
+    let absent_unproven: Vec<usize> = if sparse {
+        (0..expect.absent.len()).collect()
+    } else {
+        Vec::new()
+    };
+    let matches = application_matches
+        && missing_present.is_empty()
+        && violated_absent.is_empty()
+        && absent_unproven.is_empty();
     (
         matches,
         serde_json::json!({
             "application": application,
             "application_matches": application_matches,
             "missing_present": missing_present,
-            "violated_absent": violated_absent
+            "violated_absent": violated_absent,
+            // Additive evidence about the READ itself, so a caller can tell a
+            // condition that was genuinely not met from a screen nobody could
+            // see. `read: true` here means this observation came from an actual
+            // tree read (see the failure body for the never-read case).
+            "read": true,
+            "rows": rows.len(),
+            "sparse": sparse,
+            "absent_unproven": absent_unproven
         }),
     )
+}
+
+/// The observation a failing `wait_for` reports, in the caller's terms rather
+/// than the loop's. Exactly three things can have happened, and they must not
+/// be confused with each other:
+///
+/// * `read:false` — no readable tree was EVER obtained. Nothing here proves an
+///   element is absent.
+/// * `read:true, stale:true` — the screen was read at least once, but the last
+///   read failed, so this is the last valid observation, not the current one.
+///   A late failure must never erase the reads that did succeed.
+/// * `read:true` — the screen was read and the condition simply was not met.
+fn agent_wait_observation(
+    last_observation: serde_json::Value,
+    attempts: u64,
+    reads: u64,
+    // Whether the MOST RECENT read failed. Passed explicitly by each exit
+    // branch: a timeout is a failed read just as much as a broken connection
+    // is, and staleness must not be inferred from whether some error string
+    // happens to be around.
+    last_read_failed: bool,
+    read_error: Option<&str>,
+) -> serde_json::Value {
+    let mut value = if last_observation.is_null() {
+        serde_json::json!({
+            "read": false,
+            "hint": "no readable element tree was obtained; nothing here proves an element is absent"
+        })
+    } else {
+        last_observation
+    };
+    value["attempts"] = attempts.into();
+    value["reads"] = reads.into();
+    if last_read_failed && value["read"] == serde_json::Value::Bool(true) {
+        value["stale"] = serde_json::Value::Bool(true);
+    }
+    if let Some(error) = read_error {
+        value["read_error"] = serde_json::Value::String(error.to_string());
+    }
+    value
 }
 
 #[derive(Debug)]
@@ -6388,6 +7031,31 @@ async fn agent_wait_elements(
     }
 }
 
+/// What the WHOLE batch did, given what its failed step did.
+///
+/// `outcome` has always described the failed STEP, which reads as a verdict on
+/// the batch when it sits at the top level: hardware acceptance found
+/// `applied_actions: 2` next to `outcome: "not_sent"`, which is true of the
+/// step and false of the batch.
+///
+/// Three values, deliberately: an unrecognised step outcome, and any step
+/// whose own result is `unknown`, both collapse to `unknown` — not to
+/// `partially_applied`, which would assert that the earlier actions are known
+/// to have landed while the last one is not. `nothing_applied` is claimed only
+/// when the count says so. This decides nothing on its own; `retry_safe`
+/// remains the only authorisation to send a batch again.
+fn batch_outcome_for(failed_step_outcome: &str, applied_actions: usize) -> &'static str {
+    match failed_step_outcome {
+        // `applied` alongside a count of zero contradicts itself: a step that
+        // applied is counted. Rather than pick which half to believe, say we
+        // do not know.
+        "applied" if applied_actions == 0 => "unknown",
+        "not_sent" | "applied" | "no_effect" if applied_actions == 0 => "nothing_applied",
+        "not_sent" | "applied" | "no_effect" => "partially_applied",
+        _ => "unknown",
+    }
+}
+
 // Keeping all failure evidence in one builder prevents individual early-return
 // branches from silently omitting the at-most-once fields callers rely on.
 #[allow(clippy::too_many_arguments)]
@@ -6408,7 +7076,12 @@ fn agent_actions_failure(
         "failed_step": failed_step,
         "completed": completed,
         "applied_actions": applied_actions,
+        // Frozen for compatibility: existing callers read this and it keeps
+        // describing the FAILED STEP. `failed_step_outcome` is the same value
+        // under a name that says so; `batch_outcome` is the batch verdict.
         "outcome": outcome,
+        "failed_step_outcome": outcome,
+        "batch_outcome": batch_outcome_for(outcome, applied_actions),
         "retry_safe": retry_safe,
         "steps": steps
     });
@@ -6468,7 +7141,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "batch_requires_direct_wda",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true
             }),
         );
@@ -6484,7 +7160,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "device_not_drivable",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true,
                 "hint": "check /agent/status, reconnect the canonical Direct target if instructed, then retry only after drivable=true"
             }),
@@ -6496,7 +7175,10 @@ async fn agent_actions(
             serde_json::json!({
                 "ok": false,
                 "error": "wda_not_configured",
+                // Refused before the first step: zero actions, certainly.
                 "outcome": "not_sent",
+                "failed_step_outcome": "not_sent",
+                "batch_outcome": "nothing_applied",
                 "retry_safe": true
             }),
         );
@@ -6738,6 +7420,10 @@ async fn agent_actions(
                 let mut attempts = 0_u64;
                 let mut last_observation = serde_json::Value::Null;
                 let mut last_read_error = None;
+                // Successful reads, so "never saw the screen" stays separable
+                // from "saw it, then lost the read" — a late failure must not
+                // erase history.
+                let mut reads = 0_u64;
                 loop {
                     attempts += 1;
                     let rows = match agent_wait_elements(&mut w, wait_deadline).await {
@@ -6755,6 +7441,7 @@ async fn agent_actions(
                                     "wda batch wait_for source never recovered: {error:#}"
                                 );
                                 mark_wda_read_path_unactionable(&state);
+                                let error = format!("{error:#}");
                                 return agent_actions_failure(
                                     StatusCode::BAD_GATEWAY,
                                     index,
@@ -6764,7 +7451,13 @@ async fn agent_actions(
                                     "not_sent",
                                     applied_actions == 0,
                                     &step_results,
-                                    None,
+                                    Some(agent_wait_observation(
+                                        last_observation,
+                                        attempts,
+                                        reads,
+                                        true,
+                                        Some(&error),
+                                    )),
                                 );
                             }
                             let remaining = wait_deadline
@@ -6777,12 +7470,21 @@ async fn agent_actions(
                             continue;
                         }
                         Err(AgentWaitReadError::TimedOut) => {
-                            if let Some(error) = last_read_error {
+                            if let Some(error) = last_read_error.as_deref() {
                                 tracing::warn!(
                                     "wda batch wait_for source timed out after retries: {error}"
                                 );
                             }
                             w.invalidate_session();
+                            // The read that ended the window is this timeout,
+                            // whether or not an earlier attempt also failed.
+                            let timeout_error = match last_read_error.as_deref() {
+                                Some(error) => format!(
+                                    "element read timed out inside the wait window; \
+                                     last read error: {error}"
+                                ),
+                                None => "element read timed out inside the wait window".to_string(),
+                            };
                             return agent_actions_failure(
                                 StatusCode::CONFLICT,
                                 index,
@@ -6792,10 +7494,17 @@ async fn agent_actions(
                                 "not_sent",
                                 applied_actions == 0,
                                 &step_results,
-                                Some(last_observation),
+                                Some(agent_wait_observation(
+                                    last_observation,
+                                    attempts,
+                                    reads,
+                                    true,
+                                    Some(&timeout_error),
+                                )),
                             );
                         }
                     };
+                    reads += 1;
                     let (matches, observation) = agent_expectation_observation(&rows, expect);
                     last_observation = observation;
                     if matches {
@@ -6818,7 +7527,16 @@ async fn agent_actions(
                             "not_sent",
                             applied_actions == 0,
                             &step_results,
-                            Some(last_observation),
+                            // This branch is only reachable straight after a
+                            // SUCCESSFUL read, so the observation is current;
+                            // any earlier error is history, not staleness.
+                            Some(agent_wait_observation(
+                                last_observation,
+                                attempts,
+                                reads,
+                                false,
+                                last_read_error.as_deref(),
+                            )),
                         );
                     }
                     let remaining =
@@ -6869,56 +7587,245 @@ struct AgentInputQuery {
     settle_ms: Option<u64>,
 }
 
-const AGENT_INPUT_SETTLE_DEFAULT_MS: u64 = 1_200;
-const AGENT_INPUT_SETTLE_MAX_MS: u64 = 5_000;
+/// Default observation budget, and its ceiling.
+///
+/// Both were previously sized on a fast development machine (1.2s / 5s). On a
+/// phone where one `/source` takes six or seven seconds that was not "we
+/// sometimes miss the screen" — it made the post-action observation
+/// structurally impossible: every caller got `captures: 0` and an empty
+/// `budget_exhausted`, forever, with no way to tell why.
+///
+/// A read's cost varies with the device and the screen; on the hardware that
+/// exposed this it was measured in the 6–7s range for a large tree. 15s leaves
+/// room for two such reads, so the DEFAULT call can still reach `stable`
+/// there, and any phone returns as soon as two reads match rather than waiting
+/// out the budget.
+const AGENT_INPUT_SETTLE_DEFAULT_MS: u64 = 15_000;
+const AGENT_INPUT_SETTLE_MAX_MS: u64 = 20_000;
 
-/// One post-action tree read with a single stale-session retry (mirroring
-/// `/agent/elements`' read loop, but bounded — this runs inside an action's
-/// deadline).
-async fn read_elements_once(
-    w: &mut crate::wda::WdaClient,
-) -> anyhow::Result<(String, Vec<crate::wda::ElementRow>)> {
-    let rows = match w.elements().await {
-        Ok(rows) => rows,
-        Err(error) => {
-            w.invalidate_session();
-            w.elements()
-                .await
-                .map_err(|retry| retry.context(format!("first error: {error:#}")))?
-        }
-    };
-    let id = element_snapshot_id(&rows)?;
-    Ok((id, rows))
+/// A settled tree read is best-effort *observation*, never part of the action
+/// result. `Stable` means two consecutive reads hashed identically over a tree
+/// that actually had content; `BudgetExhausted` means the UI was still moving
+/// (or the caller allowed no time); `ObservationFailed` means the read itself
+/// timed out or errored — the action still applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleReason {
+    Stable,
+    BudgetExhausted,
+    ObservationFailed,
 }
 
-/// Wait (bounded) for the post-action UI to quiesce, then return the settled
-/// tree: poll until two consecutive reads hash identically or the budget runs
-/// out, and return the latest read either way.
+impl SettleReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            SettleReason::Stable => "stable",
+            SettleReason::BudgetExhausted => "budget_exhausted",
+            SettleReason::ObservationFailed => "observation_failed",
+        }
+    }
+}
+
+/// What the post-action observation actually did, reported alongside the
+/// (already authoritative) action result.
+#[derive(Debug, Clone)]
+struct SettleReport {
+    settled: bool,
+    reason: SettleReason,
+    /// Wall time spent on the TREE observation only.
+    waited_ms: u64,
+    /// Successful tree reads.
+    captures: u32,
+    /// The tree observation's budget. The `alert` probe is deliberately NOT
+    /// inside it: it is a separate, hard 1.5s probe that only runs when the
+    /// endpoint deadline still has margin left. `waited_ms`/`budget_ms`
+    /// describe the tree, never the alert.
+    budget_ms: u64,
+    /// The observed tree carried nothing to act on — no rows at all, or only
+    /// container/decoration kinds (`ax_stats.container_only`). WDA returns a
+    /// bare tree mid transition, and two identical bare reads are NOT evidence
+    /// the screen settled — they are evidence we cannot see it. A genuinely
+    /// simple screen (an Application plus one real Button) is NOT sparse and
+    /// may settle normally.
+    sparse: bool,
+    /// The tree carried in this response is the LAST SUCCESSFUL observation,
+    /// not a fresh one — the read that would have refreshed it failed
+    /// (`observation_failed`) or was cut off by the budget
+    /// (`budget_exhausted`). Never present alongside `settled: true`.
+    stale: bool,
+    error: Option<String>,
+}
+
+impl SettleReport {
+    fn new(budget_ms: u64) -> Self {
+        Self {
+            settled: false,
+            reason: SettleReason::BudgetExhausted,
+            waited_ms: 0,
+            captures: 0,
+            budget_ms,
+            sparse: false,
+            stale: false,
+            error: None,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "settled": self.settled,
+            "reason": self.reason.as_str(),
+            "waited_ms": self.waited_ms,
+            "captures": self.captures,
+            "budget_ms": self.budget_ms,
+        });
+        if self.sparse {
+            value["sparse"] = serde_json::Value::Bool(true);
+        }
+        if self.stale {
+            value["stale"] = serde_json::Value::Bool(true);
+        }
+        if let Some(error) = &self.error {
+            value["error"] = serde_json::Value::String(error.clone());
+        }
+        value
+    }
+}
+
+/// A tree we cannot trust as evidence that the screen settled: nothing at all,
+/// or only container/decoration rows. Reuses the same `container_only` fact
+/// `/agent/elements` already publishes via `ax_stats`, rather than inventing a
+/// second row-count threshold that would disagree with it.
+fn settle_tree_is_sparse(rows: &[crate::wda::ElementRow]) -> bool {
+    let stats = ax_stats(rows, None);
+    stats.n == 0 || stats.container_only
+}
+
+/// One post-action tree read with a single stale-session retry (mirroring
+/// `/agent/elements`' read loop). BOTH the first read and the retry are bounded
+/// by the observation deadline: the WDA HTTP client's own 20s timeout, taken
+/// twice, would otherwise outlive the action deadline and turn an applied
+/// action into an unknown outcome.
+enum SettleRead {
+    /// A tree was read.
+    Read(String, Vec<crate::wda::ElementRow>),
+    /// The observation budget ran out mid-read. Running out of time is NOT the
+    /// read path failing, and must not be reported as one.
+    Deadline,
+    /// The read path itself broke.
+    Failed(anyhow::Error),
+}
+
+async fn read_elements_once(
+    w: &mut crate::wda::WdaClient,
+    deadline: tokio::time::Instant,
+) -> SettleRead {
+    let rows = match tokio::time::timeout_at(deadline, w.elements()).await {
+        Err(_) => return SettleRead::Deadline,
+        Ok(Ok(rows)) => rows,
+        Ok(Err(error)) => {
+            w.invalidate_session();
+            match tokio::time::timeout_at(deadline, w.elements()).await {
+                Err(_) => return SettleRead::Deadline,
+                Ok(Ok(rows)) => rows,
+                Ok(Err(retry)) => {
+                    return SettleRead::Failed(retry.context(format!("first error: {error:#}")));
+                }
+            }
+        }
+    };
+    match element_snapshot_id(&rows) {
+        Ok(id) => SettleRead::Read(id, rows),
+        Err(error) => SettleRead::Failed(error),
+    }
+}
+
+/// Wait (bounded) for the post-action UI to quiesce: poll until two consecutive
+/// reads hash identically over a non-sparse tree, or the budget runs out.
+///
+/// Returns the latest readable tree (if any) plus a report of what happened.
+/// This NEVER returns an error to the caller — the action already applied, and
+/// a failed observation is reported, not raised.
 async fn settle_and_read_elements(
     w: &mut crate::wda::WdaClient,
     budget: std::time::Duration,
-) -> anyhow::Result<(String, Vec<crate::wda::ElementRow>)> {
-    let deadline = tokio::time::Instant::now() + budget;
+) -> (Option<(String, Vec<crate::wda::ElementRow>)>, SettleReport) {
+    let started = tokio::time::Instant::now();
+    let mut report = SettleReport::new(budget.as_millis() as u64);
+    // A zero budget is the caller declining observation, not a failure.
+    if budget.is_zero() {
+        return (None, report);
+    }
+    let deadline = started + budget;
     tokio::time::sleep(std::cmp::min(std::time::Duration::from_millis(150), budget)).await;
-    let (mut id, mut rows) = read_elements_once(w).await?;
+    // An already-expired deadline must read "no budget", never "the read
+    // failed": polling an expired `timeout_at` would report a self-inflicted
+    // observation failure and, on a tiny budget, still cost one `/source`.
+    if tokio::time::Instant::now() >= deadline {
+        report.waited_ms = started.elapsed().as_millis() as u64;
+        return (None, report);
+    }
+    let (mut id, mut rows) = match read_elements_once(w, deadline).await {
+        SettleRead::Read(id, rows) => (id, rows),
+        // No tree, but for opposite reasons: out of time vs. a broken read.
+        SettleRead::Deadline => {
+            report.waited_ms = started.elapsed().as_millis() as u64;
+            return (None, report);
+        }
+        SettleRead::Failed(error) => {
+            report.reason = SettleReason::ObservationFailed;
+            report.error = Some(format!("{error:#}"));
+            report.waited_ms = started.elapsed().as_millis() as u64;
+            return (None, report);
+        }
+    };
+    report.captures = 1;
+    report.sparse = settle_tree_is_sparse(&rows);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok((id, rows));
+            break;
         }
         tokio::time::sleep(std::cmp::min(
             std::time::Duration::from_millis(250),
             remaining,
         ))
         .await;
-        let (next_id, next_rows) = read_elements_once(w).await?;
+        if tokio::time::Instant::now() >= deadline {
+            // Out of budget, not a failed observation.
+            break;
+        }
+        let (next_id, next_rows) = match read_elements_once(w, deadline).await {
+            SettleRead::Read(id, rows) => (id, rows),
+            // Out of budget with a usable earlier tree: unsettled, not
+            // failed — but this sample never completed, so what we hand back
+            // is the PREVIOUS observation, and it says so.
+            SettleRead::Deadline => {
+                report.stale = true;
+                break;
+            }
+            SettleRead::Failed(error) => {
+                // We still hold an earlier readable tree; hand it back and say
+                // plainly that the observation stopped short.
+                report.reason = SettleReason::ObservationFailed;
+                report.error = Some(format!("{error:#}"));
+                report.stale = true;
+                report.waited_ms = started.elapsed().as_millis() as u64;
+                return (Some((id, rows)), report);
+            }
+        };
+        report.captures += 1;
         let stable = next_id == id;
         id = next_id;
         rows = next_rows;
-        if stable {
-            return Ok((id, rows));
+        report.sparse = settle_tree_is_sparse(&rows);
+        // Two identical bare trees mean the screen is unreadable, not settled.
+        if stable && !report.sparse {
+            report.settled = true;
+            report.reason = SettleReason::Stable;
+            break;
         }
     }
+    report.waited_ms = started.elapsed().as_millis() as u64;
+    (Some((id, rows)), report)
 }
 
 /// `POST /agent/input` — inject one control message (same JSON shape as the
@@ -6930,8 +7837,16 @@ async fn settle_and_read_elements(
 /// `?return=delta` (optional, Direct only): after an applied action the
 /// response also carries the settled post-action element tree — as a `delta`
 /// against `?since=` / the action's own `snapshot` when that baseline is still
-/// cached, else as full `elements` — plus the fresh `snapshot` token. A failed
-/// observation never fails the applied action; it is reported as `delta_error`.
+/// cached, else as full `elements` — plus the fresh `snapshot` token and a
+/// `settle` block saying how good that observation actually was
+/// ([`SettleReport`]).
+///
+/// The action result and the observation are DELIBERATELY separate: the
+/// mutation runs under the endpoint's action deadline, the observation under
+/// its own shorter one. A slow or failed read can therefore never turn an
+/// applied action into an `outcome_unknown` 504, and never causes the mutation
+/// to be re-sent. Such a read is reported as `settle.reason:"observation_failed"`
+/// (and, for existing callers, still as `delta_error`) beside `ok:true`.
 ///
 /// Coordinates are normalized `[0,1]` over the phone content rect (geometry-agnostic,
 /// like the web client). Acquiring an `Agent` control lease makes the injector gate
@@ -7116,7 +8031,7 @@ async fn agent_input(
             );
         }
         let won = state.wda_lifecycle.try_begin_reconnecting();
-        if won {
+        if let Some(reconnect_token) = won {
             // Someone just asked for the phone, so it is not idle — restart the
             // clock before the supervisor starts building. Otherwise the idle
             // watchdog can reach its window mid-bring-up and stop the very
@@ -7137,9 +8052,11 @@ async fn agent_input(
                     recovery_state
                         .wda_actionable
                         .store(false, std::sync::atomic::Ordering::Release);
-                    spawn_wda_readiness_wait(recovery_state);
+                    spawn_wda_readiness_wait(recovery_state, reconnect_token);
                 } else {
-                    recovery_state.wda_lifecycle.finish_reconnecting();
+                    recovery_state
+                        .wda_lifecycle
+                        .finish_reconnecting(reconnect_token);
                 }
             });
         }
@@ -7208,6 +8125,15 @@ async fn agent_input(
                 );
             }
         };
+        // A malformed request is the caller's problem, not the device's. Name
+        // the action BEFORE the WDA guard is taken: an unknown or missing
+        // `type` used to fall through to the dispatcher, whose catch-all
+        // `Unsupported` is rendered as `wda_unavailable_or_unsupported` — a
+        // 503 blaming a perfectly healthy phone for a typo. Answer 400 here
+        // and never touch WDA.
+        if let Err(response) = reject_unknown_single_step_action(&value) {
+            return response;
+        }
         let Some(wda) = &state.wda else {
             return with_security_headers(
                 Response::builder()
@@ -7226,7 +8152,19 @@ async fn agent_input(
         let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dispatch_marker = dispatched.clone();
         let want_delta = query.return_mode.as_deref() == Some("delta");
-        let outcome = tokio::time::timeout_at(agent_wda_deadline, async {
+        let settle_budget_ms = query
+            .settle_ms
+            .unwrap_or(AGENT_INPUT_SETTLE_DEFAULT_MS)
+            .min(AGENT_INPUT_SETTLE_MAX_MS);
+        // The action deadline and the observation deadline are DELIBERATELY
+        // separate scopes over one WDA guard. Only acquiring the guard and
+        // dispatching the mutation run under `agent_wda_deadline` — once
+        // `direct_agent_action` returns, its outcome is a plain local and no
+        // later timeout can rewrite it. The best-effort observation that
+        // follows gets its own, strictly shorter deadline, so a slow `/source`
+        // or `/alert/text` can never turn an applied action into
+        // `outcome_unknown` and can never cause the mutation to be re-sent.
+        let dispatch = tokio::time::timeout_at(agent_wda_deadline, async {
             let mut client = wda.lock().await;
             if tokio::time::Instant::now() >= agent_wda_deadline
                 || state.wda_lifecycle.is_transitioning()
@@ -7238,40 +8176,11 @@ async fn agent_input(
             let mut detail = None;
             let outcome =
                 direct_agent_action(&mut client, &state.wda_actionable, &value, &mut detail).await;
-            // Post-action observation (`?return=delta`), in the SAME lock scope
-            // so no other control interleaves between the action and its read.
-            // The budget stays under the endpoint deadline with a safety margin
-            // so a slow observation can never turn an applied action into an
-            // "outcome unknown" timeout.
-            let mut settled = None;
-            if want_delta && outcome == WdaControlOutcome::Applied {
-                let requested = query
-                    .settle_ms
-                    .unwrap_or(AGENT_INPUT_SETTLE_DEFAULT_MS)
-                    .min(AGENT_INPUT_SETTLE_MAX_MS);
-                let remaining = agent_wda_deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .saturating_sub(std::time::Duration::from_secs(3));
-                let budget = std::cmp::min(std::time::Duration::from_millis(requested), remaining);
-                settled = Some(
-                    settle_and_read_elements(&mut client, budget)
-                        .await
-                        .map(|(snapshot, rows)| (snapshot, Arc::new(rows)))
-                        .map_err(|error| format!("{error:#}")),
-                );
-            }
-            // A system alert is the one thing the settled tree may not show;
-            // report it alongside so the agent never has to screenshot for it.
-            let alert = if want_delta && outcome == WdaControlOutcome::Applied {
-                probe_alert(&mut client).await
-            } else {
-                None
-            };
-            Some((outcome, settled, alert, detail))
+            Some((client, outcome, detail))
         })
         .await;
-        let (outcome, settled, alert, detail) = match outcome {
-            Ok(Some(pair)) => pair,
+        let (mut client, outcome, detail) = match dispatch {
+            Ok(Some(dispatched)) => dispatched,
             Ok(None) => return wda_deadline_response(false),
             Err(_) => {
                 return wda_deadline_response(
@@ -7279,56 +8188,101 @@ async fn agent_input(
                 );
             }
         };
+        // Post-action observation (`?return=delta`), still holding the SAME
+        // guard so no other control interleaves between the action and its
+        // read — but on its own budget, bounded by both the caller's
+        // `settle_ms` and what is left of the endpoint deadline.
+        let mut settled = None;
+        let mut alert = None;
+        if want_delta && outcome == WdaControlOutcome::Applied {
+            // The observation's clock starts HERE, after the action is
+            // confirmed — it is not carved out of what the action left of its
+            // own deadline. Otherwise a slow action silently eats the
+            // observation: 15s of dispatch would leave nothing to look with,
+            // and the caller would be told `captures: 0` as though the screen
+            // were unreadable rather than never looked at.
+            //
+            // The two deadlines therefore compose rather than compete:
+            // dispatch is bounded by `agent_wda_deadline`, observation by this
+            // budget, and the client's timeout has to cover their sum (see
+            // `OBSERVE_TIMEOUT` in the MCP client).
+            let budget = std::time::Duration::from_millis(settle_budget_ms);
+            let (observed, report) = settle_and_read_elements(&mut client, budget).await;
+            settled = Some((
+                observed.map(|(snapshot, rows)| (snapshot, Arc::new(rows))),
+                report,
+            ));
+            // A system alert is the one thing the settled tree may not show;
+            // report it alongside so the agent never has to screenshot for it.
+            // Bounded by its own hard 1.5s cap (see `probe_alert`), which is
+            // what the client's timeout budgets for on top of the action
+            // deadline and the observation budget.
+            alert = probe_alert(&mut client).await;
+        }
+        drop(client);
         return match outcome {
             WdaControlOutcome::Applied => {
                 let body = match settled {
                     None => r#"{"ok":true,"transport":"wda"}"#.to_string(),
-                    // The action DID apply; a failed observation is reported
-                    // alongside the success, never as a failure.
-                    Some(Err(error)) => serde_json::json!({
-                        "ok": true,
-                        "transport": "wda",
-                        "delta_error": error,
-                    })
-                    .to_string(),
-                    Some(Ok((snapshot, rows))) => {
-                        remember_element_snapshot(&state, &snapshot, &rows);
-                        let baseline = query
-                            .since
-                            .as_deref()
-                            .filter(|since| !since.is_empty())
-                            .or_else(|| value.get("snapshot").and_then(serde_json::Value::as_str))
-                            .and_then(|since| {
-                                lookup_element_snapshot(&state, since)
-                                    .map(|baseline| (since, baseline))
-                            });
-                        match baseline {
-                            Some((baseline_id, baseline_rows)) => {
-                                let delta = diff_element_rows(&baseline_rows, &rows);
-                                let mut body = serde_json::json!({
-                                    "ok": true,
-                                    "transport": "wda",
-                                    "snapshot": snapshot,
-                                    "baseline": baseline_id,
-                                    "delta": elements_delta_json(&delta, &rows),
-                                });
-                                // A banner that drops in front of the tap eats it and opens
-                                // its own app; the delta then describes a screen the caller
-                                // never asked for, and nothing says the tap missed. The
-                                // frontmost app is already in the tree, so say it plainly.
-                                if let Some(changed) = app_changed_json(&baseline_rows, &rows) {
-                                    body["app_changed"] = changed;
-                                }
-                                body.to_string()
-                            }
+                    Some((observed, report)) => {
+                        // The action DID apply. Everything below is observation
+                        // quality reported ALONGSIDE that success — never a
+                        // reason to fail it.
+                        let mut body = match observed {
                             None => serde_json::json!({
                                 "ok": true,
                                 "transport": "wda",
-                                "snapshot": snapshot,
-                                "elements": &*rows,
-                            })
-                            .to_string(),
+                            }),
+                            Some((snapshot, rows)) => {
+                                remember_element_snapshot(&state, &snapshot, &rows);
+                                let baseline = query
+                                    .since
+                                    .as_deref()
+                                    .filter(|since| !since.is_empty())
+                                    .or_else(|| {
+                                        value.get("snapshot").and_then(serde_json::Value::as_str)
+                                    })
+                                    .and_then(|since| {
+                                        lookup_element_snapshot(&state, since)
+                                            .map(|baseline| (since, baseline))
+                                    });
+                                match baseline {
+                                    Some((baseline_id, baseline_rows)) => {
+                                        let delta = diff_element_rows(&baseline_rows, &rows);
+                                        let mut body = serde_json::json!({
+                                            "ok": true,
+                                            "transport": "wda",
+                                            "snapshot": snapshot,
+                                            "baseline": baseline_id,
+                                            "delta": elements_delta_json(&delta, &rows),
+                                        });
+                                        // A banner that drops in front of the tap eats it and opens
+                                        // its own app; the delta then describes a screen the caller
+                                        // never asked for, and nothing says the tap missed. The
+                                        // frontmost app is already in the tree, so say it plainly.
+                                        if let Some(changed) =
+                                            app_changed_json(&baseline_rows, &rows)
+                                        {
+                                            body["app_changed"] = changed;
+                                        }
+                                        body
+                                    }
+                                    None => serde_json::json!({
+                                        "ok": true,
+                                        "transport": "wda",
+                                        "snapshot": snapshot,
+                                        "elements": &*rows,
+                                    }),
+                                }
+                            }
+                        };
+                        // `delta_error` stays exactly where it was for existing
+                        // callers; `settle` is the additive, structured view.
+                        if let Some(error) = &report.error {
+                            body["delta_error"] = serde_json::Value::String(error.clone());
                         }
+                        body["settle"] = report.to_json();
+                        body.to_string()
                     }
                 };
                 let body = attach_alert(body, alert);
@@ -9084,6 +10038,32 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
 
+    // --- Batch outcome: the failed step is not the batch ---
+
+    /// Every value `agent_actions_failure` is actually called with, mapped
+    /// deliberately rather than by accident.
+    #[test]
+    fn batch_outcome_covers_every_failed_step_outcome_in_use() {
+        // The four `outcome` strings the call sites pass today.
+        assert_eq!(batch_outcome_for("not_sent", 0), "nothing_applied");
+        assert_eq!(batch_outcome_for("not_sent", 2), "partially_applied");
+        assert_eq!(batch_outcome_for("no_effect", 0), "nothing_applied");
+        assert_eq!(batch_outcome_for("no_effect", 2), "partially_applied");
+        assert_eq!(batch_outcome_for("applied", 2), "partially_applied");
+        // An unknown step is unknown for the batch at ANY count — never a
+        // partial, which would claim the earlier actions are settled and only
+        // the last one in doubt.
+        assert_eq!(batch_outcome_for("unknown", 0), "unknown");
+        assert_eq!(batch_outcome_for("unknown", 5), "unknown");
+        // Contradictory input: a step that applied is counted, so a zero count
+        // disagrees with itself. Do not pick a half to believe.
+        assert_eq!(batch_outcome_for("applied", 0), "unknown");
+        // A value added later and not yet mapped here must fall to the
+        // conservative side rather than be guessed into a known state.
+        assert_eq!(batch_outcome_for("some_future_outcome", 0), "unknown");
+        assert_eq!(batch_outcome_for("some_future_outcome", 3), "unknown");
+    }
+
     // --- Semantic intents channel ---
 
     #[test]
@@ -9662,25 +10642,25 @@ mod tests {
                     (lifecycle.clone(), hold_until.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    if !lifecycle.try_begin_releasing() {
+                    let Some(token) = lifecycle.try_begin_releasing() else {
                         return None;
-                    }
+                    };
                     // What the watchdog does right after its CAS: re-check the
                     // hold under the same lock the hold is written under. The
                     // transition stays open until the main thread has joined
                     // both sides, so a hold accepted after a *finished* release
                     // (legal) cannot be mistaken for the race.
                     let held = recover(hold_until.lock()).is_some_and(|until| until > Instant::now());
-                    Some(!held)
+                    Some((token, !held))
                 })
             };
             let hold_ok = holder.join().expect("holder");
             let release_proceeds = releaser.join().expect("releaser");
-            if release_proceeds.is_some() {
-                lifecycle.finish_releasing();
+            if let Some((token, _)) = release_proceeds {
+                lifecycle.finish_releasing(token);
             }
             assert!(
-                !(hold_ok && release_proceeds == Some(true)),
+                !(hold_ok && release_proceeds.map(|(_, ok)| ok) == Some(true)),
                 "hold accepted with 200 while the release went ahead"
             );
         }
@@ -9693,20 +10673,20 @@ mod tests {
         let lifecycle = WdaLifecycle::new();
         let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
         assert!(try_take_hold(&lifecycle, &hold_until, 30));
-        assert!(lifecycle.try_begin_releasing());
+        let token = lifecycle.try_begin_releasing().expect("release begins");
         let held = recover(hold_until.lock()).is_some_and(|until| until > Instant::now());
         assert!(held, "the post-CAS re-check must see the lease and back out");
-        lifecycle.finish_releasing();
+        assert!(lifecycle.finish_releasing(token));
     }
 
     #[test]
     fn a_release_that_begins_first_refuses_the_hold_until_it_is_done() {
         let lifecycle = WdaLifecycle::new();
         let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
-        assert!(lifecycle.try_begin_releasing());
+        let token = lifecycle.try_begin_releasing().expect("release begins");
         assert!(!try_take_hold(&lifecycle, &hold_until, 30), "503 while releasing");
         assert!(recover(hold_until.lock()).is_none(), "a refused hold writes no lease");
-        lifecycle.finish_releasing();
+        assert!(lifecycle.finish_releasing(token));
         assert!(try_take_hold(&lifecycle, &hold_until, 30), "and is accepted once the release is over");
     }
 
@@ -9728,7 +10708,6 @@ mod tests {
     /// popup and scrolled the page. The popup's CollectionView ran from y=92
     /// to y=1049 on a 956pt screen, so the old centre-based gesture started
     /// at y≈570 — below the visible menu (92..487) — i.e. outside the popup.
-    #[test]
     /// A refused TCP connect never reached WDA; a response-level failure may
     /// have. The classifier must tell them apart, and only the first is
     /// "not sent".
@@ -9751,6 +10730,7 @@ mod tests {
         assert!(!error_never_reached_wda(&anyhow::anyhow!("HTTP status 400 Bad Request")));
     }
 
+    #[test]
     fn element_swipe_starts_on_the_row_and_stays_on_screen() {
         let row = [109.0, 245.0, 251.0, 36.0];
         let popup_list = [62.0, 92.0, 316.0, 957.0];
@@ -11111,17 +12091,30 @@ mod tests {
     fn wda_lifecycle_serializes_release_and_reconnect_in_both_orders() {
         let lifecycle = WdaLifecycle::new();
 
-        assert!(lifecycle.try_begin_reconnecting());
+        let reconnect = lifecycle
+            .try_begin_reconnecting()
+            .expect("reconnect begins");
         assert!(lifecycle.is_reconnecting());
-        assert!(!lifecycle.try_begin_releasing());
-        lifecycle.finish_reconnecting();
+        assert!(lifecycle.try_begin_releasing().is_none());
+        assert!(lifecycle.finish_reconnecting(reconnect));
 
-        assert!(lifecycle.try_begin_releasing());
+        let release = lifecycle.try_begin_releasing().expect("release begins");
         assert!(lifecycle.is_releasing());
-        assert!(!lifecycle.try_begin_reconnecting());
-        lifecycle.finish_releasing();
+        assert!(lifecycle.try_begin_reconnecting().is_none());
+        assert!(lifecycle.finish_releasing(release));
 
         assert!(!lifecycle.is_transitioning());
+
+        // Each round gets its own generation, so a token never matches twice.
+        let again = lifecycle
+            .try_begin_reconnecting()
+            .expect("second reconnect");
+        assert!(
+            !lifecycle.finish_reconnecting(reconnect),
+            "a spent token must not end a later round"
+        );
+        assert!(lifecycle.is_reconnecting());
+        assert!(lifecycle.finish_reconnecting(again));
     }
 
     #[test]
@@ -11145,14 +12138,14 @@ mod tests {
         barrier.wait();
         let reconnect_won = reconnect.join().unwrap();
         let release_won = release.join().unwrap();
-        assert_ne!(reconnect_won, release_won);
+        assert_ne!(reconnect_won.is_some(), release_won.is_some());
 
-        if reconnect_won {
+        if let Some(token) = reconnect_won {
             assert!(lifecycle.is_reconnecting());
-            lifecycle.finish_reconnecting();
+            assert!(lifecycle.finish_reconnecting(token));
         } else {
             assert!(lifecycle.is_releasing());
-            lifecycle.finish_releasing();
+            assert!(lifecycle.finish_releasing(release_won.expect("one side won")));
         }
         assert!(!lifecycle.is_transitioning());
     }
@@ -11165,7 +12158,9 @@ mod tests {
         let actionable = AtomicBool::new(false);
         let released = AtomicBool::new(true);
         let lifecycle = WdaLifecycle::new();
-        assert!(lifecycle.try_begin_reconnecting());
+        let token = lifecycle
+            .try_begin_reconnecting()
+            .expect("reconnect begins");
         let locked = crate::wda::WdaHealth {
             up: true,
             actionable: false,
@@ -11188,9 +12183,965 @@ mod tests {
         // Model the readiness deadline expiring without actionability: the
         // runner still owns the device, while reconnecting ends and status can
         // honestly tell the user to unlock instead of reconnecting again.
-        finish_wda_readiness_wait(&lifecycle);
+        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Deadline);
         assert!(!lifecycle.is_reconnecting());
         assert_eq!(recover(health_slot.lock()).locked, Some(true));
+    }
+
+    // ---------------------------------------------------------------------
+    // Readiness lifecycle: real router, real loop, synthetic WDA.
+    // ---------------------------------------------------------------------
+
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    use crate as srv;
+    use ::core as srv_core;
+    include!("../tests/fixtures/app_state.rs");
+
+    fn readiness_test_state() -> Arc<AppState> {
+        fixture_app_state(None)
+    }
+
+    /// A synthetic WDA on loopback that the test owns and shuts down.
+    ///
+    /// Serves an unbounded number of requests until [`Self::shutdown`] (or
+    /// `Drop`) stops it, then joins its thread — so a panic inside the
+    /// responder surfaces in the test instead of being swallowed by a
+    /// detached thread, and no thread outlives the test.
+    struct MockWda {
+        base: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockWda {
+        fn start(responder: impl Fn(&str) -> String + Send + 'static) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let Ok(mut stream) = incoming else { return };
+                    // A peer that connects and then says nothing would park
+                    // this thread in `read` forever, and one that stops
+                    // reading would park it in `write_all`. Both sides get a
+                    // deadline so the thread always ends and the join always
+                    // returns.
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .ok();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                        .ok();
+                    let mut buffer = [0_u8; 8192];
+                    let Ok(read) = stream.read(&mut buffer) else {
+                        continue;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let body = responder(&request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                base: format!("http://{address}"),
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn base(&self) -> &str {
+            &self.base
+        }
+
+        /// Stop accepting and join, propagating a responder panic.
+        fn shutdown(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            // Unblock the blocking `accept` with one throwaway connection.
+            let address = self.base.trim_start_matches("http://").to_string();
+            let _ = std::net::TcpStream::connect(address);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("mock WDA responder panicked");
+            }
+        }
+    }
+
+    impl Drop for MockWda {
+        fn drop(&mut self) {
+            if self.thread.is_some() {
+                self.shutdown();
+            }
+        }
+    }
+
+    fn readiness_state_with_wda(base: &str) -> Arc<AppState> {
+        let state = readiness_test_state();
+        let mut state = Arc::try_unwrap(state).ok().expect("fresh state");
+        state.wda = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::wda::WdaClient::new(base).unwrap(),
+        )));
+        state.managed_wda = true;
+        Arc::new(state)
+    }
+
+    fn short_budget() -> WdaReadinessBudget {
+        WdaReadinessBudget {
+            total: std::time::Duration::from_millis(300),
+            probe: std::time::Duration::from_millis(80),
+            poll: std::time::Duration::from_millis(10),
+        }
+    }
+
+    /// A setup-status fixture in a temp dir. Never the operator's state dir.
+    struct SetupStatusFixture {
+        _dir: tempfile::TempDir,
+        path: String,
+    }
+
+    impl SetupStatusFixture {
+        fn absent() -> Self {
+            let dir = tempfile::tempdir().expect("temp status dir");
+            let path = dir.path().join("wda-setup-status.json");
+            Self {
+                _dir: dir,
+                path: path.to_string_lossy().to_string(),
+            }
+        }
+
+        fn blocked_on(blocker: &str) -> Self {
+            let fixture = Self::absent();
+            std::fs::write(
+                &fixture.path,
+                format!(
+                    r#"{{"phase":"lock-backoff","blocked_on":"{blocker}","message":"fixture","ts":{}}}"#,
+                    now_secs()
+                ),
+            )
+            .expect("write status fixture");
+            fixture
+        }
+
+        fn path(&self) -> &str {
+            &self.path
+        }
+    }
+
+    fn healthy_wda_responder(request: &str) -> String {
+        if request.contains("/wda/locked") {
+            r#"{"value":false}"#.to_string()
+        } else if request.contains("/wda/apps/list") {
+            r#"{"value":[{"bundleId":"com.apple.springboard","pid":1}]}"#.to_string()
+        } else if request.starts_with("POST /session ") {
+            r#"{"value":{"sessionId":"SESSION"}}"#.to_string()
+        } else {
+            r#"{"value":{"ready":true}}"#.to_string()
+        }
+    }
+
+    async fn status_json(state: &Arc<AppState>) -> String {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let response = router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agent/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// The regression 5339e34 introduced and this change removes, exercised
+    /// through the real handler: evidence cached before a bring-up must not
+    /// let GET /agent/status end that bring-up or report the phone drivable.
+    /// Repeating the request must change nothing, and the owner must still be
+    /// able to finish normally afterwards.
+    #[test]
+    fn status_never_ends_a_reconnect_that_cached_actionability_precedes() {
+        block(async {
+            let mut wda = MockWda::start(healthy_wda_responder);
+            let state = readiness_state_with_wda(wda.base());
+
+            // Evidence from before the bring-up: WDA was actionable.
+            assert!(apply_wda_health_probe(
+                &state.wda_health,
+                &state.wda_actionable,
+                &state.released,
+                crate::wda::WdaHealth {
+                    up: true,
+                    actionable: true,
+                    locked: Some(false),
+                },
+            ));
+            assert!(state
+                .wda_actionable
+                .load(std::sync::atomic::Ordering::Acquire));
+
+            // A new bring-up starts; the cached value is still true.
+            let token = state
+                .wda_lifecycle
+                .try_begin_reconnecting()
+                .expect("bring-up starts");
+
+            for _ in 0..3 {
+                let body = status_json(&state).await;
+                assert!(
+                    body.contains(r#""reconnecting":true"#),
+                    "status ended a live reconnect: {body}"
+                );
+                assert!(
+                    body.contains(r#""drivable":false"#),
+                    "status reported a rebuilding runner as drivable: {body}"
+                );
+                assert!(state.wda_lifecycle.is_reconnecting());
+            }
+
+            // The owner can still finish normally after those observations.
+            assert!(state.wda_lifecycle.finish_reconnecting(token));
+            assert!(!state.wda_lifecycle.is_transitioning());
+            wda.shutdown();
+        });
+    }
+
+    /// Drive the real loop to `Ready` against a healthy synthetic WDA.
+    #[test]
+    fn readiness_loop_reaches_ready_and_publishes_evidence() {
+        block(async {
+            let mut wda = MockWda::start(healthy_wda_responder);
+            let status = SetupStatusFixture::absent();
+            let state = readiness_state_with_wda(wda.base());
+            state
+                .released
+                .store(true, std::sync::atomic::Ordering::Release);
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+
+            let outcome =
+                run_wda_readiness_wait(&state, token, short_budget(), status.path()).await;
+
+            assert_eq!(outcome, WdaReadinessOutcome::Ready);
+            assert!(state
+                .wda_actionable
+                .load(std::sync::atomic::Ordering::Acquire));
+            assert!(!state.released.load(std::sync::atomic::Ordering::Acquire));
+            wda.shutdown();
+        });
+    }
+
+    /// A locked phone ends the wait promptly instead of burning the budget.
+    #[test]
+    fn readiness_loop_ends_on_a_locked_phone() {
+        block(async {
+            let mut wda = MockWda::start(|request| {
+                if request.contains("/wda/locked") {
+                    r#"{"value":true}"#.to_string()
+                } else {
+                    r#"{"value":{"ready":true}}"#.to_string()
+                }
+            });
+            let status = SetupStatusFixture::absent();
+            let state = readiness_state_with_wda(wda.base());
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+
+            let budget = short_budget();
+            let started = std::time::Instant::now();
+            let outcome = run_wda_readiness_wait(&state, token, budget, status.path()).await;
+
+            assert_eq!(outcome, WdaReadinessOutcome::Locked);
+            assert!(
+                started.elapsed() < budget.total,
+                "a locked phone burned the whole budget"
+            );
+            assert_eq!(
+                recover(state.wda_health.lock()).locked,
+                Some(true),
+                "the lock state must be published"
+            );
+            wda.shutdown();
+        });
+    }
+
+    /// A published prerequisite ends the wait before WDA is ever contacted:
+    /// the retry loop cannot clear something only a person can.
+    #[test]
+    fn readiness_loop_ends_on_a_setup_blocker_without_touching_wda() {
+        block(async {
+            let contacted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = contacted.clone();
+            let mut wda = MockWda::start(move |request| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Release);
+                healthy_wda_responder(request)
+            });
+            let status = SetupStatusFixture::blocked_on("locked");
+            let state = readiness_state_with_wda(wda.base());
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+
+            let outcome =
+                run_wda_readiness_wait(&state, token, short_budget(), status.path()).await;
+
+            assert_eq!(outcome, WdaReadinessOutcome::SetupBlocked);
+            assert_eq!(
+                contacted.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "a published blocker must end the wait before probing WDA"
+            );
+            assert!(!state
+                .wda_actionable
+                .load(std::sync::atomic::Ordering::Acquire));
+            wda.shutdown();
+        });
+    }
+
+    /// A probe that hangs must be cut off by the ABSOLUTE deadline: the wait
+    /// ends at its budget even though the probe's own ceiling is longer.
+    #[test]
+    fn a_hanging_probe_cannot_push_the_wait_past_its_deadline() {
+        block(async {
+            let mut wda = MockWda::start(|_| {
+                // Longer than the whole budget below.
+                std::thread::sleep(std::time::Duration::from_millis(1_500));
+                r#"{"value":{"ready":true}}"#.to_string()
+            });
+            let status = SetupStatusFixture::absent();
+            let state = readiness_state_with_wda(wda.base());
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let budget = WdaReadinessBudget {
+                total: std::time::Duration::from_millis(200),
+                // Deliberately larger than `total`: only the absolute deadline
+                // can stop this probe.
+                probe: std::time::Duration::from_secs(30),
+                poll: std::time::Duration::from_millis(10),
+            };
+
+            let started = std::time::Instant::now();
+            let outcome = run_wda_readiness_wait(&state, token, budget, status.path()).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(outcome, WdaReadinessOutcome::Deadline);
+            assert!(
+                elapsed < std::time::Duration::from_millis(900),
+                "a hanging probe ran past the budget: {elapsed:?}"
+            );
+            assert!(!state
+                .wda_actionable
+                .load(std::sync::atomic::Ordering::Acquire));
+            wda.shutdown();
+        });
+    }
+
+    /// With WDA refusing connections, the wait ends at its deadline and not
+    /// meaningfully beyond it.
+    #[test]
+    fn readiness_loop_ends_at_its_deadline_without_overrunning() {
+        block(async {
+            let status = SetupStatusFixture::absent();
+            // Port 1 refuses instantly, so `is_up` fails every round.
+            let state = readiness_state_with_wda("http://127.0.0.1:1");
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let budget = short_budget();
+
+            let started = std::time::Instant::now();
+            let outcome = run_wda_readiness_wait(&state, token, budget, status.path()).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(outcome, WdaReadinessOutcome::Deadline);
+            assert!(
+                elapsed >= budget.total,
+                "returned before the budget: {elapsed:?}"
+            );
+            assert!(
+                elapsed < budget.total + budget.probe + budget.poll,
+                "overran the budget: {elapsed:?}"
+            );
+        });
+    }
+
+    /// A round taken over mid-wait must end as `Superseded`, publish nothing,
+    /// and leave the new round alone.
+    #[test]
+    fn readiness_loop_reports_superseded_when_another_round_takes_over() {
+        block(async {
+            let status = SetupStatusFixture::absent();
+            let state = readiness_state_with_wda("http://127.0.0.1:1");
+            let first = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            assert!(state.wda_lifecycle.finish_reconnecting(first));
+            let second = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+
+            let outcome =
+                run_wda_readiness_wait(&state, first, short_budget(), status.path()).await;
+
+            assert_eq!(outcome, WdaReadinessOutcome::Superseded);
+            assert!(
+                state.wda_lifecycle.is_reconnecting(),
+                "a superseded round ended the current one"
+            );
+            assert!(state.wda_lifecycle.finish_reconnecting(second));
+        });
+    }
+
+    /// Cancellation contract: dropping the wait future must not leave the
+    /// reconnect set forever.
+    #[test]
+    fn a_cancelled_readiness_wait_still_ends_its_reconnect() {
+        block(async {
+            let status = SetupStatusFixture::absent();
+            let state = readiness_state_with_wda("http://127.0.0.1:1");
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            {
+                let _ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
+                let wait = run_wda_readiness_wait(&state, token, short_budget(), status.path());
+                tokio::pin!(wait);
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(5), &mut wait).await;
+            }
+            assert!(
+                !state.wda_lifecycle.is_transitioning(),
+                "a cancelled readiness wait left the reconnect set"
+            );
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // Capability discovery
+    // ---------------------------------------------------------------------
+
+    /// The advertised catalogue is hand-kept, so it is only honest while it
+    /// matches the dispatchers. Read their own match arms out of this source
+    /// file and compare: adding an action without advertising it (or
+    /// advertising one that does not exist) fails here.
+    ///
+    /// Three separate surfaces, three separate comparisons — conflating them
+    /// is how the first draft of this endpoint advertised a helper function's
+    /// arms as if they were the product's entry point.
+    #[test]
+    fn capability_catalogue_matches_the_dispatchers() {
+        fn arms_of(source: &str, signature: &str) -> Vec<String> {
+            let start = source.find(signature).unwrap_or_else(|| {
+                panic!("dispatcher {signature} not found — the scraper needs updating")
+            });
+            let body = &source[start + signature.len()..];
+            // Stop at the next top-level fn: arms belong to this one only.
+            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            let end = body[..end].find("\nfn ").unwrap_or(end);
+            let mut found = Vec::new();
+            for line in body[..end].lines() {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with('"') || !line.contains("=>") {
+                    continue;
+                }
+                let head = trimmed.split("=>").next().unwrap_or("");
+                let head = head.split(" if ").next().unwrap_or(head);
+                for piece in head.split('|') {
+                    let piece = piece.trim().trim_matches('"');
+                    if !piece.is_empty()
+                        && piece.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    {
+                        found.push(piece.to_string());
+                    }
+                }
+            }
+            found.sort();
+            found.dedup();
+            assert!(!found.is_empty(), "no arms scraped from {signature}");
+            found
+        }
+
+        let source = include_str!("http.rs");
+        // Single step = what direct_agent_action handles itself, plus what it
+        // delegates to wda_control_with_client.
+        let mut single = arms_of(source, "async fn direct_agent_action(");
+        single.extend(arms_of(source, "async fn wda_control_with_client("));
+        single.sort();
+        single.dedup();
+        let batch = arms_of(source, "fn validate_agent_action_value(");
+
+        let advertised = |set: &[&str]| {
+            let mut v: Vec<String> = set.iter().map(|a| a.to_string()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            single,
+            advertised(CAPABILITY_SINGLE_STEP_ACTIONS),
+            "single-step catalogue drifted from the dispatchers"
+        );
+        assert_eq!(
+            batch,
+            advertised(CAPABILITY_BATCH_ACTIONS),
+            "batch catalogue drifted from validate_agent_action_value"
+        );
+    }
+
+    /// Fetch `/agent/capabilities` through the real router.
+    async fn capabilities_json(state: &Arc<AppState>, owner: Option<&str>) -> serde_json::Value {
+        capabilities_json_as(state, owner, false).await
+    }
+
+    async fn capabilities_json_as(
+        state: &Arc<AppState>,
+        owner: Option<&str>,
+        takeover: bool,
+    ) -> serde_json::Value {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().uri("/agent/capabilities");
+        if let Some(name) = owner {
+            request = request.header("x-phone-owner", name);
+        }
+        if takeover {
+            request = request.header("x-phone-owner-takeover", "1");
+        }
+        let response = router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn mirror_capability_state() -> Arc<AppState> {
+        let state = readiness_test_state();
+        let mut owned = Arc::try_unwrap(state).ok().expect("fresh state");
+        owned.backend = crate::config::DeviceBackend::Mirror;
+        Arc::new(owned)
+    }
+
+    fn strings(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_string())
+            .collect()
+    }
+
+    /// Read the ADVERTISED perform set out of the real endpoint, not out of
+    /// the constant, so a response that serialises the wrong set is caught.
+    #[test]
+    fn the_endpoint_advertises_exactly_the_closed_perform_set() {
+        block(async {
+            let state = readiness_test_state();
+            let json = capabilities_json(&state, None).await;
+            let advertised = strings(&json["supported"]["perform_actions"]);
+
+            let expected: Vec<String> =
+                PERFORM_ACTION_NAMES.iter().map(|a| a.to_string()).collect();
+            assert_eq!(advertised, expected, "endpoint returned a different set: {json}");
+            assert!(advertised.iter().any(|a| a == "scroll_to_visible"));
+            assert!(
+                !advertised.iter().any(|a| a == "tap"),
+                "a top-level action leaked into the perform set: {json}"
+            );
+        });
+    }
+
+    /// Mirror cannot do element-shaped work, and the route responses prove it:
+    /// the batch route answers `batch_requires_direct_wda` and the element
+    /// tree answers `backend_is_mirror`. Neither touches the OS, so this is
+    /// safe to assert here — unlike a Mirror `tap`, which would pull real
+    /// windows around on the operator's Mac.
+    #[test]
+    fn mirror_advertises_only_what_it_can_actually_carry() {
+        block(async {
+            use axum::body::Body;
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let state = mirror_capability_state();
+            let json = capabilities_json(&state, None).await;
+
+            assert_eq!(json["backend"], "mirror");
+            assert_eq!(json["supported"]["element_tree"], false);
+            assert!(strings(&json["supported"]["batch_actions"]).is_empty());
+            assert!(strings(&json["supported"]["perform_actions"]).is_empty());
+            assert_eq!(json["supported"]["observation"]["return_delta"], false);
+            assert_eq!(json["supported"]["modes"], serde_json::json!(["mirror"]));
+            let single = strings(&json["supported"]["single_step_actions"]);
+            assert!(single.iter().any(|a| a == "tap"), "{json}");
+            for element_shaped in ["perform", "set_value", "tap_locator", "launch_app"] {
+                assert!(
+                    !single.iter().any(|a| a == element_shaped),
+                    "mirror advertised {element_shaped}: {json}"
+                );
+            }
+
+            // The refusals the advertisement is based on.
+            let batch = router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/agent/actions")
+                        .header("x-phone-control", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"steps":[{"kind":"action","action":{"type":"tap","x":0.5,"y":0.5}}]}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(batch.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = batch.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("batch_requires_direct_wda"),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+
+            let elements = router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/agent/elements")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(elements.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = elements.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains("backend_is_mirror"));
+        });
+    }
+
+    /// Direct advertises the element-shaped surface Mirror does not, and the
+    /// two responses must differ — one catalogue for both backends was the
+    /// defect this replaces.
+    #[test]
+    fn direct_and_mirror_advertise_different_surfaces() {
+        block(async {
+            let direct = capabilities_json(&readiness_test_state(), None).await;
+            let mirror = capabilities_json(&mirror_capability_state(), None).await;
+
+            assert_ne!(
+                direct["supported"], mirror["supported"],
+                "both backends advertised the same capabilities"
+            );
+            assert_eq!(direct["supported"]["element_tree"], true);
+            assert!(!strings(&direct["supported"]["batch_actions"]).is_empty());
+            assert!(strings(&direct["supported"]["single_step_actions"])
+                .iter()
+                .any(|a| a == "perform"));
+        });
+    }
+
+    /// An externally managed endpoint owns no supervisor, so `mode=agent` and
+    /// `mode=human` both 409. Advertising either would be a false promise.
+    #[test]
+    fn an_externally_managed_endpoint_advertises_no_lifecycle_modes() {
+        block(async {
+            use axum::body::Body;
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let state = readiness_test_state(); // managed_wda = false
+            let json = capabilities_json(&state, None).await;
+            assert_eq!(json["recovery_owner"], "external");
+            assert_eq!(json["supported"]["modes"], serde_json::json!([]));
+            assert_eq!(json["supported"]["lifecycle_managed_here"], false);
+
+            // The refusal that justifies it.
+            let response = router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/agent/mode")
+                        .header("x-phone-control", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"mode":"human"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains("wda_is_externally_managed"));
+        });
+    }
+
+    /// The four lease states, decided read-only. An expired record blocks
+    /// nobody, and the holder must be told about its own phone.
+    #[test]
+    fn lease_states_are_classified_without_touching_the_lease() {
+        block(async {
+            let state = readiness_test_state();
+
+            // Anonymous caller, no lease.
+            let json = capabilities_json(&state, None).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "free");
+
+            *recover(state.owner.lock()) = Some(PhoneOwner {
+                name: "agent-a".to_string(),
+                last_seen: Instant::now(),
+            });
+            let before = recover(state.owner.lock()).clone().unwrap();
+
+            // The holder itself.
+            let json = capabilities_json(&state, Some("agent-a")).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "self");
+            assert_ne!(json["available"]["blocked_by"], "owned_by_other");
+
+            // Somebody else.
+            let json = capabilities_json(&state, Some("agent-b")).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "refused");
+            assert_eq!(json["available"]["blocked_by"], "owned_by_other");
+            assert_eq!(json["available"]["ok"], false);
+            assert_eq!(json["available"]["detail"]["needs_owner_identity"], false);
+
+            // An anonymous caller is REFUSED by a live lease — `arbitrate_owner`
+            // rejects `Anonymous` — so this is a definite false, not unknown.
+            // What would change it is naming itself.
+            let json = capabilities_json(&state, None).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "refused");
+            assert_eq!(json["available"]["ok"], false);
+            assert_eq!(json["available"]["detail"]["needs_owner_identity"], true);
+
+            // The lease must be untouched by all of that.
+            let after = recover(state.owner.lock()).clone().unwrap();
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.last_seen, before.last_seen, "the lease was refreshed");
+
+            // An explicit takeover would be admitted, but the phone is not
+            // this caller's yet — saying `self` would hide the eviction.
+            let json = capabilities_json_as(&state, Some("agent-b"), true).await;
+            assert_eq!(
+                json["available"]["detail"]["ownership"], "takeover_permitted",
+                "a takeover against another holder reported as self: {json}"
+            );
+            let still = recover(state.owner.lock()).clone().unwrap();
+            assert_eq!(still.name, "agent-a", "a capability probe performed the takeover");
+            assert_eq!(still.last_seen, before.last_seen);
+
+            // The holder's own takeover header is still just `self`.
+            let json = capabilities_json_as(&state, Some("agent-a"), true).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "self");
+
+            // An expired record blocks nobody.
+            *recover(state.owner.lock()) = Some(PhoneOwner {
+                name: "agent-a".to_string(),
+                last_seen: Instant::now()
+                    - std::time::Duration::from_secs(state.owner_lease_secs + 1),
+            });
+            let json = capabilities_json(&state, Some("agent-b")).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "expired");
+            assert_ne!(json["available"]["blocked_by"], "owned_by_other");
+            // And an anonymous caller is not blocked by a dead lease either.
+            let json = capabilities_json(&state, None).await;
+            assert_eq!(json["available"]["detail"]["ownership"], "expired");
+            assert_eq!(json["available"]["detail"]["needs_owner_identity"], false);
+        });
+    }
+
+    /// Discovery must not wake the phone or take it from whoever holds it.    /// Discovery must not wake the phone or take it from whoever holds it.
+    #[test]
+    fn capabilities_contacts_no_wda_and_takes_no_lease() {
+        block(async {
+            use axum::body::Body;
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let contacted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = contacted.clone();
+            let mut wda = MockWda::start(move |request| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Release);
+                healthy_wda_responder(request)
+            });
+            let state = readiness_state_with_wda(wda.base());
+            let owner_before = recover(state.owner.lock()).clone();
+
+            let response = router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/agent/capabilities")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(
+                contacted.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "capability discovery opened a WDA connection: {json}"
+            );
+            assert_eq!(
+                recover(state.owner.lock()).clone().map(|o| o.name),
+                owner_before.map(|o| o.name),
+                "capability discovery touched the owner lease"
+            );
+            assert_eq!(json["available"]["evidence"], "cache");
+            wda.shutdown();
+        });
+    }
+
+    /// `supported` is static and must not collapse just because the phone is
+    /// unavailable right now — that separation is the point of the endpoint.
+    #[test]
+    fn supported_capabilities_survive_an_unavailable_phone() {
+        block(async {
+            use axum::body::Body;
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let state = readiness_test_state();
+            state
+                .released
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            let response = router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/agent/capabilities")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(json["available"]["ok"], false);
+            assert_eq!(json["available"]["blocked_by"], "released");
+            let actions = json["supported"]["single_step_actions"].as_array().unwrap();
+            assert!(
+                actions.iter().any(|a| a == "tap"),
+                "supported collapsed with availability: {json}"
+            );
+            assert!(json["supported"]["batch_actions"]
+                .as_array()
+                .is_some_and(|batch| batch.iter().any(|a| a == "perform")));
+        });
+    }
+
+    /// The guard is created before the spawn, so a future the runtime drops
+    /// without ever polling it still releases its generation.
+    #[test]
+    fn a_readiness_future_dropped_before_its_first_poll_releases_its_generation() {
+        block(async {
+            let state = readiness_state_with_wda("http://127.0.0.1:1");
+            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            {
+                let ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
+                let never_polled = async move {
+                    let mut ownership = ownership;
+                    ownership.resolve(WdaReadinessOutcome::Ready);
+                };
+                drop(never_polled);
+            }
+            assert!(
+                !state.wda_lifecycle.is_transitioning(),
+                "a never-polled readiness future kept its reconnect"
+            );
+        });
+    }
+
+    /// A superseded task must neither publish its round's observation nor end
+    /// the round that replaced it, and neither attempt may panic.
+    #[test]
+    fn a_superseded_task_publishes_nothing_and_finishes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let lifecycle = WdaLifecycle::new();
+        let first = lifecycle.try_begin_reconnecting().expect("first round");
+        assert!(lifecycle.finish_reconnecting(first));
+        let second = lifecycle.try_begin_reconnecting().expect("second round");
+
+        let health_slot = Mutex::new(crate::wda::WdaHealth::down());
+        let actionable = AtomicBool::new(false);
+        let released = AtomicBool::new(true);
+        let stale = crate::wda::WdaHealth {
+            up: true,
+            actionable: true,
+            locked: Some(false),
+        };
+        // The first round's late probe tries to land its evidence.
+        let published = lifecycle.publish_if_current(first, || {
+            apply_wda_health_probe(&health_slot, &actionable, &released, stale)
+        });
+        assert!(
+            published.is_none(),
+            "a superseded round must publish nothing"
+        );
+        assert!(!actionable.load(Ordering::Acquire));
+        assert!(released.load(Ordering::Acquire));
+        assert!(!recover(health_slot.lock()).up);
+
+        // And its late finish must not end the round that replaced it.
+        finish_wda_readiness_wait(&lifecycle, first, WdaReadinessOutcome::Deadline);
+        assert!(
+            lifecycle.is_reconnecting(),
+            "a stale task ended a newer generation"
+        );
+        assert!(lifecycle.finish_reconnecting(second));
+        assert!(!lifecycle.is_transitioning());
+    }
+
+    /// A token that lost ownership must not end a *release* either.
+    #[test]
+    fn a_stale_reconnect_token_cannot_end_a_release() {
+        let lifecycle = WdaLifecycle::new();
+        let reconnect = lifecycle.try_begin_reconnecting().expect("reconnect");
+        assert!(lifecycle.finish_reconnecting(reconnect));
+        let release = lifecycle.try_begin_releasing().expect("release");
+
+        finish_wda_readiness_wait(&lifecycle, reconnect, WdaReadinessOutcome::Superseded);
+        assert!(
+            lifecycle.is_releasing(),
+            "a reconnect token ended a release"
+        );
+        assert!(lifecycle.finish_releasing(release));
+    }
+
+    /// Finishing twice, or after being superseded, is a normal outcome and
+    /// must be reported rather than asserted — debug builds run these too.
+    #[test]
+    fn repeated_finishes_report_false_instead_of_panicking() {
+        let lifecycle = WdaLifecycle::new();
+        let token = lifecycle.try_begin_reconnecting().expect("reconnect");
+        assert!(lifecycle.finish_reconnecting(token));
+        assert!(
+            !lifecycle.finish_reconnecting(token),
+            "second finish is a no-op"
+        );
+        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Ready);
+        assert!(!lifecycle.is_transitioning());
+    }
+
+    /// A `Superseded` outcome owns nothing, so it must not even attempt a
+    /// finish — including in the window where its generation is somehow
+    /// current again.
+    #[test]
+    fn a_superseded_outcome_never_finishes_even_its_own_generation() {
+        let lifecycle = WdaLifecycle::new();
+        let token = lifecycle.try_begin_reconnecting().expect("reconnect");
+        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Superseded);
+        assert!(
+            lifecycle.is_reconnecting(),
+            "a superseded outcome must leave the transition to its owner"
+        );
+        assert!(lifecycle.finish_reconnecting(token));
     }
 
     #[test]

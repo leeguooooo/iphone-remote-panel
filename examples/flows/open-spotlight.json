@@ -24,7 +24,7 @@
           }
         ]
       },
-      "timeout_ms": 3000,
+      "timeout_ms": 15000,
       "poll_ms": 100
     }
   ]

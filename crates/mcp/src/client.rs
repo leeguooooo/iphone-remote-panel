@@ -14,6 +14,15 @@ const DEFAULT_URL: &str = "http://127.0.0.1:44321";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
+/// Only for a request that asks the daemon to OBSERVE after acting.
+///
+/// Such a request costs the action deadline plus the observation budget, and
+/// those compose rather than share: 15s of dispatch, then up to 20s of
+/// looking, plus the alert probe and serialising. The ordinary 30s would abandon
+/// the request while the daemon still held the phone — and abandoning it is
+/// precisely how a caller ends up not knowing what happened. Non-observing
+/// requests keep the shorter timeout.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_BODY_CHARS: usize = 2_048;
@@ -197,24 +206,54 @@ impl DaemonClient {
         Ok(body)
     }
 
-    /// `POST /agent/input` — send one control event to the phone.
-    pub async fn input(&self, msg: &InputMsg) -> anyhow::Result<()> {
-        let json = msg.to_json();
+    /// `GET /agent/capabilities` — what this build supports and whether the
+    /// phone can be driven right now. Read-only: it opens no device
+    /// connection and takes no owner lease.
+    pub async fn capabilities(&self) -> anyhow::Result<DaemonResponse> {
         let req = self
-            .auth(self.client.post(self.url("/agent/input")))
+            .auth(self.client.get(self.url("/agent/capabilities")))
+            .header("x-phone-owner", &self.owner);
+        read_response(req.send().await?).await
+    }
+
+    /// `POST /agent/input` with the daemon's structured result kept.
+    ///
+    /// `observe` asks the daemon for a post-action observation
+    /// (`?return=delta`); without it the request is byte-for-byte what
+    /// [`Self::input`] sends, so existing callers are unaffected.
+    pub async fn input_observed(
+        &self,
+        msg: &InputMsg,
+        observe: bool,
+    ) -> anyhow::Result<DaemonResponse> {
+        let path = if observe {
+            "/agent/input?return=delta"
+        } else {
+            "/agent/input"
+        };
+        let mut req = self
+            .auth(self.client.post(self.url(path)))
             .header("x-phone-control", "1")
             .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(json);
-        let resp = req.send().await?;
-        let _ = check_status(resp).await?;
-        Ok(())
+            .body(msg.to_json());
+        if observe {
+            req = req.timeout(OBSERVE_TIMEOUT);
+        }
+        read_response(req.send().await?).await
     }
 
-    /// `POST /agent/actions` — execute one bounded, fail-closed multi-step
-    /// Direct/WDA sequence. The daemon validates every step before dispatch and
-    /// returns a compact per-step result.
-    pub async fn actions(&self, body: &serde_json::Value) -> anyhow::Result<String> {
+
+    /// `POST /agent/actions`, keeping the response rather than raising it.
+    ///
+    /// The daemon answers a FAILED flow with a non-2xx status and a complete
+    /// JSON body: `failed_step`, `outcome`, `applied_actions`, `retry_safe`,
+    /// per-step results. Collapsing that into an error string throws away
+    /// exactly what a caller needs after a failure.
+    ///
+    /// A TRANSPORT failure is still an error: when the request never completed
+    /// we do not know what the phone did, and must not pretend otherwise.
+    pub async fn actions_outcome(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
         let req = self
             .auth(self.client.post(self.url("/agent/actions")))
             .timeout(ACTIONS_TIMEOUT)
@@ -222,9 +261,7 @@ impl DaemonClient {
             .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
-        let resp = req.send().await?;
-        let resp = check_status(resp).await?;
-        Ok(resp.text().await?)
+        read_response(req.send().await?).await
     }
 
     /// `GET /agent/screenshot` — returns raw PNG bytes.
@@ -270,9 +307,19 @@ impl DaemonClient {
         Ok(resp.text().await?)
     }
 
-    /// `POST /agent/input` with an element index bound to the exact snapshot
-    /// returned by `GET /agent/elements`.
-    pub async fn tap_element(&self, element: usize, snapshot: &str) -> anyhow::Result<()> {
+
+    /// [`Self::tap_element`] keeping the daemon's structured result, and
+    /// optionally asking for a post-action observation.
+    ///
+    /// The snapshot id is whatever the CALLER passed: this never substitutes a
+    /// baseline of its own, so a tap can only ever be resolved against the
+    /// tree the caller actually looked at.
+    pub async fn tap_element_observed(
+        &self,
+        element: usize,
+        snapshot: &str,
+        observe: bool,
+    ) -> anyhow::Result<DaemonResponse> {
         if snapshot.is_empty() {
             anyhow::bail!("snapshot must not be empty");
         }
@@ -282,28 +329,248 @@ impl DaemonClient {
             "snapshot": snapshot,
         })
         .to_string();
-        let req = self
-            .auth(self.client.post(self.url("/agent/input")))
+        let path = if observe {
+            "/agent/input?return=delta"
+        } else {
+            "/agent/input"
+        };
+        let mut req = self
+            .auth(self.client.post(self.url(path)))
             .header("x-phone-control", "1")
             .header("x-phone-owner", &self.owner)
             .header(header::CONTENT_TYPE, "application/json")
             .body(json);
-        let resp = req.send().await?;
-        let _ = check_status(resp).await?;
-        Ok(())
+        if observe {
+            // Same arithmetic as `input_observed`: an observing request costs
+            // the action deadline plus the observation budget. Abandoning it at
+            // the ordinary 30s is how a caller stops knowing what happened.
+            req = req.timeout(OBSERVE_TIMEOUT);
+        }
+        read_response(req.send().await?).await
     }
 
-    /// Resolve a visible label against one element snapshot, require exactly
-    /// one match, then submit a snapshot-bound indexed tap.
+
+    /// [`Self::tap_label`] keeping the structured result.
     ///
-    /// This deliberately does not use WDA's "first matching element" lookup:
-    /// duplicate labels are common in lists and blindly choosing one can cause
-    /// an irreversible action on the wrong row.
-    pub async fn tap_label(&self, label: &str) -> anyhow::Result<()> {
-        let body = self.elements().await?;
-        let (element, snapshot) = unique_label_target(&body, label)?;
-        self.tap_element(element, &snapshot).await
+    /// The snapshot comes from the element read this call just performed —
+    /// never from a cached or borrowed baseline — so the daemon's staleness
+    /// check is evaluated against the tree this resolution actually used.
+    pub async fn tap_label_observed(
+        &self,
+        label: &str,
+        observe: bool,
+    ) -> Result<DaemonResponse, TapLabelFailure> {
+        // Resolution is READ-ONLY: an element read and a label lookup. A
+        // failure here means no MUTATION was dispatched — the GET did reach
+        // the phone, so "nothing reached the phone" would be false — and a
+        // retry is therefore safe.
+        let body = self
+            .elements()
+            .await
+            .map_err(TapLabelFailure::BeforeDispatch)?;
+        let (element, snapshot) =
+            unique_label_target(&body, label).map_err(TapLabelFailure::BeforeDispatch)?;
+        // Past this point the tap has been dispatched. Whether it was
+        // delivered is exactly what we cannot say, so a failure here is
+        // unknown rather than "not sent".
+        self.tap_element_observed(element, &snapshot, observe)
+            .await
+            .map_err(TapLabelFailure::AfterDispatch)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured daemon responses
+// ---------------------------------------------------------------------------
+
+/// How much of a response we are willing to hold in memory. Element trees and
+/// post-action deltas are routinely hundreds of kilobytes, so this is sized
+/// for them; it exists to bound a runaway or hostile response, not to trim
+/// normal ones.
+const DAEMON_RESPONSE_READ_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How much raw text we quote back to a human or a model. Deliberately much
+/// smaller than the read limit and applied ONLY to the preview — the JSON is
+/// parsed from the whole body first, so trimming never costs structure.
+const DAEMON_RESPONSE_PREVIEW_BYTES: usize = 8 * 1024;
+
+/// One daemon call, with its HTTP status and its body kept together.
+///
+/// The daemon reports the fate of an action inside the body (`ok`, `outcome`,
+/// `retry_safe`), so discarding it — or flattening it into an error string —
+/// throws away exactly what a caller needs to decide whether re-sending is
+/// safe. This type keeps both halves and refuses to guess when it cannot see
+/// them.
+#[derive(Debug, Clone)]
+pub struct DaemonResponse {
+    pub status: reqwest::StatusCode,
+    body: String,
+    pub json: Option<serde_json::Value>,
+    /// The response exceeded [`DAEMON_RESPONSE_READ_LIMIT`] and was NOT
+    /// parsed. Nothing about the action can be concluded from it.
+    pub too_large: bool,
+}
+
+impl DaemonResponse {
+    /// Whether the daemon reports the call as successful.
+    ///
+    /// A 2xx alone is not enough: the daemon answers `200 {"ok":false,…}` for
+    /// refusals it wants a caller to read, so an `ok:false` body stays a
+    /// failure here.
+    ///
+    /// **Do not use this to decide whether a MUTATION completed.** With no
+    /// readable body — unparseable, or past the read limit — there is nothing
+    /// to contradict the status, so this returns `true` for "the request was
+    /// accepted". That is the right answer for a read and the wrong one for a
+    /// tap. Use [`Self::confirms_action`], which requires the daemon to have
+    /// said `ok:true`.
+    pub fn ok(&self) -> bool {
+        if !self.status.is_success() {
+            return false;
+        }
+        !matches!(
+            self.json.as_ref().and_then(|json| json.get("ok")),
+            Some(serde_json::Value::Bool(false))
+        )
+    }
+
+    /// Whether this response is positive EVIDENCE that the action completed.
+    ///
+    /// Stricter than [`Self::ok`]: a 2xx whose body could not be parsed proves
+    /// the request was accepted, not that the phone did anything, so it is not
+    /// evidence.
+    pub fn confirms_action(&self) -> bool {
+        self.status.is_success()
+            && matches!(
+                self.json.as_ref().and_then(|json| json.get("ok")),
+                Some(serde_json::Value::Bool(true))
+            )
+    }
+
+    /// Whether the daemon EXPLICITLY refused: an object body saying
+    /// `ok: false`, at any status.
+    ///
+    /// The counterpart to [`Self::confirms_action`], and the other half of the
+    /// only pair that may be trusted. A body that is merely parseable — an
+    /// empty object, or `{"unrelated": 1}` alongside a 500 — told us nothing,
+    /// and treating it as the daemon's verdict invents one. Anything that is
+    /// neither a confirmation nor a refusal is an unknown outcome.
+    pub fn explicit_refusal(&self) -> bool {
+        matches!(
+            self.json.as_ref().and_then(|json| json.get("ok")),
+            Some(serde_json::Value::Bool(false))
+        )
+    }
+
+    pub fn outcome(&self) -> Option<&str> {
+        self.json.as_ref()?.get("outcome")?.as_str()
+    }
+
+    pub fn error_code(&self) -> Option<&str> {
+        self.json.as_ref()?.get("error")?.as_str()
+    }
+
+    /// `Some(true)` ONLY when the daemon said so explicitly.
+    ///
+    /// An unparseable or oversized body yields `None`, never `Some(true)`:
+    /// inferring "safe to retry" from a body we could not read is how a
+    /// duplicate tap reaches a phone.
+    pub fn retry_safe(&self) -> Option<bool> {
+        self.json.as_ref()?.get("retry_safe")?.as_bool()
+    }
+
+    /// The whole body, as read (empty when it was too large).
+    ///
+    /// For callers that need the exact bytes they parsed — evidence files
+    /// hashing what they actually saw, or recognising the legacy plain-text
+    /// acknowledgement. Use [`Self::preview`] for anything shown to a person
+    /// or a model.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Body trimmed to [`DAEMON_RESPONSE_PREVIEW_BYTES`] on a char boundary,
+    /// for quoting into human- or model-facing text.
+    pub fn preview(&self) -> String {
+        if self.too_large {
+            return format!(
+                "<response larger than {} bytes; not read>",
+                DAEMON_RESPONSE_READ_LIMIT
+            );
+        }
+        if self.body.len() <= DAEMON_RESPONSE_PREVIEW_BYTES {
+            return self.body.clone();
+        }
+        let mut end = DAEMON_RESPONSE_PREVIEW_BYTES;
+        while end > 0 && !self.body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &self.body[..end])
+    }
+
+    /// One line for an error message: status, error code, outcome and whether
+    /// a retry is known to be safe.
+    pub fn failure_summary(&self) -> String {
+        let mut parts = vec![format!("HTTP {}", self.status)];
+        if self.status == reqwest::StatusCode::UNAUTHORIZED {
+            parts.push("check PHONE_REMOTE_TOKEN".to_string());
+        }
+        if let Some(code) = self.error_code() {
+            parts.push(format!("error={code}"));
+        }
+        if let Some(outcome) = self.outcome() {
+            parts.push(format!("outcome={outcome}"));
+        }
+        parts.push(match self.retry_safe() {
+            Some(true) => "retry_safe=true".to_string(),
+            Some(false) => "retry_safe=false".to_string(),
+            None => "retry_safe=unknown (do not resend automatically)".to_string(),
+        });
+        format!("{}: {}", parts.join(" "), self.preview())
+    }
+}
+
+/// Read a response into [`DaemonResponse`] without failing on a non-2xx.
+///
+/// Bounded: the body is accumulated chunk by chunk and abandoned past
+/// [`DAEMON_RESPONSE_READ_LIMIT`], which is reported as `too_large` rather
+/// than guessed about. Within the limit the WHOLE body is parsed, so a large
+/// element tree keeps its structure.
+pub async fn read_response(resp: reqwest::Response) -> anyhow::Result<DaemonResponse> {
+    let status = resp.status();
+    let mut resp = resp;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut too_large = false;
+    while let Some(chunk) = resp.chunk().await.context("read daemon response body")? {
+        if buffer.len() + chunk.len() > DAEMON_RESPONSE_READ_LIMIT {
+            too_large = true;
+            buffer.clear();
+            break;
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    // Parse the RAW bytes. Decoding lossily first would let replacement
+    // characters repair a corrupt body into valid JSON, and a corrupt body
+    // must never be able to answer `ok:true` or `retry_safe:true`.
+    let json = if too_large {
+        None
+    } else {
+        serde_json::from_slice(&buffer).ok()
+    };
+    // The text form is for reporting only, so lossy is right here: a body
+    // that is not valid UTF-8 still has to be quotable, and the replacement
+    // characters make the damage visible.
+    let body = if too_large {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&buffer).into_owned()
+    };
+    Ok(DaemonResponse {
+        status,
+        body,
+        json,
+        too_large,
+    })
 }
 
 /// Turn a non-2xx status into an `anyhow::Error` that includes the status code
@@ -385,19 +652,264 @@ mod tests {
     fn mock_daemon(status: &str, body: &str) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Same bound as `mock_daemon_bytes`: a joined handle must not be able
+        // to wait forever for a connection a failed test never opened.
+        listener.set_nonblocking(true).unwrap();
         let status = status.to_string();
         let body = body.to_string();
         let task = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            // Bounding `accept` alone is not enough: a peer that connects and
+            // then says nothing would park this thread in `read` forever, and
+            // a peer that stops reading would park it in `write_all`. Both
+            // sides get a deadline so the thread always ends and the join
+            // always returns.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .ok();
             let mut request = [0_u8; 4_096];
             let _ = stream.read(&mut request);
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).unwrap();
+            let _ = stream.write_all(response.as_bytes());
         });
         (format!("http://{addr}"), task)
+    }
+
+    /// Serve a raw byte body (so tests can send invalid UTF-8 or oversized
+    /// payloads) and join the thread afterwards.
+    fn mock_daemon_bytes(status: &str, body: Vec<u8>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Non-blocking with a deadline. A blocking `accept` waiting for a
+        // connection a failed test never makes turns a joined handle into a
+        // hung suite rather than a red one.
+        listener.set_nonblocking(true).unwrap();
+        let status = status.to_string();
+        let task = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            // Bounding `accept` alone is not enough: a peer that connects and
+            // then says nothing would park this thread in `read` forever, and
+            // a peer that stops reading would park it in `write_all`. Both
+            // sides get a deadline so the thread always ends and the join
+            // always returns.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            let mut request = [0_u8; 4_096];
+            let _ = stream.read(&mut request);
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    async fn read_from(url: &str) -> DaemonResponse {
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        read_response(resp).await.unwrap()
+    }
+
+    /// A body far larger than the preview must still be parsed in full: the
+    /// preview is for quoting, never for deciding. Trailing fields are the
+    /// ones a naive "truncate then parse" would destroy.
+    #[test]
+    fn a_body_larger_than_the_preview_keeps_its_structure() {
+        let filler = "x".repeat(64 * 1024);
+        let body = format!(
+            r#"{{"ok":true,"tree":"{filler}","outcome":"applied","retry_safe":false,"settle":{{"reason":"stable"}}}}"#
+        );
+        assert!(body.len() > DAEMON_RESPONSE_PREVIEW_BYTES * 4);
+        let (url, task) = mock_daemon("200 OK", &body);
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(read_from(&url));
+        task.join().unwrap();
+
+        assert!(response.json.is_some(), "a large body lost its structure");
+        assert_eq!(response.outcome(), Some("applied"));
+        assert_eq!(response.retry_safe(), Some(false));
+        assert_eq!(
+            response.json.as_ref().unwrap()["settle"]["reason"],
+            "stable",
+            "a trailing field was lost"
+        );
+        assert!(response.confirms_action());
+        // Only the preview is trimmed.
+        assert!(response.preview().len() <= DAEMON_RESPONSE_PREVIEW_BYTES + 8);
+        assert!(response.body().len() > DAEMON_RESPONSE_PREVIEW_BYTES);
+    }
+
+    /// Past the read limit nothing may be concluded — least of all that a
+    /// retry is safe.
+    #[test]
+    fn an_oversized_body_is_reported_not_guessed() {
+        let body = vec![b'x'; DAEMON_RESPONSE_READ_LIMIT + 1_024];
+        let (url, task) = mock_daemon_bytes("200 OK", body);
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(read_from(&url));
+        task.join().unwrap();
+
+        assert!(response.too_large);
+        assert!(response.json.is_none());
+        assert_eq!(response.retry_safe(), None, "an unread body implied a retry");
+        assert!(!response.confirms_action(), "an unread body counted as evidence");
+        assert!(response.preview().contains("not read"));
+        // The trap this pair exists to prevent: with nothing to contradict it,
+        // `ok()` still reports the REQUEST as accepted. That is correct for a
+        // read and useless for a mutation, which is why the two are separate.
+        assert!(
+            response.ok(),
+            "ok() answers about the request, not about the phone"
+        );
+    }
+
+    /// A corrupt body must not be repairable into evidence.
+    ///
+    /// Decoding lossily before parsing would turn the invalid bytes into
+    /// replacement characters, producing valid JSON that says `ok:true` and
+    /// `retry_safe:true` — a damaged response would then authorise a resend.
+    /// These assertions are unconditional on purpose: an earlier version of
+    /// this test guarded them with `if json.is_none()`, which passed while the
+    /// bug was present.
+    #[test]
+    fn an_invalid_utf8_body_can_never_confirm_an_action() {
+        // Deliberately the most dangerous shape: everything a caller would act
+        // on is present and positive, and only the bytes are broken.
+        let mut body = br#"{"ok":true,"outcome":"applied","retry_safe":true,"note":""#.to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        body.extend_from_slice(br#""}"#);
+        let (url, task) = mock_daemon_bytes("200 OK", body);
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(read_from(&url));
+        task.join().unwrap();
+
+        assert!(!response.too_large);
+        assert!(
+            response.json.is_none(),
+            "invalid UTF-8 was repaired into parseable JSON"
+        );
+        assert!(
+            !response.confirms_action(),
+            "a corrupt body confirmed an action"
+        );
+        assert_eq!(
+            response.retry_safe(),
+            None,
+            "a corrupt body authorised a resend"
+        );
+        assert_eq!(response.outcome(), None);
+        // Still reportable, with the damage visible.
+        assert!(!response.preview().is_empty());
+        assert!(response.preview().contains('\u{fffd}'));
+    }
+
+    /// `200 {"ok":false}` is the daemon refusing while answering politely. It
+    /// must stay a failure, and a 2xx with no readable JSON must not count as
+    /// proof the phone did anything.
+    #[test]
+    fn a_2xx_is_not_by_itself_success_or_evidence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (url, task) = mock_daemon("200 OK", r#"{"ok":false,"error":"phone_owned","outcome":"not_sent","retry_safe":true}"#);
+        let refused = runtime.block_on(read_from(&url));
+        task.join().unwrap();
+        assert!(!refused.ok(), "an ok:false body was treated as success");
+        assert!(!refused.confirms_action());
+        assert_eq!(refused.error_code(), Some("phone_owned"));
+        assert_eq!(refused.outcome(), Some("not_sent"));
+        assert_eq!(refused.retry_safe(), Some(true));
+
+        let (url, task) = mock_daemon("200 OK", "not json at all");
+        let opaque = runtime.block_on(read_from(&url));
+        task.join().unwrap();
+        assert!(opaque.ok(), "a 2xx without a body is still HTTP-level success");
+        assert!(
+            !opaque.confirms_action(),
+            "an unparseable 2xx counted as proof the action ran"
+        );
+        assert_eq!(opaque.retry_safe(), None);
+    }
+
+    /// The failure summary must carry the fields a caller decides on, and say
+    /// plainly when a retry is unknown.
+    #[test]
+    fn a_failure_summary_keeps_outcome_and_retry_safety() {
+        let (url, task) = mock_daemon(
+            "409 Conflict",
+            r#"{"ok":false,"error":"phone_owned","outcome":"not_sent","retry_safe":true}"#,
+        );
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(read_from(&url));
+        task.join().unwrap();
+        let summary = response.failure_summary();
+        assert!(summary.contains("error=phone_owned"), "{summary}");
+        assert!(summary.contains("outcome=not_sent"), "{summary}");
+        assert!(summary.contains("retry_safe=true"), "{summary}");
+
+        let (url, task) = mock_daemon("500 Internal Server Error", "gateway exploded");
+        let opaque = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(read_from(&url));
+        task.join().unwrap();
+        let summary = opaque.failure_summary();
+        assert!(
+            summary.contains("retry_safe=unknown"),
+            "an unreadable failure must not imply a safe retry: {summary}"
+        );
     }
 
     fn mock_daemon_sequence(
@@ -542,12 +1054,13 @@ mod tests {
         });
 
         let response = DaemonClient::new(url, None)
-            .actions(&request_body)
+            .actions_outcome(&request_body)
             .await
             .unwrap();
         task.join().unwrap();
 
-        assert_eq!(response, response_body);
+        assert_eq!(response.body(), response_body);
+        assert!(response.confirms_action());
         let request = requests.recv().unwrap();
         assert!(request.starts_with("POST /agent/actions "));
         assert!(request.to_ascii_lowercase().contains("x-phone-control: 1"));
@@ -598,6 +1111,198 @@ mod tests {
         assert!(error.contains("no action was sent"));
     }
 
+    /// A label that resolves to nothing (or to two things) fails BEFORE any
+    /// tap goes out. The count is the proof: one GET, zero POSTs.
+    #[tokio::test]
+    async fn a_label_that_does_not_resolve_sends_no_tap() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "取消"}]
+        })
+        .to_string();
+        let (url, task, requests) = mock_daemon_sequence(&[("200 OK", &elements)]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("an unresolvable label is a failure");
+        task.join().unwrap();
+
+        assert!(
+            matches!(failure, TapLabelFailure::BeforeDispatch(_)),
+            "no mutation was dispatched, and the phase says so: {failure}"
+        );
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(sent.len(), 1, "exactly one request: {sent:?}");
+        assert!(sent[0].starts_with("GET /agent/elements"), "{sent:?}");
+        assert!(
+            !sent.iter().any(|request| request.starts_with("POST")),
+            "no mutation may be dispatched when the label did not resolve: {sent:?}"
+        );
+    }
+
+    /// The element read itself failing is also before dispatch.
+    #[tokio::test]
+    async fn an_unreadable_tree_fails_before_any_tap() {
+        let (url, task, requests) =
+            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"wda_source_failed"}"#)]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("an unreadable tree is a failure");
+        task.join().unwrap();
+
+        assert!(matches!(failure, TapLabelFailure::BeforeDispatch(_)), "{failure}");
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert!(
+            !sent.iter().any(|request| request.starts_with("POST")),
+            "{sent:?}"
+        );
+    }
+
+    /// Losing the answer AFTER the tap went out is the other phase: exactly
+    /// one POST happened, and what the phone did is unknown.
+    #[tokio::test]
+    async fn a_lost_answer_after_the_tap_is_reported_after_dispatch() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "发布", "identifier": "publish-button"}]
+        })
+        .to_string();
+        // The second response is never sent: the connection closes with the
+        // tap already on the wire.
+        let (url, task, requests) = mock_daemon_script(&[
+            ("200 OK", Some(elements.as_str()), Duration::ZERO),
+            ("200 OK", None, Duration::ZERO),
+        ]);
+
+        let failure = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
+            .await
+            .expect_err("a lost answer is a failure");
+        task.join().unwrap();
+
+        assert!(
+            matches!(failure, TapLabelFailure::AfterDispatch(_)),
+            "the tap was already dispatched: {failure}"
+        );
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(
+            sent.iter().filter(|r| r.starts_with("POST")).count(),
+            1,
+            "dispatched once, and never re-dispatched: {sent:?}"
+        );
+    }
+
+    /// The timeout that observing requests actually get, exercised rather than
+    /// asserted as a constant.
+    ///
+    /// An observing tap costs the daemon's action deadline plus its observation
+    /// budget. Under the ordinary 30s timeout this request is abandoned while
+    /// the daemon still holds the phone — and abandoning it is exactly how a
+    /// caller stops knowing what happened. The daemon here answers after 33s:
+    /// past the old limit, inside the observing one.
+    ///
+    /// Deliberately slow (~33s). It is the only way to test a timeout without
+    /// asserting the constant back to itself.
+    #[tokio::test]
+    async fn an_observing_tap_waits_past_the_ordinary_timeout() {
+        let elements = serde_json::json!({
+            "snapshot": "tree-v7",
+            "elements": [{"kind": "Button", "label": "发布", "identifier": "publish-button"}]
+        })
+        .to_string();
+        let (url, task, _requests) = mock_daemon_script(&[
+            ("200 OK", Some(elements.as_str()), Duration::ZERO),
+            (
+                "200 OK",
+                Some(r#"{"ok":true,"settle":{"settled":true,"reason":"stable","captures":2}}"#),
+                Duration::from_secs(33),
+            ),
+        ]);
+
+        // Through tap_label, so this covers the label path reaching the same
+        // request builder as a direct element tap.
+        let response = DaemonClient::new(url, None)
+            .tap_label_observed("发布", true)
+            .await
+            .expect("an observing tap must outlast the ordinary 30s timeout");
+        task.join().unwrap();
+
+        assert!(response.confirms_action());
+        assert_eq!(
+            response.json.as_ref().and_then(|json| json["settle"]["reason"].as_str()),
+            Some("stable"),
+            "the observation survived the wait, rather than the client giving up"
+        );
+    }
+
+    /// One scripted response: status, an optional body (`None` closes the
+    /// connection with the request already sent), and a delay before answering.
+    type ScriptedResponse<'a> = (&'a str, Option<&'a str>, Duration);
+
+    /// A scripted daemon that always terminates.
+    ///
+    /// Every wait is bounded: `accept` polls with an overall deadline, reads
+    /// have a timeout, and the thread stops when the script runs out or the
+    /// deadline passes. An earlier version of this file grew mocks that could
+    /// block forever on `accept`, which turns any mistake in a test into a hung
+    /// suite rather than a failing one.
+    fn mock_daemon_script(
+        responses: &[ScriptedResponse<'_>],
+    ) -> (String, std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<(String, Option<String>, Duration)> = responses
+            .iter()
+            .map(|(status, body, delay)| {
+                (status.to_string(), body.map(str::to_string), *delay)
+            })
+            .collect();
+        // Generous enough for the slowest scripted delay, finite regardless.
+        let overall = Duration::from_secs(90);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + overall;
+            for (status, body, delay) in responses {
+                let mut stream = loop {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buffer = [0_u8; 8_192];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let Some(body) = body else {
+                    continue; // the request was sent; the answer never comes
+                };
+                std::thread::sleep(delay);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), task, rx)
+    }
+
     #[tokio::test]
     async fn tap_label_reads_then_submits_snapshot_bound_index() {
         let elements = serde_json::json!({
@@ -611,10 +1316,11 @@ mod tests {
         let (url, task, requests) =
             mock_daemon_sequence(&[("200 OK", &elements), ("200 OK", r#"{"ok":true}"#)]);
 
-        DaemonClient::new(url, None)
-            .tap_label("发布")
+        let response = DaemonClient::new(url, None)
+            .tap_label_observed("发布", false)
             .await
             .unwrap();
+        assert!(response.confirms_action(), "{}", response.preview());
         task.join().unwrap();
 
         let elements_request = requests.recv().unwrap();
@@ -655,5 +1361,36 @@ mod tests {
                 .is_some_and(reqwest::Error::is_timeout),
             "{error:#}"
         );
+    }
+}
+
+/// Which phase of a label-addressed tap failed.
+///
+/// `tap_label` resolves a label to an element (reads only) and then taps it.
+/// Those two halves fail in ways that call for opposite responses, and the
+/// difference is structural — it is known at the call site. Recovering it by
+/// inspecting an error message would be guessing, and guessing wrong in the
+/// safe-looking direction means re-tapping a phone that already acted.
+#[derive(Debug)]
+pub enum TapLabelFailure {
+    /// The element read or the label lookup failed. No mutation was
+    /// dispatched (the read itself was a GET), so a retry is safe.
+    BeforeDispatch(anyhow::Error),
+    /// The tap was already dispatched. Whether it was delivered, and what the
+    /// phone did with it, is unknown.
+    AfterDispatch(anyhow::Error),
+}
+
+impl TapLabelFailure {
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::BeforeDispatch(error) | Self::AfterDispatch(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for TapLabelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error())
     }
 }

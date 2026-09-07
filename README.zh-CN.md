@@ -28,7 +28,7 @@ Mac 上的一个守护进程在 USB 连接的 iPhone 上运行 WebDriverAgent（
 |---|---|---|
 | 坐在浏览器前的人 | `http://<mac>:44321/phone`：实时画面、点按输入、流程录制 | [快速开始](#快速开始) |
 | agent 或脚本 | `/agent/*` 下带 bearer 鉴权的 HTTP API | [Agent API](#agent-api) |
-| Claude Code / Claude Desktop / 任何 MCP 客户端 | 随包的 `iphone-use-mcp`，20 个工具 | [MCP server](#mcp-server) |
+| Claude Code / Claude Desktop / 任何 MCP 客户端 | 随包的 `iphone-use-mcp`，21 个工具 | [MCP server](#mcp-server) |
 | 要反复做同一件事的人 | 官方源里审阅过的 **flow**：一条命令，不经过模型 | [Flow 与官方源](#flow-与官方-flow-源) |
 
 所有动作都发生在手机上。默认的 `direct` 后端不用 macOS 的 iPhone 镜像、屏幕录制、辅助功能、Mac 光标或前台窗口，并且 fail closed：WDA 不可用时控制请求直接报错，不会去动 Mac 上的任何东西。旧的镜像路径只在显式设置 `PHONE_REMOTE_BACKEND=mirror` 时启用，见[旧镜像后端](#旧镜像后端)。
@@ -137,8 +137,8 @@ daemon 每天检查一次 GitHub，在 `/agent/status` 里报 `version` / `lates
 | `GET` | `/agent/screenshot` | 当前屏幕 PNG，来自手机。 |
 | `GET` | `/agent/elements` | 扁平化的辅助功能树，带一次性 `snapshot` 令牌、`ax_stats` 可用性块，以及系统弹窗在场时的 `alert` 块。`?since=<snapshot>` 只返回 `delta`。WDA 缺失或繁忙 `503`，source 失败 `502`，不会用空数组伪装 `200`。 |
 | `GET` | `/agent/mjpeg` | 鉴权后的实时 MJPEG。 |
-| `POST` | `/agent/input` | 一个动作：点按、拖动、长按、滚动、文字、按键、`home` / `spotlight`、`launch_app`、`set_value`、`perform`、`alert`。`?return=delta` 同时返回动作后稳定下来的树变化。 |
-| `POST` | `/agent/actions` | 最多 24 个 `action` / `wait_for` / `pause` 步骤，整批预校验，一把 WDA 锁，首个失败即停。返回 `completed`、`applied_actions`、`failed_step`、`outcome`、`retry_safe`。 |
+| `POST` | `/agent/input` | 一个动作：点按、拖动、长按、滚动、文字、按键、`home` / `spotlight`、`launch_app`、`set_value`、`perform`、`alert`。`?return=delta` 会在动作后于预算内反复采样元素树并返回其变化，以及一个 `settle` 块（`settled`、`reason`：`stable` / `budget_exhausted` / `observation_failed`、`waited_ms`、`captures`、`budget_ms`，必要时还有 `sparse` / `stale`）。观察是尽力而为的：读取慢或失败绝不会把已经生效的动作降级成未知结果。 |
+| `POST` | `/agent/actions` | 最多 24 个 `action` / `wait_for` / `pause` 步骤，整批预校验，一把 WDA 锁，首个失败即停。返回 `completed`、`applied_actions`、`failed_step`、`outcome`（失败步骤的结果）、`failed_step_outcome`、`batch_outcome`（`nothing_applied` / `partially_applied` / `unknown`）、`retry_safe`（整批语义，也是唯一授权重跑的字段）。 |
 | `POST` | `/agent/mode` | `{"mode":"agent"}` 重启已配置的 Direct 目标。不换后端，不换 UDID。 |
 | `POST` | `/agent/hold` | `{"secs":N}`（0 清除，上限 14400）在人工暂停期间阻止空闲释放。释放已经开始时返回 `503 device_release_in_progress`。 |
 | `POST` | `/agent/owner` | `{"release":true}` 提前归还 owner 租约。 |
@@ -207,11 +207,15 @@ verb 定义在 `~/.iphone-use/intents-registry.json`（从 [`deploy/intents-regi
 
 | 分组 | 工具 |
 |---|---|
-| 看 | `phone_status`、`phone_screenshot`、`phone_elements`（带 `registry` 块，列出当前屏幕上这个 app 已安装的 flow） |
-| 动 | `phone_tap`、`phone_tap_element`（绑定快照）、`phone_tap_label`（精确标签唯一）、`phone_scroll`、`phone_type`（中文无损）、`phone_key`、`phone_shortcut`（`home` / `spotlight`） |
+| 看 | `phone_status`、`phone_capabilities`（这个版本支持什么，以及此刻能不能用；不唤醒手机、不占租约）、`phone_screenshot`、`phone_elements`（带 `registry` 块，列出当前屏幕上这个 app 已安装的 flow） |
+| 动 | `phone_tap`、`phone_tap_element`（绑定快照）、`phone_tap_label`（精确标签唯一）、`phone_scroll`、`phone_type`（中文无损）、`phone_key`、`phone_shortcut`（`home` / `spotlight`）——每个都可选传 `observe` |
 | 批 | `phone_run_steps`：最多 24 步，含 `tap_locator`、`launch_app`、`picker`、`alert`、长按 / 滑动 / 拖动、`wait_for` |
 | 生命周期 | `phone_reconnect`（重启已配置的 Direct 目标，不换 UDID）、`phone_hold`、`phone_release_owner` |
 | Flow | `phone_flow_list`、`phone_flow_info`、`phone_flow_run`、`phone_flow_update`、`phone_flow_publish`、`phone_flow_report` |
+
+这七个动作工具加上 `phone_capabilities`，解析后的 JSON 放在 MCP 的 `structuredContent` 里，文本块只是在 8 KiB 处截断的预览——请解析结构化字段。`phone_run_steps` 两边都给完整的批次结果，解析哪一边都安全。其余工具保持它们原来的返回形态：多数把完整 JSON 放在文本里（包括 `phone_flow_run` 的执行结果，无论成败），`phone_screenshot` 返回图片，而在请求到达手机**之前**就失败的那些错误是说明文字。总的规则是：有 `structuredContent` 就读它，没有再按该工具的约定读 `content`。无法确认结果时会给 `outcome: "unknown"` 与 `retry_safe: false`，这是可供程序分支的形式；判断能否重发一律看显式的 `retry_safe` 布尔值，不要看 `outcome`。完整对照表见 [`crates/mcp/README.md`](crates/mcp/README.md)。
+
+单步动作工具传 `observe: true`，daemon 会在动作之后观察屏幕稳定下来并把变化一起返回（`settle`、`snapshot`、`delta`）。默认关闭，因为这段等待是动作本身不必付的延迟。`settle.reason` 三态：`stable`、`budget_exhausted`（观察预算用尽，动作本身已经发生）、`observation_failed`（读取链路坏了）；`stale: true` 表示返回的树是上一次成功的读取而不是当前屏幕，`sparse: true` 表示空树或纯容器树，这种树两次相同也不算 stable。
 
 收起键盘、卸载、目标配置仍只走 HTTP。完整 schema 见 [`crates/mcp/README.md`](crates/mcp/README.md)。
 
@@ -232,16 +236,36 @@ PHONE_REMOTE_TOKEN=… "$MCP" flow run examples/flows/search-spotlight.json --in
 "$MCP" flow list --category health        # id · risk · verified · inputs · name
 "$MCP" flow info health/export-all-zh-cn  # 元数据和步骤模板
 PHONE_REMOTE_TOKEN=… "$MCP" flow run health/export-all-zh-cn
+PHONE_REMOTE_TOKEN=… "$MCP" flow run health/export-all-zh-cn --artifacts-dir ./runs   # 记录本次执行（文件 0600）
 "$MCP" flow add my.json --as myapp/daily  # 自己的 flow，update 不会删
 "$MCP" flow publish my.json --as myapp/daily --alias 某App --note "iPhone 17 Pro Max, iOS 26"   # 用 gh 开 PR
 "$MCP" flow report health/export-all --result @run.json --note "资料按钮改名了"                  # 提 flow-broken issue
 ```
 
+执行失败时结果里会多一个 **`diagnosis`** 块：daemon 原始的 0-based
+`failed_step`、屏幕当时能不能读（`observable`）、原因（`locator_matches_now`、
+`locator_no_match`、`locator_ambiguous`、`still_present`、`no_similar_element`、
+`no_readable_tree`、`screen_unreadable`、`diagnosis_timeout`、
+`step_has_no_locator`），以及最多五
+个候选元素，附上它们是按哪些定位字段 `matched` / `differed` 挑出来的（身份
+字段 `identifier` 优先于 `label`）。这是执行结束后一次有界（4 秒）的只读：
+不重发任何动作，不静默改写 flow，也不改动本次执行的 `outcome` /
+`applied_actions` / `retry_safe`。CLI 和 `phone_flow_run` 走的是同一条路径。
+
+`--artifacts-dir DIR` 把本次执行写成可机器读取的记录——schema、flow 名称
+与 sha256（算的是本次真正解析的那份文件内容）、执行时所对的各版本（读不到
+就写 `unavailable`，绝不猜，也不会为了收集元数据去打扰设备）、真实耗时、
+以及投影后的结果。目录在**发出任何动作之前**先验证可写；文件以 0600 独占
+创建，不覆盖已有证据、不写穿 symlink，同一秒的两次运行各留各的记录。只落
+结构化字段：输入的文字和屏幕文本一律不写盘。如果动作已经执行、写盘才失
+败，结果照常完整打印，另加一个 `artifact_error`——记录失败不能改写已经发
+生的事；反过来 `artifact_error` 也不会把成功的执行说成失败。
+
 flow 上的源元数据都是可选的：`app`（bundle id）、`category`、`risk`（`read_only` · `navigation` · `side_effect`，`side_effect` 没有 `--confirm` / `confirm=true` 拒绝运行）、`locale`（标签和语言绑定）、`tags`、`verified_on`（证明过这份文件的真机记录）。文件是纯 JSON，安装源不执行任何代码；任何一个校验或哈希失败都会中止整次更新，本地目录原样不动。
 
 格式里定死的规则：`--input KEY=VALUE` 只在本次运行解析，不写回文件；flow 在第一个失败步骤停下，不自动重试；命令行参数会留在 shell 历史里，所以参数不能装凭据、验证码或隐私内容，发送 / 发布 / 支付 / 删除类动作必须声明 `side_effect`。
 
-app 更新不会让源悄悄失效：每条 flow 记着它在哪个 app（系统 app 则是 iOS）版本上验过，CLI 读出手机上实际装的版本（`flow apps`），每次列表都给出 `compat` 结论：`verified`、`untested-newer`、`incompatible`、`broken`、`needs-verification`、`draft`、`unknown`。`flow run` 对 broken / incompatible 的 flow 不带 `--force` 就拒跑。夜间 canary（`scripts/flow-reverify.py`）在真机上重跑已验证的只读 flow，刷新 `verified_on`，失败的打标记。
+app 更新不会让源悄悄失效：每条 flow 记着它在哪个 app（系统 app 则是 iOS）版本上验过，CLI 读出手机上实际装的版本（`flow apps`），每次列表都给出 `compat` 结论：`verified`、`untested-newer`、`incompatible`、`broken`、`needs-verification`、`draft`、`unknown`。`flow run` 对 broken / incompatible 的 flow 不带 `--force` 就拒跑。夜间 canary（`scripts/flow-reverify.py`）在真机上重跑已验证的只读 flow，每条给出三种结论之一：**verified**（刷新 `verified_on`）、**failed**（打 `needs-verification` 标记并提 `flow-broken` issue）、**skipped**——手机锁着、被别人占着、不可驱动，或者 daemon 自己也判不出结果。skipped 的 flow 原样不动：手机不可用的那一晚说明不了 flow 的任何事，既不该判它坏，也不该给它记一个没发生过的验证日期。
 
 agent 不靠记性去查源，而是被推着走：`phone_elements` 直接列出屏幕上这个 app 已安装的 flow；`phone_run_steps` 成功跑完 3 步以上会提示把这段存成 flow；`phone_flow_run` 失败时保留现场，`phone_flow_report` 只需补一句说明。格式背后的调研见 [`docs/scripted-flows-research.html`](docs/scripted-flows-research.html)。
 
@@ -249,7 +273,9 @@ agent 不靠记性去查源，而是被推着走：`phone_elements` 直接列出
 
 ### 生命周期与恢复
 
-`/agent/status` 是唯一事实来源。`recovery_owner` 在托管 loopback WDA 下是 `daemon`，首次接入尚未持久化目标时是 `unconfigured`，不托管的端点是 `external`。锁屏导致失败后，daemon 重建 WDA 的间隔从 30 秒退避到 15 分钟，不会反复催密码；其他失败从 5 秒退避到 5 分钟；一次成功恢复清零两种退避。交互式 setup 最多等 5 分钟解锁。`POST /agent/mode {"mode":"agent"}`（MCP 里是 `phone_reconnect`）只重启一次已配置的目标，不要循环调；先读 `hint` 和 `setup_blocked_on`（`warp|proxy|usb|trust|ddi|account`）。
+`/agent/status` 是唯一事实来源。`recovery_owner` 在托管 loopback WDA 下是 `daemon`，首次接入尚未持久化目标时是 `unconfigured`，不托管的端点是 `external`。锁屏导致失败后，daemon 重建 WDA 的间隔从 30 秒退避到 15 分钟，不会反复催密码；其他失败从 5 秒退避到 5 分钟；一次成功恢复清零两种退避。交互式 setup 最多等 5 分钟解锁。`POST /agent/mode {"mode":"agent"}`（MCP 里是 `phone_reconnect`）只重启一次已配置的目标，不要循环调；先读 `hint` 和 `setup_blocked_on`（`warp|proxy|usb|trust|ddi|account|locked`）。
+
+**谁有权结束一次重连。** 一次启动归发起它的任务所有，只有这个所有者能结束它。每次开始都会生成一个代次，所以迟到的任务无法结束接替它的那一轮；`GET /agent/status` 也永远不会结束重连——读状态会刷新健康缓存，但不移动生命周期。一次等待只以一个原因结束：手机可驱动了、锁屏了、setup 报出了前置阻塞、预算用尽、或被另一轮接管，每种都有日志。整个等待受预算约束：探针由绝对截止时间掐断而不是它自己的上限，超过截止时间才返回的证据一律丢弃，被取消的等待（进程关闭、future 被 drop）会释放自己那一轮而不是把 `reconnecting` 永久留下。启动之前缓存的证据，永远不算作这次启动已完成的证明。
 
 ### 升级
 

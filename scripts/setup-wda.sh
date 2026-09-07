@@ -3771,12 +3771,39 @@ printf '  Resume    : %s resume\n' "$SELF_INSTALL"
 printf '  WDA source: %s %s (exact checkout)\n' "$WDA_REF_LABEL" "$WDA_REF"
 printf '  Signing   : free Apple ID profiles may expire after 7 days; re-run setup when needed.\n'
 
+# One health probe, and what it means. Returns 0 to keep holding, 1 to rebuild.
+#
+# A single unanswered probe cannot tell a transient busy period, a network
+# hiccup, and a genuinely dead WDA apart — and treating one 4s timeout as a
+# verdict tore down the runner and both relays during heavy element reads.
+# Requiring consecutive non-answers keeps the distinction the probe cannot
+# make from becoming a decision. Process death and a vanished listener are
+# unambiguous and still exit at once.
+_keepalive_probe_verdict() {
+    if curl -fsS -m 4 "$TARGET_URL/status" >/dev/null 2>&1; then
+        KEEPALIVE_PROBE_FAILURES=0
+        return 0
+    fi
+    KEEPALIVE_PROBE_FAILURES=$((KEEPALIVE_PROBE_FAILURES + 1))
+    if [ "$KEEPALIVE_PROBE_FAILURES" -ge "$KEEPALIVE_PROBE_MAX_FAILURES" ]; then
+        return 1
+    fi
+    info "WDA did not answer /status within 4s (${KEEPALIVE_PROBE_FAILURES}/${KEEPALIVE_PROBE_MAX_FAILURES}); the runner and relays are alive, so holding"
+    return 0
+}
+
 # In supervisor mode, stay alive while the runner and verified relay do. launchd
 # sees an exit as a failure and rebuilds incrementally after sleep/USB/tunnel
 # failures. Interactive setup returned above only after handing off to this job.
 if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
     info "KeepAlive mode: holding while the PID-verified runner and relays stay healthy"
     KEEPALIVE_EXIT_CAUSE=runner
+    # Consecutive `/status` non-answers before a rebuild (~32s at a 4s probe
+    # on a 10s interval). Fixed on purpose: a configurable threshold would need
+    # validating, and a non-numeric or zero value would break the bound it
+    # exists to provide.
+    KEEPALIVE_PROBE_MAX_FAILURES=3
+    KEEPALIVE_PROBE_FAILURES=0
     while :; do
         KEEPALIVE_EXIT_CAUSE=runner
         _validate_pid_record "$RUNNER_PID_FILE" "$LEGACY_RUNNER_EXPECTED" runner || break
@@ -3786,10 +3813,11 @@ if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
             || break
         _verify_loopback_listener "$MJPEG_RELAY_PID_FILE" "$LEGACY_MJPEG_EXPECTED" mjpeg "$MJPEG_PORT" \
             || break
-        # The runner and both relay processes are alive, so an unreachable WDA
-        # means the path between them broke, not the runner.
+        # The processes are alive; whether WDA is answering is the one question
+        # left, and how many unanswered probes make that a failure belongs to
+        # `_keepalive_probe_verdict`.
         KEEPALIVE_EXIT_CAUSE=unreachable
-        curl -fsS -m 4 "$TARGET_URL/status" >/dev/null 2>&1 || break
+        _keepalive_probe_verdict || break
         sleep 10
     done
     if _wda_failure_is_lock_related; then
@@ -3803,13 +3831,11 @@ if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
     # phone's current one.
     case "$KEEPALIVE_EXIT_CAUSE" in
         unreachable)
-            if [ "${WDA_ALLOW_LAN:-0}" = "1" ]; then
-                warn "WDA stopped answering while the runner and relays are alive — the phone's Wi-Fi address most likely changed (the relay still points at ${PHONE_IP:-its old address}). Rebuilding; connect the iPhone by USB to make this immune to DHCP changes."
-                _setstatus building "" "WDA unreachable through the LAN relay (the phone's Wi-Fi address may have changed) — rebuilding"
-            else
-                warn "WDA stopped answering while the runner and relays are alive — the USB tunnel dropped; rebuilding"
-                _setstatus building "" "WDA unreachable through the USB relay — rebuilding"
-            fi
+            # Report the observation, not a diagnosis: this loop cannot tell
+            # which cause it was, and naming one sent a session hunting the
+            # wrong thing.
+            warn "WDA did not answer /status ${KEEPALIVE_PROBE_FAILURES} times in a row while the runner and both relays stayed alive — rebuilding"
+            _setstatus building "" "WDA did not answer ${KEEPALIVE_PROBE_FAILURES} consecutive /status probes — rebuilding"
             ;;
         relay)
             warn "the WDA relay stopped listening — exiting so launchd KeepAlive rebuilds it"

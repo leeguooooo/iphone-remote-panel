@@ -218,6 +218,88 @@
   the web client shows the same hint as a banner.
 </p>
 
+<h3><span class="method get">GET</span> <span class="ep">/agent/capabilities</span></h3>
+<p>
+  Two questions that used to be conflated: what this build can do, and whether
+  the phone can be driven right now. Read-only — it opens no device connection,
+  wakes nothing, and takes no owner lease — so it is safe to call before
+  deciding what to attempt.
+</p>
+<pre><code>{
+  "ok": true,
+  "backend": "direct",
+  "recovery_owner": "daemon",
+  "scope": "ui_control",
+  "supported": {
+    "single_step_actions": ["alert","back","drag","home","key","keyboard","launch_app",
+                            "longpress","perform","picker","scroll","set_value",
+                            "shortcut","swipe","tap","tap_locator","text"],
+    "batch_actions": ["…the same set validated by /agent/actions…"],
+    "perform_actions": ["increment","decrement","adjust","toggle","menu","double_tap",
+                        "two_finger_tap","scroll_to_visible","pinch","rotate","force_press"],
+    "element_tree": true,
+    "observation": { "return_delta": true, "settle_ms_max": 20000 },
+    "modes": ["agent", "human"],
+    "lifecycle_managed_here": true
+  },
+  "available": {
+    "ok": false,
+    "blocked_by": "locked",
+    "evidence": "cache",
+    "detail": {
+      "released": false, "releasing": false, "reconnecting": false,
+      "human_handoff": false, "wda_up": true, "wda_actionable": false,
+      "wda_locked": true, "ownership": "free", "needs_owner_identity": false
+    }
+  }
+}</code></pre>
+<p>
+  <code>supported</code> is static for the configured backend. Mirror carries only
+  the CGEvent vocabulary (<code>down up tap longpress scroll shortcut text key</code>):
+  it refuses <code>/agent/actions</code> with <code>batch_requires_direct_wda</code> and
+  <code>/agent/elements</code> with <code>backend_is_mirror</code>, so it advertises no
+  batch actions, no <code>perform</code> set, and no delta observation.
+  <code>modes</code> lists only values this daemon would accept — an externally
+  managed endpoint lists none, because it answers
+  <code>wda_is_externally_managed</code> to both.
+  <code>perform_actions</code> is the closed set checked before the device is
+  touched; an unlisted name is refused without reaching the phone.
+</p>
+<p>
+  <code>available</code> is a <strong>cached snapshot</strong>, marked
+  <code>evidence: "cache"</code>. Reading it starts no probe, so it reflects the
+  last completed observation rather than the phone's state this instant.
+  <code>ok</code> is deliberately three-valued: <code>true</code> drivable,
+  <code>false</code> blocked, and <code>null</code> meaning the daemon has no
+  evidence either way — <em>not</em> that things are fine.
+  <code>blocked_by</code> names the obstacle:
+  <code>backend_is_mirror</code>, <code>human_handoff</code>,
+  <code>releasing</code>, <code>reconnecting</code>, <code>released</code>,
+  <code>locked</code>, <code>owned_by_other</code>, <code>not_actionable</code>,
+  <code>offline</code>.
+</p>
+<p>
+  <code>detail.ownership</code> is decided by running the real lease-admission
+  rule against a copy of the lease, so the answer cannot drift from what a
+  control request would get, and nothing is claimed, extended or cleared:
+  <code>free</code> (no live lease),
+  <code>self</code> (yours),
+  <code>refused</code> (a live lease would reject this caller — including an
+  anonymous one, which the admission rule rejects, so
+  <code>needs_owner_identity</code> then says naming yourself would change the
+  answer),
+  <code>takeover_permitted</code> (an explicit <code>X-Phone-Owner-Takeover</code>
+  would be admitted, but by evicting the current holder — the phone is not yours
+  yet), and
+  <code>expired</code> (a stale record that blocks nobody).
+</p>
+<p class="muted">
+  <code>scope: "ui_control"</code> is a boundary, not decoration: this catalogue
+  describes UI control and observation only. It says nothing about management
+  surfaces such as app install/uninstall over CoreDevice, and absence here is
+  not a statement that those do not exist.
+</p>
+
 <h3><span class="method post">POST</span> <span class="ep">/agent/mode</span></h3>
 <p>
   This is current-backend recovery, not a mode switch. It never changes
@@ -295,6 +377,44 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   <tr><td><code>{"type":"launch_app","bundle":"com.apple.Preferences"}</code></td><td>Launch/foreground an app by bundle id. A limited known-name mapping is also accepted.</td></tr>
   <tr><td><code>{"type":"picker","column":0,"value":"March"}</code></td><td>Set a WDA PickerWheel value.</td></tr>
 </table>
+<h4><code>?return=delta</code> — the post-action observation</h4>
+<p>
+  With <code>?return=delta</code> an applied action also attempts a bounded
+  observation of the resulting screen (it samples the tree repeatedly within
+  its budget, looking for two matching reads), returned as a <code>delta</code> against
+  <code>?since=</code> (or the action's own <code>snapshot</code>) when that
+  baseline is still cached, else as full <code>elements</code>, plus a fresh
+  <code>snapshot</code> token.
+</p>
+<p>
+  <strong>The action result and the observation are separate facts.</strong>
+  The mutation runs under the endpoint's 15-second action deadline; the
+  observation runs under its own, strictly shorter one. A slow or failed read
+  therefore never downgrades an applied action to
+  <code>outcome_unknown</code>, and never causes the mutation to be re-sent.
+</p>
+<table>
+  <tr><th><code>settle</code> field</th><th>Meaning</th></tr>
+  <tr><td><code>settled</code></td><td><code>true</code> only when the observed TREE stopped changing. Never a claim that the action achieved what you wanted.</td></tr>
+  <tr><td><code>reason</code></td><td><code>stable</code>, <code>budget_exhausted</code> (stability not confirmed within the budget), or <code>observation_failed</code> (the read path itself broke — the action still applied). Running out of budget is <code>budget_exhausted</code>, never <code>observation_failed</code>: a cancelled read is not a broken one.</td></tr>
+  <tr><td><code>waited_ms</code> / <code>budget_ms</code> / <code>captures</code></td><td>Time spent, budget allowed, and successful reads — all describing the TREE read only. The <code>alert</code> probe is separate and hard-capped at 1.5s.</td></tr>
+  <tr><td><code>sparse</code></td><td>Present when the tree held nothing to act on (empty, or container kinds only). Two identical bare reads are evidence the screen is unreadable, not that it settled.</td></tr>
+  <tr><td><code>stale</code></td><td>Present when the returned tree is the last successful read rather than a fresh one — because the refreshing read broke, or because the budget cut it off mid-sample. Never appears with <code>settled:true</code>.</td></tr>
+</table>
+<p>
+  <code>settle_ms</code> (default 15000, max 20000) sets the tree budget;
+  sized so two reads fit even when a single element read is slow (6–7s was
+  measured on one phone with a large tree). A budget shorter than one read may
+  come back with no sample at all — <code>captures: 0</code> — however healthy
+  the phone is; the answer carries the budget it used, so that is visible
+  rather than mysterious. Reading stops as soon as two reads match, so this is
+  a ceiling and not a wait. The observation's clock starts once the action is
+  confirmed, so a slow action does not consume the window;
+  <code>settle_ms=0</code> does not read the element tree at all (the separate 1.5s <code>alert</code> probe may still run). For existing callers,
+  <code>delta_error</code> is still emitted alongside <code>ok:true</code>
+  whenever the observation failed.
+</p>
+
 <p>
   Direct mode returns <code>200</code> only after the WDA action succeeds.
   <code>/agent/input</code> adds no deadline field to the action payload; the server
@@ -372,7 +492,10 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
 <table>
   <tr><th>Step kind</th><th>Contract</th></tr>
   <tr><td><code>action</code></td><td>One supported Direct/WDA input payload, including strict <code>tap_locator</code> and validated bundle-id <code>launch_app</code>. Optional <code>after_ms</code> is capped at 3000 ms and is only an animation settle. Destructive <code>uninstall</code> is never accepted in a batch.</td></tr>
-  <tr><td><code>wait_for</code></td><td>Polls the current element tree. <code>application</code> is an exact Application label; every <code>present</code> locator must match and every <code>absent</code> locator must not match. Locator fields are exact <code>label</code>, <code>identifier</code>, <code>kind</code>, <code>value</code>, <code>focused</code>, <code>enabled</code>, and <code>visible</code>. Timeout is 1–10000 ms; poll interval is 50–1000 ms.</td></tr>
+  <tr><td><code>wait_for</code></td><td>Polls the current element tree. <code>application</code> is an exact Application label; every <code>present</code> locator must match and every <code>absent</code> locator must not match. Locator fields are exact <code>label</code>, <code>identifier</code>, <code>kind</code>, <code>value</code>, <code>focused</code>, <code>enabled</code>, and <code>visible</code>. Timeout is 1–30000 ms (default 15000); poll interval is 50–1000 ms. The
+    per-wait ceiling leaves room for several polls even when an element read is
+    slow; the cumulative declared wait (60000 ms) and the batch deadline are
+    unchanged, so a longer single wait cannot lengthen a batch. An empty or container-only tree never satisfies an <code>absent</code> locator — see the <code>observation</code> block below.</td></tr>
   <tr><td><code>pause</code></td><td>A fixed 1–3000 ms pause for animation that exposes no semantic state. Prefer <code>wait_for</code>.</td></tr>
 </table>
 <p>
@@ -381,11 +504,47 @@ curl -s -H "$AUTH" -H "$MUTATION" -X POST "$HOST/agent/mode" -d '{"mode":"mirror
   <code>completed</code>, <code>applied_actions</code>, and compact per-step results.
   A failure includes <code>failed_step</code>, the completed/applied counts,
   completed <code>steps</code>, the last failed wait <code>observation</code> when
-  available, <code>outcome</code>, and <code>retry_safe</code>. A read-only
+  available, <code>outcome</code>, <code>failed_step_outcome</code>,
+  <code>batch_outcome</code>, and <code>retry_safe</code>. A read-only
   <code>wait_for</code> rebuilds one stale WDA source session within its existing
-  deadline. The retry flag describes replaying
-  the <em>whole batch</em>: once an earlier action landed, it is false even when the
-  current failed step itself was not sent.
+  deadline. <code>retry_safe</code> describes replaying the <em>whole batch</em>:
+  once an earlier action landed it is false, even when the step that failed was
+  itself never sent.
+</p>
+<p>
+  <code>outcome</code> describes the step that FAILED, not the batch, and keeps
+  that meaning for compatibility: a body can carry <code>applied_actions: 2</code>
+  next to <code>outcome: "not_sent"</code>, and both are true of different
+  things. <code>failed_step_outcome</code> is the same value under a name that
+  says which. <code>batch_outcome</code> is the batch's own verdict:
+</p>
+<table>
+  <tr><th>Value</th><th>What it means</th></tr>
+  <tr><td><code>nothing_applied</code></td><td>No action reached the phone.</td></tr>
+  <tr><td><code>partially_applied</code></td><td>At least one action reached the phone before the batch stopped.</td></tr>
+  <tr><td><code>unknown</code></td><td>The failed step's own outcome is unknown, so what the batch did cannot be stated. This is never downgraded to <code>partially_applied</code>, which would claim the earlier actions are settled and only the last one in doubt.</td></tr>
+</table>
+<p>
+  None of the three authorises a retry. <code>retry_safe</code> remains the only
+  field that does, and it is not inferable from these.
+</p>
+<h4>The <code>observation</code> block on a failed <code>wait_for</code></h4>
+<p>
+  A failing step reports what was actually seen, because "the condition was not
+  met" and "nobody could see the screen" call for opposite responses:
+</p>
+<table>
+  <tr><th>Shape</th><th>What happened</th></tr>
+  <tr><td><code>read:false</code></td><td>No readable tree was ever obtained (<code>reads:0</code>, with <code>read_error</code>). <strong>Nothing here proves an element is absent.</strong></td></tr>
+  <tr><td><code>read:true, stale:true</code></td><td>The screen was read at least once and then the read path failed. The observation is the last valid one, not the current screen. A late failure never erases the reads that succeeded.</td></tr>
+  <tr><td><code>read:true</code></td><td>The screen was read and the condition simply was not met — <code>missing_present</code> / <code>violated_absent</code> say which.</td></tr>
+</table>
+<p>
+  <code>sparse:true</code> means the tree was empty or container-only.
+  Because such a tree satisfies any <code>absent</code> locator vacuously, each
+  one is listed in <code>absent_unproven</code> and the step does NOT match:
+  an unreadable screen is not evidence something is gone. <code>rows</code>,
+  <code>attempts</code> and <code>reads</code> carry the raw counts.
 </p>
 <aside class="note">
   <strong>This is not permission to batch guesses.</strong> Discover a changing or

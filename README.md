@@ -29,7 +29,7 @@ phone three ways:
 |---|---|---|
 | a person at a browser | `http://<mac>:44321/phone` — live screen, tap/type/scroll, a flow recorder | [Quick start](#quick-start) |
 | an agent or script | the bearer-authenticated HTTP API under `/agent/*` | [Agent API](#agent-api) |
-| Claude Code / Claude Desktop / any MCP client | the bundled `iphone-use-mcp` server, 20 tools | [MCP server](#mcp-server) |
+| Claude Code / Claude Desktop / any MCP client | the bundled `iphone-use-mcp` server, 21 tools | [MCP server](#mcp-server) |
 | anyone repeating a task | a reviewed **flow** from the official registry — one command, no model | [Flows and the registry](#flows-and-the-official-flow-registry) |
 
 Everything happens on the phone. The default `direct` backend does **not** use macOS
@@ -207,8 +207,8 @@ Full reference: **[`docs/agent-api.html`](docs/agent-api.html)**. The bundled sk
 | `GET` | `/agent/screenshot` | Current screen as PNG, from the phone. |
 | `GET` | `/agent/elements` | Flattened accessibility tree with an ephemeral `snapshot` token, an `ax_stats` usability block, and a sparse `alert` block when a system alert is up. `?since=<snapshot>` returns a `delta` instead of the full tree. WDA missing/busy → `503`; failed source → `502`, never a fake empty `200`. |
 | `GET` | `/agent/mjpeg` | Authenticated live MJPEG stream. |
-| `POST` | `/agent/input` | One action: tap, drag, long-press, scroll, text, key, `home`/`spotlight`, `launch_app`, `set_value`, `perform`, `alert`. `?return=delta` also returns the settled post-action tree change. |
-| `POST` | `/agent/actions` | Up to 24 `action` / `wait_for` / `pause` steps validated as a whole, run under one WDA lock, stopped at the first failure. Response: `completed`, `applied_actions`, `failed_step`, `outcome`, `retry_safe`. |
+| `POST` | `/agent/input` | One action: tap, drag, long-press, scroll, text, key, `home`/`spotlight`, `launch_app`, `set_value`, `perform`, `alert`. `?return=delta` also attempts a post-action tree read and returns the change plus a `settle` block (`settled`, `reason`: `stable` / `budget_exhausted` / `observation_failed`, `waited_ms`, `captures`, `budget_ms`, and `sparse` / `stale` when they apply). Observation is best-effort: a slow or failed read never downgrades an applied action to an unknown outcome. |
+| `POST` | `/agent/actions` | Up to 24 `action` / `wait_for` / `pause` steps validated as a whole, run under one WDA lock, stopped at the first failure. Response: `completed`, `applied_actions`, `failed_step`, `outcome` (the failed step), `failed_step_outcome`, `batch_outcome` (`nothing_applied` / `partially_applied` / `unknown`), `retry_safe` (the whole batch, and the only field that authorises a replay). |
 | `POST` | `/agent/mode` | `{"mode":"agent"}` restarts the configured Direct target. Never changes backend or UDID. |
 | `POST` | `/agent/hold` | `{"secs":N}` (0 clears, max 14400) keeps the phone from idle release around a human pause. `503 device_release_in_progress` if release already started. |
 | `POST` | `/agent/owner` | `{"release":true}` hands the owner lease back early. |
@@ -307,11 +307,31 @@ its daemon requests automatically.
 
 | Group | Tools |
 |---|---|
-| See | `phone_status`, `phone_screenshot`, `phone_elements` (carries a `registry` block naming installed flows for the app on screen) |
-| Act | `phone_tap`, `phone_tap_element` (snapshot-bound), `phone_tap_label` (unique exact label), `phone_scroll`, `phone_type` (CJK-clean), `phone_key`, `phone_shortcut` (`home`/`spotlight`) |
+| See | `phone_status`, `phone_capabilities` (what this build supports vs what is possible right now; wakes nothing), `phone_screenshot`, `phone_elements` (carries a `registry` block naming installed flows for the app on screen) |
+| Act | `phone_tap`, `phone_tap_element` (snapshot-bound), `phone_tap_label` (unique exact label), `phone_scroll`, `phone_type` (CJK-clean), `phone_key`, `phone_shortcut` (`home`/`spotlight`) — each takes an optional `observe` |
 | Batch | `phone_run_steps` — up to 24 steps incl. `tap_locator`, `launch_app`, `picker`, `alert`, long-press/swipe/drag, `wait_for` |
 | Lifecycle | `phone_reconnect` (restart the canonical Direct target, never a UDID switch), `phone_hold`, `phone_release_owner` |
 | Flows | `phone_flow_list`, `phone_flow_info`, `phone_flow_run`, `phone_flow_update`, `phone_flow_publish`, `phone_flow_report` |
+
+For those seven act tools and `phone_capabilities`, the parsed JSON arrives as MCP
+`structuredContent` and the text block is a preview trimmed at 8 KiB — parse the
+structured field. `phone_run_steps` carries its complete batch result in BOTH, so either
+is safe to parse. Every other tool keeps the return it always had: complete JSON as
+text for most (including `phone_flow_run`'s execution result, passed or failed), an
+image for `phone_screenshot`, and explanatory text for errors raised before a call
+reaches the phone. Read `structuredContent` when it is present; otherwise read
+`content` according to the tool. When a result cannot be confirmed,
+`outcome: "unknown"` with `retry_safe: false` says so in a form a program can branch on
+— and branch on the explicit `retry_safe` boolean, never on `outcome`. Full table:
+[`crates/mcp/README.md`](crates/mcp/README.md).
+
+`observe: true` on a single-step act tool asks the daemon to watch the screen settle and
+return what changed (`settle`, `snapshot`, `delta`) with the result. It is off by default
+because the wait costs latency an action does not otherwise pay. `settle.reason` is
+`stable`, `budget_exhausted` (the observation window ran out — the action still happened)
+or `observation_failed` (the read itself broke); `stale: true` means the tree returned is
+the previous successful read rather than the current screen, and `sparse: true` marks an
+empty or container-only tree, which is never called stable.
 
 Keyboard dismissal, uninstall, and target configuration stay HTTP-only. Full schemas:
 [`crates/mcp/README.md`](crates/mcp/README.md).
@@ -337,10 +357,30 @@ flows, the way chrome-use ships site packs:
 "$MCP" flow list --category health        # id · risk · verified · inputs · name
 "$MCP" flow info health/export-all-zh-cn  # metadata and step templates
 PHONE_REMOTE_TOKEN=… "$MCP" flow run health/export-all-zh-cn
+PHONE_REMOTE_TOKEN=… "$MCP" flow run health/export-all-zh-cn --artifacts-dir ./runs   # record the run (0700 dir, 0600 files)
 "$MCP" flow add my.json --as myapp/daily  # your own flow; survives update
 "$MCP" flow publish my.json --as myapp/daily --alias MyApp --note "iPhone 17 Pro Max, iOS 26"   # opens the PR via gh
 "$MCP" flow report health/export-all --result @run.json --note "profile button renamed"           # files a flow-broken issue
 ```
+
+When a run fails, the result grows a **`diagnosis`** block: the daemon's own
+0-based `failed_step`, whether the screen could be read at all (`observable`),
+a `reason` (`locator_matches_now`, `locator_no_match`, `locator_ambiguous`,
+`still_present`, `no_similar_element`, `no_readable_tree`, `screen_unreadable`,
+`diagnosis_timeout`, `step_has_no_locator`), and up to five
+`candidates` with the `matched` / `differed` locator fields they were picked
+on. It is one bounded read taken after the run: nothing is re-sent, the flow is
+never silently edited, and the run's own `outcome` / `applied_actions` /
+`retry_safe` are not touched by it.
+
+`--artifacts-dir DIR` writes a machine-readable record of the run — schema,
+flow name and sha256, the versions it ran against (`unavailable` when they
+could not be read, never guessed), timings, and the projected result. The
+directory is created `0700` and checked for writability *before* anything is
+sent; files are `0600`. Structure only: typed input and screen text are never
+written. If the write fails after the phone has already acted, the result is
+still printed in full with an added `artifact_error` — a failure to record
+something cannot rewrite what happened.
 
 Registry metadata on a flow is optional: `app` (bundle id), `category`, `risk`
 (`read_only` · `navigation` · `side_effect` — the last refuses to run without
@@ -359,7 +399,12 @@ version it was proved on, the CLI reads what the phone has installed (`flow apps
 every listing shows a `compat` verdict — `verified`, `untested-newer`, `incompatible`,
 `broken`, `needs-verification`, `draft`, `unknown`. `flow run` refuses broken or
 incompatible flows without `--force`. A nightly canary (`scripts/flow-reverify.py`) re-runs
-the verified read-only flows on a real phone, refreshes `verified_on`, and tags failures.
+the verified read-only flows on a real phone and reaches one of three verdicts per flow:
+**verified** (refresh `verified_on`), **failed** (tag `needs-verification` and file a
+`flow-broken` issue), or **skipped** — the phone was locked, owned by someone else, not
+drivable, or the daemon could not determine the outcome. A skipped flow is left exactly as
+it was: a night the phone was unavailable says nothing about the flow, so it is neither
+marked broken nor credited with a fresh date.
 
 Agents are pushed toward the registry rather than asked to remember it: `phone_elements`
 lists the installed flows for the app on screen, a 3+-step `phone_run_steps` success
@@ -378,7 +423,20 @@ unmanaged endpoint. After a lock-screen failure the daemon rebuilds WDA with bac
 5 min; a verified recovery resets both. Interactive setup waits at most 5 min for an
 unlock. `POST /agent/mode {"mode":"agent"}` (or MCP `phone_reconnect`) restarts the
 configured target once — do not loop it; read `hint` and `setup_blocked_on`
-(`warp|proxy|usb|trust|ddi|account`) first.
+(`warp|proxy|usb|trust|ddi|account|locked`) first.
+
+**Who may end a reconnect.** A bring-up is owned by the task that started it, and only
+that owner ends it. Every begin mints a generation, so a late task cannot end the round
+that replaced it, and `GET /agent/status` never ends one: reading status refreshes the
+health cache but does not move the lifecycle. A wait ends for exactly one reason —
+the phone became drivable, it is locked, setup published a prerequisite, the budget ran
+out, or another round took over — and each is logged. The whole wait is bounded by that
+budget: a probe is cut off by the absolute deadline rather than its own ceiling, evidence
+that arrives after the deadline is discarded, and a wait that is cancelled (runtime
+shutdown, a dropped future) releases its own round rather than leaving `reconnecting`
+set. Evidence cached before a bring-up is never treated as proof that the bring-up
+finished — that briefly shipped in v0.6.4 and opened input onto a runner that was still
+being replaced.
 
 ### Upgrades
 

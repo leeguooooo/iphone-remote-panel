@@ -137,9 +137,50 @@ action settle briefly and return the post-action element change in the same
 response — `{"ok":true,"snapshot":…,"baseline":…,"delta":{…}}` when the
 baseline (the `since` query param, or the action's own `snapshot` field) is
 still server-cached, else full `elements`. That replaces the separate
-act-then-`GET /agent/elements` verify pair for routine steps; `delta_error`
-alongside `ok:true` means the action applied but the read failed — verify with
-a normal `GET /agent/elements`.
+act-then-`GET /agent/elements` verify pair for routine steps.
+
+**Read the `settle` block before you trust the delta.** The action result and
+the observation are separate facts: `ok:true` means the action applied, and
+nothing in the observation can take that back — a slow or failed read comes
+back in `settle.reason` beside `ok:true`, never as an unknown outcome you have
+to escalate.
+
+| `settle.reason` | What it means | What to do |
+|---|---|---|
+| `stable` | Two consecutive reads matched over a tree with something in it. | The tree is worth reading — now check your postcondition against it. Stable is not "it worked". |
+| `budget_exhausted` | Stability was not confirmed within the budget. The screen may still be moving, or `settle_ms` was too short (or `0`, which does not read the tree at all), or every read was container-only. | Do not conclude anything from the delta alone; re-read with `GET /agent/elements`. |
+| `observation_failed` | The read path itself broke (plus the legacy `delta_error`). Running out of budget is *not* this — a cancelled read is not a broken one. | The action still applied. Verify with `GET /agent/elements`. |
+
+Two more flags matter: `sparse:true` means the tree held nothing to act on
+(empty, or containers only) — two identical bare reads are evidence you cannot
+see the screen, not that it settled, so never read `sparse` + unchanged as
+"nothing happened". `stale:true` means the tree in the response is the LAST
+good read, not a fresh one — either the refreshing read broke, or the budget
+cut it off mid-sample. And `settled:true` only ever claims *the tree
+stopped changing* — it is never a claim that what you wanted actually
+happened; that judgment stays yours.
+
+`settle_ms`, `budget_ms` and `waited_ms` all describe the TREE read only; the
+`alert` probe is separate and hard-capped at 1.5s. Tune with `settle_ms`
+(default 15000, max 20000): drop it to `0` for a step you are going to verify
+by screenshot anyway. How long a read takes varies with the device and the
+screen — on one phone with a large tree it was measured at 6–7s — so the
+default leaves room for two reads rather than assuming a fast one. It is a
+ceiling, not a wait: reading stops as soon as two reads match. If you set a
+budget shorter than a single read on that screen, expect `captures: 0`;
+`budget_ms` in the answer tells you what it had to work with.
+
+**A failed `wait_for` tells you whether anyone could see the screen.** Its
+`observation` block distinguishes three things you must not conflate:
+`read:false` (no tree was ever obtained — this proves nothing, least of all
+that an element is absent), `read:true, stale:true` (the screen was read, then
+the read path failed; you are looking at the last valid observation, not the
+current screen), and plain `read:true` (the screen was read and the condition
+genuinely was not met). `sparse:true` means the tree was empty or
+container-only; every `absent` locator it would have "satisfied" is listed in
+`absent_unproven` and the step deliberately does not pass. **Never conclude an
+element is gone from a tree that had nothing in it** — take a screenshot
+instead.
 
 **`app_changed` means your tap landed in the wrong app.** Any delta response
 (`?return=delta` or `GET /agent/elements?since=`) grows an
@@ -168,9 +209,44 @@ notification dropping from the top will otherwise intercept a tap and open the
 notifying app (hardware-seen: a chat banner hijacked a tap and opened WeChat).
 
 MCP alternative: the repo ships `iphone-use-mcp` (crates/mcp) with the
-day-to-day safe subset: status, reconnect, screenshot, elements, coordinate
-and snapshot-bound element taps, strict unique-label taps, scroll, text, named
-keys, Home/Spotlight, and `phone_run_steps` for one guarded multi-step call.
+day-to-day safe subset: status, capabilities, reconnect, screenshot, elements,
+coordinate and snapshot-bound element taps, strict unique-label taps, scroll,
+text, named keys, Home/Spotlight, and `phone_run_steps` for one guarded
+multi-step call.
+`phone_capabilities` answers two separate questions without touching the
+phone: what this build supports for the configured backend, and whether the
+device can be driven right now (`blocked_by` names locked / released /
+reconnecting / human_handoff / owned_by_other / offline; `ok: null` means no
+evidence either way). It wakes nothing and takes no owner lease, so it is safe
+before deciding what to attempt. Its scope is UI control and observation only.
+For those seven act tools and `phone_capabilities`, the JSON comes back as MCP
+`structuredContent` and the text block is only a preview (trimmed at 8 KiB), so
+parse the structured field. `phone_run_steps` puts its complete batch result in
+both, so either is safe to parse. Every other tool keeps its original shape:
+`phone_elements` and the `phone_flow_*` tools return complete JSON as text
+(including `phone_flow_run`'s execution result, passed or failed), and
+`phone_screenshot` returns an image. Errors raised before a call reaches the
+phone are explanatory text instead. The rule is simply: read
+`structuredContent` when it is there, otherwise read `content` according to the
+tool, and call `phone_status` / `phone_capabilities` when you need a
+machine-readable state. When a tool cannot confirm what happened it answers
+`outcome: "unknown"` with `retry_safe: false` — the request may have reached the
+phone, so check `phone_elements` or `phone_screenshot` rather than resending.
+Decide by the explicit `retry_safe` boolean, not by `outcome`: a local refusal
+and a daemon-reported `not_sent` are both valid evidence when they carry
+`retry_safe: true`, and `not_sent` on one step never means a whole batch can be
+replayed.
+
+Every single-step act tool takes an optional `observe`. With `observe: true`
+the daemon watches the screen settle and returns `settle`, `snapshot` and
+`delta` alongside the result, so you do not need a separate `phone_elements`
+round trip to see what an action produced. It is off by default because that
+wait is latency the action does not otherwise pay. Read `settle.reason`:
+`stable` means the screen stopped changing, `budget_exhausted` means the
+observation window ran out and says NOTHING against the action itself, and
+`observation_failed` means the read broke. `stale: true` marks a tree from the
+previous successful read rather than the current screen; `sparse: true` marks
+an empty or container-only tree, which is never reported stable.
 Inside a sequence, `tap_locator` can act on the same strict
 label/identifier/kind/value/focus/enabled/visible locator used by `wait_for`;
 zero or multiple matches send no tap.
